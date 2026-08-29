@@ -1,0 +1,61 @@
+# appkit 自身的 CI（域仓库请用 domain-ci.yml）。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: appkit
+          POSTGRES_DB: appkit_test
+        ports:
+          - 55499:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d appkit_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:appkit@127.0.0.1:55499/appkit_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: gofmt 检查
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "以下文件未经 gofmt 格式化:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -race -count=1 ./...
+
+      - name: go.mod 整洁检查
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: lint 子 module（appkit-lint analyzers）
+        run: |
+          cd lint
+          go build ./...
+          go test ./...

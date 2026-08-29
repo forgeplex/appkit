@@ -1,0 +1,28 @@
+# {{.Name}}
+
+{{.Name}} 组合仓库，由 `appkit new system {{.Name}}` 生成：只做 wiring +
+配置 + 部署，零业务逻辑（DESIGN §5）。这是唯一 import 各域 Module 入口
+的地方。
+
+## 快速开始
+
+```sh
+appkit dev     # 生成 go.work，联调本地 appkit 与各域仓库（go.work 不提交）
+make run       # -target=all 单体形态起服
+make check
+```
+
+## 结构
+
+```
+cmd/{{.Name}}/       唯一 composition root：-target 过滤模块，其余契约落 Remote 绑定
+config/              dev/prod.yaml，按模块前缀分区；密钥走环境变量
+deploy/              部署说明：同一镜像、不同 -target（见 deploy/README.md）
+```
+
+## 接入域仓库
+
+1. `go.mod` 里 require 域 repo（如 github.com/forgeplex/ledger）；
+2. `cmd/{{.Name}}/main.go` 里取消对应 `appkit.Modules` 装配注释；
+3. target 之外的契约补 `appkit.Remote(xxxv1.NewClient)`；
+4. 声明了事件消费者的域需要 `appkit.Bus(...)`（单库直投用 outbox.NewDirectBus()）。

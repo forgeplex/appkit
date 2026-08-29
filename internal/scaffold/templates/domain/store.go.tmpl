@@ -1,0 +1,10 @@
+package {{.Name}}
+
+import "context"
+
+// Store 是业务包所需的持久化接口（接口放消费方），由 internal/postgres 实现。
+// 方法按用例命名，签名里只出现领域类型——不出现 SQL / 驱动细节。
+type Store interface {
+	// Ping 占位：接入真实用例后替换（如 CreateAccount、PostEntry）。
+	Ping(ctx context.Context) error
+}

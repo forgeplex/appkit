@@ -1,0 +1,17 @@
+# sqlc 配置：make gen 生成 internal/postgres/sqlc（生成物禁手改，CI drift check）。
+# 本域独占 schema "{{.Name}}"：查询与迁移只允许操作该 schema（appkit check 扫描）。
+version: "2"
+sql:
+  - engine: "postgresql"
+    schema: "db/migrations"
+    queries: "db/queries"
+    gen:
+      go:
+        package: "sqlc"
+        out: "internal/postgres/sqlc"
+        sql_package: "pgx/v5"
+        emit_interface: true
+        overrides:
+          # 金额列一律 NUMERIC ↔ money.Money：全系统禁 float 金额（DESIGN §2）。
+          - db_type: "pg_catalog.numeric"
+            go_type: "github.com/forgeplex/appkit/money.Money"

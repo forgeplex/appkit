@@ -1,0 +1,7 @@
+# go.work 只用于本地多仓联调（appkit dev 生成），不提交
+go.work
+go.work.sum
+
+bin/
+coverage.out
+.DS_Store

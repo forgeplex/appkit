@@ -1,0 +1,9 @@
+# appkit 框架配置：appkit sync / check / dev 读取。
+version: 1
+kind: domain
+domain: {{.Name}}
+module: {{.Module}}
+# 合约 module（如 github.com/forgeplex/psp-contracts/go），可空。
+contracts: ""
+# 额外放行的 forgeplex module（域 repo 之间禁止互相 require，DESIGN §1）。
+allowRequires: []

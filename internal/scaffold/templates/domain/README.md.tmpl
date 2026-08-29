@@ -1,0 +1,39 @@
+# {{.Name}}
+
+{{.Name}} 业务域仓库，由 `appkit new domain {{.Name}}` 生成（框架见
+github.com/forgeplex/appkit，设计文档 docs/DESIGN.md）。
+
+## 快速开始
+
+```sh
+appkit sync    # 物化 lint / CI 配置（.golangci.yml 等，CI 校验未漂移）
+appkit dev     # 生成 go.work，联调本地 appkit / 各域仓库（go.work 不提交）
+make check     # 架构检查
+make test
+go run ./cmd/{{.Name}}d    # 独立微服务形态起服（需先配置 database.url）
+```
+
+## 结构
+
+```
+{{.Name}}.go             唯一导出面：func Module() —— 只被组合仓库与本仓库 cmd/ import
+cmd/{{.Name}}d/          独立部署入口：只装本模块，外域契约绑 Remote client
+internal/{{.Name}}/      业务包：领域类型 + 不变量 + 用例编排 + 所需接口（Store、Publisher）
+internal/postgres/       全仓唯一允许 import pgx / sqlc 的包；实现业务包接口
+internal/http/           transport：实现合约生成的 server 接口，只做 DTO 映射
+internal/inbox/          外域事件消费者：inbox 去重后调业务包
+internal/module/         装配层：Provide / Mount / Migrations / Health
+db/migrations/           只允许操作 "{{.Name}}" schema；0001 为 appkit 基础设施表
+db/queries/              sqlc 查询源；make gen 生成 internal/postgres/sqlc
+```
+
+## 约束（appkit sync 物化的机检 + appkit check）
+
+1. `internal/{{.Name}}` 零 infra import——纯业务，禁止 pgx / gin / net/http；
+2. pgx / sqlc 只出现在 `internal/postgres`——repo 层外无 SQL；
+3. `internal/http`、`internal/inbox` 不得 import `internal/postgres`——
+   transport 必须经业务包接口走业务逻辑。
+
+另有仓库级铁律：域 repo 之间禁止互相 require，跨域调用只依赖
+psp-contracts 生成的契约类型；跨模块一致性只走契约调用（可失败、须幂等）
+或 outbox 事件，禁止跨模块共享事务与跨 schema JOIN。

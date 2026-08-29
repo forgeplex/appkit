@@ -1,0 +1,11 @@
+# {{ .Module }} 的 CI：全部步骤在 appkit 的 reusable workflow 中维护。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    uses: forgeplex/appkit/.github/workflows/domain-ci.yml@main

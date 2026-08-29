@@ -1,0 +1,21 @@
+# {{.Name}} 域仓库开发入口。
+# 首次开发先跑：appkit sync（物化 lint/CI 配置）、appkit dev（生成 go.work 联调）。
+
+GO ?= go
+
+.PHONY: gen lint check test
+
+# 重新生成 sqlc 代码（生成物禁手改，CI drift check）。
+gen:
+	sqlc generate
+
+# golangci-lint（配置由 appkit sync 物化，勿手改）。
+lint:
+	golangci-lint run
+
+# appkit 架构检查：依赖方向、go.mod require 清单、SQL 跨 schema 引用。
+check:
+	$(GO) run github.com/forgeplex/appkit/cmd/appkit check
+
+test:
+	$(GO) test ./...

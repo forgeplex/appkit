@@ -1,0 +1,7 @@
+# gen errors 的 golden 输入；输出检入 internal/gen/genfixture/codes.gen.go。
+version: 1
+package: genfixture
+codes:
+  - { code: LEDGER_INSUFFICIENT_FUNDS, status: 422, message: insufficient funds }
+  - { code: LEDGER_ENTRY_NOT_FOUND, status: 404, message: entry not found }
+  - { code: LEDGER_DUPLICATE_ID, status: 409, message: duplicate entry id }

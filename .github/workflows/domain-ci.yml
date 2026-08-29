@@ -1,0 +1,65 @@
+# 域仓库复用的 CI（域仓库的 .github/workflows/ci.yml 由 appkit sync 生成，一行 uses 引用本文件）。
+name: domain-ci
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: Go 版本
+        type: string
+        required: false
+        default: "1.26"
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: appkit
+          POSTGRES_DB: appkit_test
+        ports:
+          - 55499:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d appkit_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://postgres:appkit@127.0.0.1:55499/appkit_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+
+      - name: gofmt 检查
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "以下文件未经 gofmt 格式化:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -race -count=1 ./...
+
+      - name: appkit check（架构检查）
+        run: go run github.com/forgeplex/appkit/cmd/appkit check
+
+      - name: appkit sync 漂移检查
+        run: go run github.com/forgeplex/appkit/cmd/appkit sync --check
+
+      - name: go.mod 整洁检查
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum

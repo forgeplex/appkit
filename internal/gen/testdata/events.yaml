@@ -1,0 +1,17 @@
+# gen events 的 golden 输入；输出检入 internal/gen/genfixture/events.gen.go。
+version: 1
+package: genfixture
+events:
+  - name: EntryPosted
+    topic: ledger.entry.posted
+    fields:
+      - { name: entry_id, type: string, required: true }
+      - { name: amount, type: decimal }
+      - { name: at, type: timestamp }
+      - { name: attempts, type: int64 }
+      - { name: final, type: bool }
+  - name: EntryReversed
+    topic: ledger.entry.reversed
+    fields:
+      - { name: entry_id, type: string, required: true }
+      - { name: reason, type: string }

@@ -1,0 +1,31 @@
+// Package http 是 transport 层：实现合约生成的 server 接口，只做解码、
+// 结构校验与 DTO↔{{.Name}} 类型映射；禁业务规则、SQL 与
+// import internal/postgres（DESIGN §4 约束 3，机检）。
+package http
+
+import (
+	"log/slog"
+	"net/http"
+
+	"github.com/forgeplex/appkit/httpserver"
+
+	"{{.Module}}/internal/{{.Name}}"
+)
+
+// PingPattern 是占位路由（标准库 ServeMux 语法，Go 1.22+）。
+// 合约仓库（psp-contracts）就绪后，本包改为实现 {{.Name}}v1 生成的
+// server 接口，路由由生成物驱动。
+const PingPattern = "GET /{{.Name}}/ping"
+
+// NewPingHandler 演示 transport 的标准形态：业务错误原样上抛，统一经
+// httpserver.WriteError 出口映射 RFC 9457（problem+json）——
+// 整条请求路径只在出口 log 一次。
+func NewPingHandler(log *slog.Logger, svc *{{.Name}}.Service) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := svc.Ping(r.Context()); err != nil {
+			httpserver.WriteError(log, w, err)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+}

@@ -1,0 +1,36 @@
+// Package postgres 实现业务包的 Store 接口——全仓唯一允许 import
+// pgx / sqlc 的包（DESIGN §4 约束 2）；业务决策不进本包。
+//
+// sqlc 工作流：
+//  1. 查询写进 db/queries/*.sql（表名带 "{{.Name}}." schema 前缀，
+//     跨 schema 引用会被 appkit check 拒绝）；
+//  2. make gen 生成 internal/postgres/sqlc（生成物禁手改，CI drift check）；
+//  3. 本包用 sqlc Querier 实现 Store，DBTX 经 pgtx.From(ctx, pool) 取——
+//     tx.Do 之内自动落在当前事务上，之外落在连接池上。
+package postgres
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/forgeplex/appkit/pgtx"
+
+	"{{.Module}}/internal/{{.Name}}"
+)
+
+// Store 实现 {{.Name}}.Store。
+type Store struct {
+	pool *pgxpool.Pool
+}
+
+var _ {{.Name}}.Store = (*Store)(nil)
+
+func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+
+// Ping 占位实现。真实实现改用 sqlc 生成的 Querier，如：
+// sqlc.New(pgtx.From(ctx, s.pool)).GetAccount(ctx, id)
+func (s *Store) Ping(ctx context.Context) error {
+	var one int
+	return pgtx.From(ctx, s.pool).QueryRow(ctx, "SELECT 1").Scan(&one)
+}

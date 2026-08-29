@@ -1,0 +1,28 @@
+# {{.Name}} 部署
+
+同一镜像按 `-target` 决定进程角色（Loki 模式，DESIGN §5）：
+部署形态是启动参数，不是架构决策。
+
+## 单体（推荐起步）
+
+```
+{{.Name}} -target=all -config=config/prod.yaml
+```
+
+一个 Deployment 装配全部模块；跨模块调用走进程内契约绑定
+（仍经 contract.Call：ctx 防火墙、事务守卫、超时、错误规范化）。
+
+## 拆分（之后的部署决策）
+
+同一镜像、不同 Deployment、不同 -target：
+
+```
+{{.Name}} -target=gateway          # 边缘服务
+{{.Name}} -target=ledger           # 账务服务
+{{.Name}} -target=relay            # outbox relay worker
+```
+
+- target 之外的契约自动落到 Remote 绑定（合约仓库生成的 HTTP client）；
+- 事件总线从 directbus 切 NATS/Kafka（同一 Bus 接口，业务代码不改）；
+- 每个进程都暴露 /healthz（liveness）与 /readyz（readiness）；
+  SIGTERM 后 readyz 先置 503 摘流量再优雅关停，K8s 配 preStop 缓冲。

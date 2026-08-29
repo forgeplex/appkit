@@ -1,0 +1,45 @@
+// Package {{.Name}} 是业务包：领域类型、不变量与用例编排。
+//
+// 三条方向性约束（DESIGN §4，appkit sync 物化的 lint 机检）：
+//  1. 本包零 infra import——只允许 stdlib、appkit 无驱动包
+//     （tx / money / apperr 与 outbox 的接口面）和合约类型，
+//     禁止 pgx / gin / net/http；
+//  2. pgx / sqlc 只允许出现在 internal/postgres；
+//  3. internal/http 与 internal/inbox 不得 import internal/postgres——
+//     transport 必须经本包接口走业务逻辑，不能抄近路。
+package {{.Name}}
+
+import (
+	"context"
+
+	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/tx"
+)
+
+// Publisher 是事件发布的消费方接口（接口放消费方）：装配时注入
+// *outbox.Publisher，事件与业务写同事务落表——本包不 import 任何 infra。
+type Publisher interface {
+	Publish(ctx context.Context, evt appkit.Event) error
+}
+
+// Service 编排用例：tx.Do 划事务边界，经 Store 读写，经 Publisher 发事件。
+// 具体 struct 而非接口（accept interfaces, return structs）——
+// transport 直接依赖它，不为它预备接口。
+type Service struct {
+	store Store
+	txr   tx.Transactor
+	pub   Publisher
+}
+
+func NewService(store Store, txr tx.Transactor, pub Publisher) *Service {
+	return &Service{store: store, txr: txr, pub: pub}
+}
+
+// Ping 是占位用例，演示事务边界的标准形态；接入真实用例后删除。
+// 真实用例在 tx.Do 内：校验不变量 → Store 读写 → pub.Publish 发事件 →
+// 审计（同事务落库），任一步失败整体回滚。
+func (s *Service) Ping(ctx context.Context) error {
+	return s.txr.Do(ctx, func(ctx context.Context) error {
+		return s.store.Ping(ctx)
+	})
+}

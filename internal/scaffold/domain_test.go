@@ -1,0 +1,128 @@
+package scaffold
+
+import (
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// domainWantFiles 是域仓库骨架的完整文件集（name=ledger）。
+var domainWantFiles = []string{
+	".appkit.yml",
+	".gitignore",
+	"Makefile",
+	"README.md",
+	"go.mod",
+	"ledger.go",
+	"cmd/ledgerd/main.go",
+	"internal/ledger/service.go",
+	"internal/ledger/store.go",
+	"internal/ledger/errors.go",
+	"internal/postgres/store.go",
+	"internal/http/handler.go",
+	"internal/inbox/consumer.go",
+	"internal/module/module.go",
+	"db/migrations/0001_appkit_base.sql",
+	"db/queries/example.sql",
+	"sqlc.yaml",
+}
+
+func TestDomainScaffold(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ledger")
+	if err := Domain(Options{Name: "ledger", Dir: dir, AppkitVersion: "(devel)"}, nil); err != nil {
+		t.Fatalf("Domain: %v", err)
+	}
+
+	assertFileSet(t, dir, domainWantFiles)
+	assertRendered(t, dir)
+	assertGoParses(t, dir)
+	assertGofmt(t, dir)
+
+	t.Run("基础迁移含四张基础设施表", func(t *testing.T) {
+		sql := readFile(t, dir, "db/migrations/0001_appkit_base.sql")
+		mustContain(t, "0001_appkit_base.sql", sql,
+			`CREATE TABLE IF NOT EXISTS "ledger".outbox`,
+			`CREATE TABLE IF NOT EXISTS "ledger".inbox`,
+			`CREATE TABLE IF NOT EXISTS "ledger"."idempotency_keys"`,
+			`CREATE TABLE IF NOT EXISTS "ledger".audit_log`,
+		)
+	})
+
+	t.Run("appkit.yml", func(t *testing.T) {
+		yml := readFile(t, dir, ".appkit.yml")
+		mustContain(t, ".appkit.yml", yml,
+			"version: 1",
+			"kind: domain",
+			"domain: ledger",
+			"module: github.com/forgeplex/ledger",
+			"allowRequires: []",
+		)
+	})
+
+	t.Run("go.mod devel 提示联调", func(t *testing.T) {
+		gomod := readFile(t, dir, "go.mod")
+		mustContain(t, "go.mod", gomod,
+			"module github.com/forgeplex/ledger",
+			"appkit dev",
+			"github.com/jackc/pgx/v5 v5.",
+		)
+		// devel 模式不 require appkit：对不存在版本的 require 会让
+		// go 命令去代理拉取而失败，appkit 由 go.work 提供。
+		if strings.Contains(gomod, "require github.com/forgeplex/appkit") ||
+			strings.Contains(gomod, "\tgithub.com/forgeplex/appkit") {
+			t.Errorf("devel 模式 go.mod 不应 require appkit：\n%s", gomod)
+		}
+	})
+
+	t.Run("关键内容", func(t *testing.T) {
+		mustContain(t, "ledger.go", readFile(t, dir, "ledger.go"),
+			"package ledger", "go:embed db/migrations/*.sql", "func Module(")
+		mustContain(t, "Makefile", readFile(t, dir, "Makefile"),
+			"run github.com/forgeplex/appkit/cmd/appkit check", "sqlc generate")
+		mustContain(t, "main.go", readFile(t, dir, "cmd/ledgerd/main.go"),
+			"httpserver.Base(log)", "pgmigrate.Runner(pool)", "telemetry.Init", "config.Load")
+		mustContain(t, "module.go", readFile(t, dir, "internal/module/module.go"),
+			`Schema = "ledger"`, "reg.Migrations(Schema", "reg.Health(", "appkit.Provide(")
+		mustContain(t, "sqlc.yaml", readFile(t, dir, "sqlc.yaml"),
+			"internal/postgres/sqlc", `schema: "db/migrations"`)
+		mustContain(t, "README.md", readFile(t, dir, "README.md"),
+			"appkit sync", "appkit dev")
+	})
+}
+
+// TestDomainGoModVersioned 断言发布版本直接写进 require，不留占位提示。
+func TestDomainGoModVersioned(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pay")
+	if err := Domain(Options{Name: "pay", AppkitVersion: "v0.7.3", Dir: dir}, nil); err != nil {
+		t.Fatalf("Domain: %v", err)
+	}
+	gomod := readFile(t, dir, "go.mod")
+	mustContain(t, "go.mod", gomod, "github.com/forgeplex/appkit v0.7.3")
+	if strings.Contains(gomod, "appkit dev") {
+		t.Error("发布版本的 go.mod 不应含 devel 联调提示")
+	}
+}
+
+// TestDomainCustomModule 断言 -module 覆盖默认 module path。
+func TestDomainCustomModule(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "ledger")
+	err := Domain(Options{Name: "ledger", Module: "example.com/x/ledgerx", Dir: dir}, nil)
+	if err != nil {
+		t.Fatalf("Domain: %v", err)
+	}
+	mustContain(t, "go.mod", readFile(t, dir, "go.mod"), "module example.com/x/ledgerx")
+	mustContain(t, "module.go", readFile(t, dir, "internal/module/module.go"),
+		`"example.com/x/ledgerx/internal/ledger"`)
+}
+
+// TestDomainCompiles 用 go.work（use 本地 appkit）完整编译生成仓库。
+func TestDomainCompiles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short 模式跳过编译")
+	}
+	dir := filepath.Join(t.TempDir(), "ledger")
+	if err := Domain(Options{Name: "ledger", Dir: dir}, nil); err != nil {
+		t.Fatalf("Domain: %v", err)
+	}
+	buildGenerated(t, dir)
+}

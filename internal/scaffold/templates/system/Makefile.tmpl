@@ -1,0 +1,23 @@
+# {{.Name}} 组合仓库开发入口。
+# 首次开发先跑：appkit dev（生成 go.work，联调本地 appkit 与各域仓库）。
+
+GO ?= go
+
+.PHONY: build run dev check test
+
+build:
+	$(GO) build -o bin/{{.Name}} ./cmd/{{.Name}}
+
+# 单体形态起服（-target 切换部署形态，见 deploy/README.md）。
+run:
+	$(GO) run ./cmd/{{.Name}} -target=all -config=config/dev.yaml
+
+# 生成/刷新 go.work，纳入同级目录全部子模块（go.work 不提交）。
+dev:
+	$(GO) run github.com/forgeplex/appkit/cmd/appkit dev
+
+check:
+	$(GO) run github.com/forgeplex/appkit/cmd/appkit check
+
+test:
+	$(GO) test ./...

@@ -1,0 +1,27 @@
+// Package {{.Name}} 是 {{.Name}} 域对外的唯一入口：只导出 Module()，
+// 只被组合仓库与本仓库 cmd/ import（DESIGN §1 铁律 3）；实现全部在 internal/。
+package {{.Name}}
+
+import (
+	"embed"
+	"io/fs"
+
+	"github.com/forgeplex/appkit"
+
+	"{{.Module}}/internal/module"
+)
+
+// Options 是装配期依赖，由组合根（cmd/{{.Name}}d 或组合仓库）注入。
+type Options = module.Options
+
+//go:embed db/migrations/*.sql
+var migrationsFS embed.FS
+
+// Module 返回 {{.Name}} 模块。
+func Module(opts Options) appkit.Module {
+	sub, err := fs.Sub(migrationsFS, "db/migrations")
+	if err != nil {
+		panic(err) // embed 路径固定，不可能失败
+	}
+	return module.New(opts, sub)
+}

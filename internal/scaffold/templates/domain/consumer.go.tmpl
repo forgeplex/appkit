@@ -1,0 +1,29 @@
+// Package inbox 消费外域事件：装配层用 outbox.Inbox 按 (consumer, event_id)
+// 去重后调业务包用例。不得 import internal/postgres（DESIGN §4 约束 3）。
+package inbox
+
+import (
+	"context"
+
+	"github.com/forgeplex/appkit"
+
+	"{{.Module}}/internal/{{.Name}}"
+)
+
+// Consumer 是 inbox 去重键里的 consumer 名。
+const Consumer = "{{.Name}}"
+
+// NewHandler 返回外域事件处理器。装配时（internal/module）用
+// outbox.Inbox(pool, "{{.Name}}", Consumer, NewHandler(svc)) 包一层去重，
+// 再经 reg.Consumer(topic, ...) 声明消费。
+//
+// 投递语义是至少一次：实现必须幂等——inbox 去重只保证「至少一次投递、
+// 至多一次生效」的协作成立。
+func NewHandler(svc *{{.Name}}.Service) appkit.EventHandler {
+	return func(ctx context.Context, evt appkit.Event) error {
+		// TODO: 按 evt.Topic 反序列化合约事件类型（psp-contracts 生成物），
+		// 调用 svc 对应用例。
+		_ = svc
+		return nil
+	}
+}

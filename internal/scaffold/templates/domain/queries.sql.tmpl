@@ -1,0 +1,5 @@
+-- 查询写在本目录，经 `make gen`（sqlc）生成到 internal/postgres/sqlc。
+-- 表名必须带 "{{.Name}}." schema 前缀；跨 schema 引用会被 appkit check 拒绝。
+
+-- name: Now :one
+SELECT now();

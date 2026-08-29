@@ -1,0 +1,79 @@
+// Package module 是装配层：把业务包、postgres、http、inbox 装进
+// appkit.Registry。这是本仓库唯一的 wiring 落点——驱动类型（连接池）
+// 从组合根注入，到此为止，不再向业务包扩散。
+package module
+
+import (
+	"context"
+	"io/fs"
+	"log/slog"
+	"net/http"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/health"
+	"github.com/forgeplex/appkit/outbox"
+	"github.com/forgeplex/appkit/pgtx"
+
+	"{{.Module}}/internal/{{.Name}}"
+	{{.Name}}http "{{.Module}}/internal/http"
+	"{{.Module}}/internal/postgres"
+)
+
+// Schema 是本域独占的 Postgres schema（= 域名，DESIGN §8）。
+// 迁移只允许操作本 schema；跨 schema 引用由 appkit check 拒绝。
+const Schema = "{{.Name}}"
+
+// Options 是装配期依赖，由组合根注入（连接池按数据库共享，DESIGN §8）。
+type Options struct {
+	Log  *slog.Logger
+	Pool *pgxpool.Pool
+}
+
+// New 构造模块。migrations 是 db/migrations 的 embed FS（由根包注入）。
+func New(opts Options, migrations fs.FS) appkit.Module {
+	return &mod{opts: opts, migrations: migrations}
+}
+
+type mod struct {
+	opts       Options
+	migrations fs.FS
+	// handler 在 Setup 阶段装配（依赖解析之后）；Mount 必须发生在 Register
+	// 阶段，因此路由经一层间接引用——Setup 先于 HTTP 监听，不会打到 nil。
+	handler http.Handler
+}
+
+func (m *mod) Name() string { return "{{.Name}}" }
+
+// Register 只做声明：Provide 服务、登记迁移 / 路由 / 健康检查（DESIGN §5.1）。
+func (m *mod) Register(reg *appkit.Registry) error {
+	appkit.Provide(reg, func(*appkit.Registry) (*{{.Name}}.Service, error) {
+		return {{.Name}}.NewService(
+			postgres.NewStore(m.opts.Pool),
+			pgtx.New(m.opts.Pool),
+			outbox.NewPublisher(m.opts.Pool, Schema),
+		), nil
+	})
+	// 对外契约（psp-contracts 生成后）改用 appkit.ProvideContract +
+	// 生成的 wrapper 注册：每次跨模块调用都经 contract.Call（DESIGN §5.3）。
+
+	reg.Migrations(Schema, m.migrations)
+
+	reg.Setup(func(context.Context) error {
+		svc := appkit.MustResolve[*{{.Name}}.Service](reg)
+		m.handler = {{.Name}}http.NewPingHandler(m.opts.Log, svc)
+		// 消费外域事件样例（声明后组合根必须以 appkit.Bus 注入总线）：
+		// reg.Consumer("other.something.v1",
+		//     outbox.Inbox(m.opts.Pool, Schema, inbox.Consumer, inbox.NewHandler(svc)))
+		return nil
+	})
+	reg.Mount({{.Name}}http.PingPattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.handler.ServeHTTP(w, r)
+	}))
+
+	reg.Health("postgres", health.CheckFunc(func(ctx context.Context) error {
+		return m.opts.Pool.Ping(ctx)
+	}))
+	return nil
+}

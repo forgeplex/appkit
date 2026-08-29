@@ -1,0 +1,14 @@
+module {{.Module}}
+
+go 1.26
+{{if .Devel}}
+// appkit 由本地源码构建（无发布 tag）：不写 require——对不存在版本的
+// require 会让 go 命令去代理拉取而失败。先跑 `appkit dev` 生成 go.work，
+// appkit 由工作区提供；appkit 发版后补 require 真实 tag 并 go mod tidy。
+require github.com/jackc/pgx/v5 {{.PgxVersion}}
+{{else}}
+require (
+	github.com/forgeplex/appkit {{.AppkitVersion}}
+	github.com/jackc/pgx/v5 {{.PgxVersion}}
+)
+{{end}}

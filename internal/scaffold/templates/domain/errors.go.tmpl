@@ -1,0 +1,14 @@
+package {{.Name}}
+
+import "github.com/forgeplex/appkit/apperr"
+
+// 错误 = apperr + 合约错误码：错误身份是错误码（apperr.Is），单体与
+// 微服务两种形态下判定一致（DESIGN §5.3）。合约仓库（psp-contracts）
+// 就绪后，错误码改用其生成的 codes 常量，此处只保留错误模板。
+//
+// 本包禁 import net/http（约束 1），HTTP 状态用字面量。
+var (
+	// ErrNotFound 是占位错误模板：apperr 值不可变，WithDetail/WithMessage
+	// 返回副本，共享模板是安全的。
+	ErrNotFound = apperr.New("{{.Upper}}_NOT_FOUND", 404, "对象不存在")
+)

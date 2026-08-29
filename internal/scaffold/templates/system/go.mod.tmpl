@@ -1,0 +1,15 @@
+module {{.Module}}
+
+go 1.26
+{{if .Devel}}
+// appkit 由本地源码构建（无发布 tag）：不写 require——对不存在版本的
+// require 会让 go 命令去代理拉取而失败。先跑 `appkit dev` 生成 go.work，
+// appkit 由工作区提供；appkit 发版后补 require 真实 tag 并 go mod tidy。
+{{else}}
+require github.com/forgeplex/appkit {{.AppkitVersion}}
+{{end}}
+// 各域 repo 在此 require（唯一 import 各域 Module 入口的地方，DESIGN §1）：
+// require (
+//	github.com/forgeplex/ledger v0.1.0
+//	github.com/forgeplex/gateway v0.1.0
+// )
