@@ -18,9 +18,16 @@ import (
 
 // appConfig 分层加载：-config 指定的 yaml → {{.EnvPrefix}}_* 环境变量覆盖。
 type appConfig struct {
-	Addr string    `koanf:"addr"`
-	Env  string    `koanf:"env" validate:"omitempty,oneof=dev staging prod"`
-	Log  logConfig `koanf:"log"`
+	Addr     string    `koanf:"addr"`
+	Env      string    `koanf:"env" validate:"omitempty,oneof=dev staging prod"`
+	Database dbConfig  `koanf:"database"`
+	Log      logConfig `koanf:"log"`
+}
+
+type dbConfig struct {
+	// URL 形如 postgres://user:pass@host:5432/db?sslmode=disable。
+	// 各域共用此库（每域独占自己的 schema，DESIGN §8）。
+	URL string `koanf:"url"`
 }
 
 type logConfig struct {

@@ -9,6 +9,7 @@ import (
 	"github.com/forgeplex/appkit/audit"
 	"github.com/forgeplex/appkit/idem"
 	"github.com/forgeplex/appkit/outbox"
+	"github.com/forgeplex/appkit/ruleset"
 )
 
 // domainFiles 是域仓库骨架的模板清单（DESIGN §4 的 Go 惯用形态）。
@@ -29,6 +30,7 @@ var domainFiles = []fileSpec{
 	{tmpl: "module.go.tmpl", path: "internal/module/module.go"},
 	{tmpl: "sqlc.yaml.tmpl", path: "sqlc.yaml"},
 	{tmpl: "queries.sql.tmpl", path: "db/queries/example.sql"},
+	{tmpl: "dev.yaml.tmpl", path: "config/dev.yaml"},
 }
 
 // Domain 生成业务域仓库骨架。out 承接进度输出（可为 nil）。
@@ -49,9 +51,14 @@ func Domain(o Options, out io.Writer) error {
 	if err := writeFile(sqlPath, []byte(baseMigrationSQL(o.Name))); err != nil {
 		return fmt.Errorf("new domain %s: %w", o.Name, err)
 	}
+	// 生成即合规：lint / CI 配置直接物化，不留"忘了跑 sync"的窗口。
+	// 升级 appkit 后由 appkit sync 刷新，CI 的 sync --check 校验未漂移。
+	if _, err := ruleset.Sync(o.Dir, o.AppkitVersion); err != nil {
+		return fmt.Errorf("new domain %s: 物化规则集: %w", o.Name, err)
+	}
 	summarize(out, "域仓库", o.Dir, []string{
-		"appkit sync   # 物化 lint / CI 配置",
 		"appkit dev    # 生成 go.work 联调本地 appkit（appkit 未发版时必需）",
+		"make run      # 零依赖试跑（最小模式）；make run-db 进完整模式",
 		"make check && make test",
 	})
 	return nil
@@ -63,6 +70,9 @@ func baseMigrationSQL(name string) string {
 	var b strings.Builder
 	b.WriteString("-- 0001_appkit_base.sql —— appkit 基础设施表（outbox/inbox/幂等/审计），每 schema 一套（DESIGN §8）。\n")
 	b.WriteString("-- 本文件由 appkit new 调用库函数生成（库函数是 DDL 唯一事实源）；升级 appkit 后可重新生成刷新。\n\n")
+	// pgmigrate 运行期本来会建 schema；这里再写一份是给 sqlc 的静态分析看的
+	// （sqlc 只读迁移文件，看不到运行期行为），幂等重复无害。
+	fmt.Fprintf(&b, "CREATE SCHEMA IF NOT EXISTS %q;\n\n", name)
 	b.WriteString(outbox.MigrationSQL(name))
 	b.WriteString("\n")
 	b.WriteString(idem.MigrationSQL(name))

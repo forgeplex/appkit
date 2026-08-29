@@ -29,6 +29,10 @@ const Schema = "{{.Name}}"
 type Options struct {
 	Log  *slog.Logger
 	Pool *pgxpool.Pool
+	// Bus 是事件总线（单体单库用 outbox.NewDirectBus()，拆分部署换 NATS/Kafka
+	// 实现）。非 nil 时模块自带 outbox relay：本域事件自动外发。
+	// 组合根应把同一个实例传给全部模块并注入 appkit.Bus(bus)。
+	Bus outbox.Bus
 }
 
 // New 构造模块。migrations 是 db/migrations 的 embed FS（由根包注入）。
@@ -75,5 +79,26 @@ func (m *mod) Register(reg *appkit.Registry) error {
 	reg.Health("postgres", health.CheckFunc(func(ctx context.Context) error {
 		return m.opts.Pool.Ping(ctx)
 	}))
+
+	// outbox relay：轮询本域 outbox 表并经 Bus 外发（退避/死信见 outbox 包文档）。
+	// OnStop 必须 select ctx——关停预算耗尽时不能吊死整个进程。
+	if m.opts.Bus != nil {
+		relay := outbox.NewRelay(m.opts.Pool, Schema, m.opts.Bus)
+		done := make(chan error, 1)
+		reg.OnStart(appkit.StageWorker, func(ctx context.Context) error {
+			go func() { done <- relay.Run(ctx) }()
+			return nil
+		})
+		reg.OnStop(func(ctx context.Context) error {
+			select {
+			case err := <-done:
+				return err
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		})
+	} else {
+		m.opts.Log.Warn("{{.Name}}: 未注入 Bus，outbox relay 未启动——本域事件只落表不外发")
+	}
 	return nil
 }

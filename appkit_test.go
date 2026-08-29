@@ -80,6 +80,23 @@ func TestResolveCycle(t *testing.T) {
 	}
 }
 
+func TestModuleFunc(t *testing.T) {
+	m := ModuleFunc("inline", func(reg *Registry) error {
+		ProvideValue[greeter](reg, localGreeter{from: "inline"})
+		return nil
+	})
+	if m.Name() != "inline" {
+		t.Fatalf("Name = %q", m.Name())
+	}
+	reg := newRegistry()
+	if err := m.Register(reg); err != nil {
+		t.Fatal(err)
+	}
+	if got := MustResolve[greeter](reg).Greet(); got != "hello from inline" {
+		t.Fatalf("Register 未生效: %q", got)
+	}
+}
+
 type wrappedGreeter struct{ inner greeter }
 
 func (w wrappedGreeter) Greet() string { return "wrapped(" + w.inner.Greet() + ")" }

@@ -1,13 +1,32 @@
 # {{.Name}} 域仓库开发入口。
-# 首次开发先跑：appkit sync（物化 lint/CI 配置）、appkit dev（生成 go.work 联调）。
+# lint/CI 配置已在 new 时物化（appkit sync 可随 appkit 升级刷新）；
+# 本地联调先跑 appkit dev（生成 go.work）。
 
 GO ?= go
+DEV_DB_URL := postgres://postgres:dev@127.0.0.1:54329/{{.Name}}_dev?sslmode=disable
 
-.PHONY: gen lint check test
+.PHONY: run dev-db run-db gen lint check test
+
+# 零依赖试跑：config/dev.yaml 的 database.url 留空 → 最小模式（仅探针 + /ping）。
+run:
+	$(GO) run ./cmd/{{.Name}}d
+
+# 启动/复用一次性开发 Postgres（docker），与 config/dev.yaml 注释里的地址一致。
+dev-db:
+	docker start {{.Name}}-dev-pg 2>/dev/null || docker run -d --name {{.Name}}-dev-pg \
+		-e POSTGRES_PASSWORD=dev -e POSTGRES_DB={{.Name}}_dev \
+		-p 127.0.0.1:54329:5432 postgres:18-alpine
+	@until docker exec {{.Name}}-dev-pg pg_isready -U postgres -q; do sleep 0.3; done
+
+# 完整模式一条命令：起开发库 + 以环境变量注入 database.url 起服。
+run-db: dev-db
+	{{.EnvPrefix}}_DATABASE__URL='$(DEV_DB_URL)' $(GO) run ./cmd/{{.Name}}d
 
 # 重新生成 sqlc 代码（生成物禁手改，CI drift check）。
+# 钉版本经 go run 执行，无需预装；本机装了 sqlc 可 SQLC=sqlc make gen。
+SQLC ?= $(GO) run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0
 gen:
-	sqlc generate
+	$(SQLC) generate
 
 # golangci-lint（配置由 appkit sync 物化，勿手改）。
 lint:

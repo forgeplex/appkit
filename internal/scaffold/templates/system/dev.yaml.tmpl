@@ -2,6 +2,11 @@
 # （{{.EnvPrefix}}_LOG__LEVEL 覆盖 log.level）。
 addr: ":8080"
 env: dev
+database:
+  # 各域共用一个库（每域独占自己的 schema）。require 域仓库并取消 main.go
+  # 里 pool 注释后填写，形如：
+  # url: postgres://postgres:dev@127.0.0.1:5432/{{.Name}}_dev?sslmode=disable
+  url: ""
 log:
   level: debug
   format: text

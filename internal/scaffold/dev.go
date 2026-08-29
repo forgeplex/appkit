@@ -51,7 +51,26 @@ func Dev(dir, root string, out io.Writer) error {
 		return fmt.Errorf("dev: %w", err)
 	}
 	fmt.Fprintf(out, "go.work 已纳入 %d 个 module 目录：%s\n", len(uses), strings.Join(uses, "、"))
+	warnAppkitMissing(absDir, uses, out)
 	return nil
+}
+
+// warnAppkitMissing 在工作区不含 appkit 本体时给出提示：appkit 未发版期间，
+// 缺了它则所有 forgeplex 依赖都会去远程解析（必然失败或拉到不可控版本）。
+func warnAppkitMissing(absDir string, uses []string, out io.Writer) {
+	for _, u := range uses {
+		dir := u
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(absDir, dir)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, "go.mod"))
+		if err == nil && strings.Contains(string(data), "module github.com/forgeplex/appkit\n") {
+			return
+		}
+	}
+	fmt.Fprintln(out, "提示：工作区未包含 appkit 本体。appkit 未发版（无 tag）期间需要它在工作区内，")
+	fmt.Fprintln(out, "      否则依赖解析会走远程。把 appkit clone 到 -root 目录下，或手动执行：")
+	fmt.Fprintln(out, "      go work use <appkit checkout 路径>")
 }
 
 // collectModuleDirs 收集 go work use 的目标：dir 自身（有 go.mod 时，记作 "."）

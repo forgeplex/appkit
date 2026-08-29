@@ -46,6 +46,20 @@ type Event struct {
 // （框架的 inbox 去重只保证「至少一次投递、至多一次生效」协作成立）。
 type EventHandler func(ctx context.Context, evt Event) error
 
+// ModuleFunc 把函数适配为 Module，便于在组合根内联轻量模块
+// （探针旁路、静态路由、无数据库的最小模式等）。业务域仍应实现完整 Module。
+func ModuleFunc(name string, register func(reg *Registry) error) Module {
+	return funcModule{name: name, register: register}
+}
+
+type funcModule struct {
+	name     string
+	register func(reg *Registry) error
+}
+
+func (m funcModule) Name() string                 { return m.name }
+func (m funcModule) Register(reg *Registry) error { return m.register(reg) }
+
 // Subscriber 是事件总线的订阅端最小接口（outbox.DirectBus 实现了它）。
 // 通过 Bus 选项注入后，框架在装配阶段把 Registry.Consumer 登记的消费者
 // 逐条 Subscribe；有消费者却未注入 Bus 会在启动期报错。

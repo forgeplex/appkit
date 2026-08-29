@@ -34,6 +34,7 @@ go run github.com/forgeplex/appkit/cmd/appkit help
 
 | 命令 | 作用 |
 |---|---|
+| `appkit doctor` | 环境体检：GOPRIVATE、git 私有仓库凭据、go.work、docker，附修复命令 |
 | `appkit new domain <name>` | 生成业务域仓库骨架（含 outbox/idem/audit 基础迁移，离线可编译） |
 | `appkit new system <name>` | 生成组合仓库骨架（`-target` 单体↔微服务） |
 | `appkit dev` | go.work 多仓本地联调（幂等） |

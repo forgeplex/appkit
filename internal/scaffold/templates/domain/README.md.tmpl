@@ -6,12 +6,16 @@ github.com/forgeplex/appkit，设计文档 docs/DESIGN.md）。
 ## 快速开始
 
 ```sh
-appkit sync    # 物化 lint / CI 配置（.golangci.yml 等，CI 校验未漂移）
 appkit dev     # 生成 go.work，联调本地 appkit / 各域仓库（go.work 不提交）
+make run       # ★ 零依赖试跑：最小模式（仅 /healthz /readyz /ping，数据面未启用）
+make run-db    # 完整模式：自动起一次性开发 Postgres（docker）并注入 database.url
 make check     # 架构检查
 make test
-go run ./cmd/{{.Name}}d    # 独立微服务形态起服（需先配置 database.url）
 ```
+
+lint / CI 配置（.golangci.yml、.go-arch-lint.yml、.github/workflows/ci.yml）
+已在 `appkit new` 时物化；升级 appkit 后跑 `appkit sync` 刷新，CI 会校验未漂移。
+运行配置在 `config/dev.yaml`，任意键可被 `{{.EnvPrefix}}_*` 环境变量覆盖。
 
 ## 结构
 

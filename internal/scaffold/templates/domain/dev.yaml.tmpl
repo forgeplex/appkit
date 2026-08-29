@@ -1,0 +1,12 @@
+# {{.Name}}d 开发配置。任意键可被 {{.EnvPrefix}}_* 环境变量覆盖
+# （双下划线是层级分隔符：{{.EnvPrefix}}_DATABASE__URL 覆盖 database.url）。
+addr: ":8080"
+env: dev
+log:
+  level: debug
+  format: text
+database:
+  # 留空 = 最小模式：只有 /healthz /readyz /ping，数据面（迁移/outbox/幂等/审计）未启用。
+  # 完整模式：make dev-db 启动一次性 Postgres 后，取消下一行注释（或 make run-db 直接以环境变量注入）。
+  # url: postgres://postgres:dev@127.0.0.1:54329/{{.Name}}_dev?sslmode=disable
+  url: ""

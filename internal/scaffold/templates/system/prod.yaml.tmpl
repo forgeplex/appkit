@@ -1,6 +1,9 @@
 # {{.Name}} 生产环境配置。密钥不进配置文件，一律走 {{.EnvPrefix}}_* 环境变量注入。
 addr: ":8080"
 env: prod
+database:
+  # 生产库地址含密钥，走 {{.EnvPrefix}}_DATABASE__URL 环境变量注入，此处留空。
+  url: ""
 log:
   level: info
   format: json

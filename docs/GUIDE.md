@@ -17,23 +17,55 @@ github.com/forgeplex/
 同一个 sso 二进制：`-target=all` 是单体，`-target=authn` 是微服务——
 部署形态是启动参数，不是架构决策。
 
-## 1. 前置条件
+## 1. 前置条件（私有仓库必读，跳过必翻车）
+
+forgeplex 全部仓库是私有的。Go 工具链拉取私有模块需要**两件事都配好**，
+缺一件就会得到两种典型报错：
 
 ```sh
-# Go 1.26+；私有仓库拉取：
-go env -w GOPRIVATE=github.com/forgeplex/*
+# ① 让 go 跳过公共代理与校验库（否则 sum.golang.org 对私有模块必然 404）
+go env -w GOPRIVATE='github.com/forgeplex/*'
 
-# 构建 CLI（appkit 发版打 tag 后可改用 go install github.com/forgeplex/appkit/cmd/appkit@latest）
+# ② 让 git 对 forgeplex 走 SSH 而不是匿名 https
+#   （否则 "fatal: could not read Username for 'https://github.com'"）
+git config --global url."git@github.com:forgeplex/".insteadOf "https://github.com/forgeplex/"
+```
+
+CI 环境（无 SSH key）用令牌变体，二选一替代 ②：
+
+```sh
+# GitHub Actions 等：写 ~/.netrc
+printf 'machine github.com\nlogin x-access-token\npassword %s\n' "$GITHUB_TOKEN" >> ~/.netrc
+```
+
+配完跑一次体检（每台新机器、每条新 CI 流水线都值得跑）：
+
+```sh
+appkit doctor
+```
+
+它会检查 Go 版本、GOPRIVATE 覆盖面、git 凭据、docker，以及——在仓库目录里——
+是否处于 go.work 工作区（appkit 未打 tag 前，域仓库编译**必须**在工作区内，
+否则 go 会去远程解析 appkit 版本）。任何 ✗ 都附带可直接复制的修复命令。
+
+**故障对照表：**
+
+| 你看到的报错 | 缺了什么 |
+|---|---|
+| `reading https://sum.golang.org/lookup/...: 404 Not Found` | ① GOPRIVATE |
+| `fatal: could not read Username for 'https://github.com'` | ② git SSH 重写 / 令牌 |
+| `go: finding module for package github.com/forgeplex/appkit/...`（本地开发时） | 不在 go.work 工作区：仓库目录跑 `appkit dev` |
+
+构建 CLI（appkit 发版打 tag 后可改用 `go install github.com/forgeplex/appkit/cmd/appkit@latest`）：
+
+```sh
 git clone git@github.com:forgeplex/appkit.git
 cd appkit && go build -o ~/bin/appkit ./cmd/appkit
 ```
 
-本地跑集成测试需要一个 Postgres（任何方式，容器即可）：
-
-```sh
-docker run -d --name sso-dev-pg -e POSTGRES_PASSWORD=dev -e POSTGRES_DB=sso \
-  -p 127.0.0.1:55432:5432 postgres:18-alpine
-```
+本地数据库不用提前准备：域仓库骨架自带 `make dev-db`（一次性 docker Postgres，
+端口 54329）与 `make run-db`。只有跑组合仓库或自建库时才需要自己起一个
+Postgres——注意选端口前先确认没被占用（`lsof -iTCP:<端口> -sTCP:LISTEN`）。
 
 ## 2. 第一步：拆域（最重要的决定，先想清楚再敲命令）
 
@@ -62,8 +94,9 @@ appkit new domain authn    -dir authn
 appkit new domain clients  -dir clients
 ```
 
-每个仓库生成 17 个文件，**生成即合规**（骨架自身通过 `appkit check` 与
-`appkit sync --check`）。以 identity 为例，你需要知道的文件：
+每个仓库生成 21 个文件（含 `new` 时自动物化的 lint / CI 配置——不需要再跑
+`appkit sync`，它只在升级 appkit 后用来刷新），**生成即合规**（骨架自身通过
+`appkit check` 与 `appkit sync --check`）。以 identity 为例，你需要知道的文件：
 
 | 文件 | 是什么 | 你要做什么 |
 |---|---|---|
@@ -75,15 +108,19 @@ appkit new domain clients  -dir clients
 | `db/migrations/0001_appkit_base.sql` | outbox/inbox/幂等/审计四张基础表（生成期由框架库函数拼装） | 别动；自己的表从 `0002_` 开始 |
 | `db/queries/` + `sqlc.yaml` | SQL 唯一存在地；sqlc 生成到 `internal/postgres/sqlc` | 写 `.sql`，`make gen` |
 | `identity.go` | 唯一导出面：`Module()`（只有组合仓库和本仓 cmd/ 会 import） | 一般不动 |
-| `cmd/identityd/` | 独立微服务部署入口 | 一般不动 |
+| `cmd/identityd/` | 独立微服务部署入口（`database.url` 留空 = 最小模式） | 一般不动 |
+| `config/dev.yaml` | 运行配置；任意键可被 `IDENTITYD_*` 环境变量覆盖 | 完整模式时填 `database.url` |
 | `.appkit.yml` | 框架配置：`check`/`sync`/`dev` 读取 | 接入合约仓库后填 `contracts:` |
 
 生成后立刻执行（每个域仓库都要）：
 
 ```sh
 cd identity
-appkit sync      # 物化 .golangci.yml / .go-arch-lint.yml / CI 引用
-appkit dev       # appkit 未发版期间：生成 go.work 引用本地 appkit
+appkit dev       # 生成 go.work。★ appkit 未发版期间，appkit 的 checkout 必须
+                 # 位于同一根目录下才会被纳入（不在则按 dev 的提示手动
+                 # go work use <appkit 路径>），否则依赖解析会走远程
+make run         # 零依赖试跑：最小模式（仅 /healthz /readyz /identity/ping）
+make run-db      # 完整模式：自动起一次性开发 Postgres（docker）并注入 database.url
 make check && make test
 ```
 
@@ -115,7 +152,8 @@ CREATE TABLE identity.users (
 INSERT INTO identity.users (id, email, password_hash) VALUES ($1, $2, $3);
 ```
 
-`make gen` 生成类型安全的查询代码。
+`make gen` 生成类型安全的查询代码（sqlc 版本已钉死、经 `go run` 执行，无需预装；
+基础迁移里已含 `CREATE SCHEMA`，sqlc 的静态分析开箱即通）。
 
 **② 业务包**（`internal/identity/`）——用例的标准形态：
 
@@ -130,7 +168,8 @@ func (s *Service) CreateUser(ctx context.Context, in CreateUser) (User, error) {
         if err := s.store.InsertUser(ctx, u); err != nil {   // Store 接口，实现在 postgres 包
             return err
         }
-        evt, err := ssoevents.UserCreated{UserID: u.ID, Email: u.Email}.Event()
+        // 事件类型来自 §5 的合约仓库生成物（identityv1）；可先完成 §5 再回来接这两行。
+        evt, err := identityv1.UserCreated{UserID: u.ID, Email: u.Email}.Event()
         if err != nil {
             return err
         }
@@ -140,19 +179,24 @@ func (s *Service) CreateUser(ctx context.Context, in CreateUser) (User, error) {
 }
 ```
 
-事务提交后，框架的 outbox relay 自动把事件投递给订阅方——你不需要也**不能**
-"手动发消息"（事务外发布会被运行时守卫拒绝，忘发事件则根本写不出来）。
+事务提交后，模块自带的 outbox relay（骨架已装配，`Options.Bus` 注入时启动）
+自动把事件投递给订阅方——你不需要也**不能**"手动发消息"（事务外发布会被
+运行时守卫拒绝，忘发事件则根本写不出来）。
 
 **③ Store 实现**（`internal/postgres/`）：从 ctx 取事务（`pgtx.From`），调 sqlc 生成代码。
 
 **④ handler**（`internal/http/`）：解码 → 调 `Service` → `httpserver.WriteError` 统一出错出口
 （RFC 9457 problem+json，错误码即错误身份）。
 
-**⑤ 挂进 module**（`internal/module/module.go`）：`reg.Mount("POST /users", ...)`。
+**⑤ 挂进 module**（`internal/module/module.go`）：`reg.Mount("POST /identity/users", ...)`。
+需要幂等的写接口（支付、建用户）用中间件包住 handler，客户端带 `Idempotency-Key` 头：
 
-金额/审计/幂等这三个 PSP 级原语在 SSO 里同样可用：登录接口套
-`idem.Middleware`（客户端带 `Idempotency-Key` 头），敏感变更用 `audit.Recorder`
-（与业务写同事务）。
+```go
+idemMW := idem.Middleware(idem.NewStore(m.opts.Pool, Schema), m.opts.Log)
+reg.Mount("POST /identity/users", idemMW(usersHandler))
+```
+
+敏感变更再加 `audit.Recorder`（与业务写同事务）；金额一律 `money.Money`。
 
 ## 5. 第四步：契约仓库（域间协作的唯一通道）
 
@@ -201,6 +245,16 @@ appkit gen events -in identityv1/events.yaml -out identityv1/events.gen.go
 type Service interface {
     VerifyCredential(ctx context.Context, req VerifyCredentialRequest) (VerifyCredentialReply, error)
 }
+
+// DTO 一律传值、可序列化（按网络边界设计）。
+type VerifyCredentialRequest struct {
+    Email    string `json:"email"`
+    Password string `json:"password"`
+}
+type VerifyCredentialReply struct {
+    UserID string `json:"user_id"`
+    OK     bool   `json:"ok"`
+}
 ```
 
 ```sh
@@ -236,31 +290,36 @@ cd sso && appkit dev
 按 `cmd/sso/main.go` 里的注释样例完成装配（这是全系统唯一的组合根）：
 
 ```go
-pool, err := pgtx.NewPool(ctx, cfg.Database.URL)     // 各域共用连接池（按库共享）
-// ...
+pool, err := pgtx.NewPool(ctx, cfg.Database.URL)     // 各域共用连接池（按库共享；
+// ...                                               //  骨架 config 已含 database 段）
 bus := outbox.NewDirectBus()                          // 单体单库：进程内直投，无 broker
 app := appkit.New(
     []appkit.Module{
-        identity.Module(identity.Options{Log: log, Pool: pool}),
-        authn.Module(authn.Options{Log: log, Pool: pool}),
-        clients.Module(clients.Options{Log: log, Pool: pool}),
+        // 同一个 bus 传给每个模块：模块用它跑自己的 outbox relay。
+        identity.Module(identity.Options{Log: log, Pool: pool, Bus: bus}),
+        authn.Module(authn.Options{Log: log, Pool: pool, Bus: bus}),
+        clients.Module(clients.Options{Log: log, Pool: pool, Bus: bus}),
     },
     appkit.Target(target),
-    appkit.Bus(bus),
+    appkit.Bus(bus),                                  // 消费者订阅端
     appkit.Migrator(pgmigrate.Runner(pool)),          // 启动时按 schema 应用各域迁移
     appkit.Middleware(httpserver.Base(log)...),
     appkit.HTTPAddr(cfg.Addr),
     appkit.Logger(log),
-    // target 之外的域自动落到远程绑定（HTTP client 实现同一契约接口）：
-    appkit.Remote[identityv1.Service](func(*appkit.Registry) (identityv1.Service, error) {
-        return identityv1.NewClient(cfg.Endpoints.Identity), nil
-    }),
+    // target 之外的域落到远程绑定：注入实现同一契约接口的 HTTP client。
+    // ★ client 目前需手写（对着契约接口实现，错误经 apperr.FromProblem 重建，
+    //   错误码身份跨网络不变）；`appkit gen client` 在路线图上。
+    // appkit.Remote[identityv1.Service](func(*appkit.Registry) (identityv1.Service, error) {
+    //     return identityclient.New(cfg.Endpoints.Identity), nil
+    // }),
 )
 return app.Run(ctx)
 ```
 
-`go.mod` require 三个域 + 合约仓库；本地联调 `appkit dev -root ..` 一条命令搞定
-（go.work 已在 .gitignore，不提交）。
+`go.mod` require 三个域 + 合约仓库——**这是打 tag 发版之后的形态**；未发版期间
+不要写这些 require（对不存在版本的 require 会去代理拉取而失败），依赖全部由
+`appkit dev -root ..` 生成的 go.work 提供（go.work 在 .gitignore，不提交；
+发版节奏见 FAQ）。
 
 **部署矩阵（同一镜像）：**
 
@@ -275,19 +334,37 @@ return app.Run(ctx)
 
 ## 7. 第六步：跑起来
 
+单个域仓库（identity 目录内）：
+
 ```sh
-cd sso
-make run                                   # -target=all，读 config/dev.yaml
-curl localhost:8080/healthz                # 存活探针
-curl localhost:8080/readyz                 # 就绪探针（含各域 postgres 检查）
-curl -X POST localhost:8080/users -d '{"email":"a@b.c","password":"..."}' \
-     -H 'Idempotency-Key: 5f0c...'         # 重发同 key 同 body → 回放缓存响应
+make run        # 最小模式：零依赖，database.url 留空
+curl localhost:8080/identity/ping          # → pong (最小模式)
+
+make run-db     # 完整模式：自动起一次性 Postgres + 迁移 + relay
+curl localhost:8080/readyz                 # → {"status":"ready"}
+curl -i localhost:8080/identity/ping       # → 204（占位用例走了真实事务边界）
 ```
 
-测试：单测不需要任何环境；数据层集成测试用环境变量开启：
+组合仓库（sso 目录内，`config/dev.yaml` 填好 database.url 后）：
 
 ```sh
-TEST_DATABASE_URL='postgres://postgres:dev@127.0.0.1:55432/sso?sslmode=disable' make test
+make run                                   # -target=all 单体
+curl localhost:8080/healthz                # 存活探针
+curl localhost:8080/readyz                 # 就绪探针（含各域 postgres 检查）
+curl -X POST localhost:8080/identity/users \
+     -d '{"email":"a@b.c","password":"..."}' \
+     -H 'Idempotency-Key: 5f0c...'         # 重发同 key 同 body → 回放缓存响应
+                                           #（响应头 Idempotency-Replayed: true）
+```
+
+端口被占时不用改文件：`SSO_ADDR=:18080 make run`（域仓库同理，
+`IDENTITYD_ADDR=...`）——任意配置键都能这样覆盖。
+
+测试：单测不需要任何环境。`TEST_DATABASE_URL` 是**给你将来写的数据层集成
+测试**的全系统约定（appkit 自身与 CI 流水线都用它；骨架初始没有测试文件）：
+
+```sh
+TEST_DATABASE_URL='postgres://postgres:dev@127.0.0.1:54329/identity_dev?sslmode=disable' make test
 ```
 
 ## 8. 第七步：CI 与约束收口
