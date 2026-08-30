@@ -44,13 +44,20 @@ linters:
       # 再包一层只会把错误码埋进 message，让 apperr.Is 认不出来。
       # 驱动错误同理：把 pgx/sqlc 的错误翻译成域错误是 internal/postgres 的
       # 职责，逐个 Scan/Exec 套 fmt.Errorf 只会逼出满仓 //nolint。
-      # 放行的只有这三类——其余外部包的错误原样漏出照报（internal/postgres 里也报）。
+      # 域内部同理：错误在 internal/ledger/** 之间流动时早已是 *apperr.Error，
+      # 一路加前缀只会让同一个错误码顶着五层"查会话: 取令牌: ..."的壳出去。
+      # 放行的只有这四类——其余外部包的错误原样漏出照报（internal/postgres 里也报）。
       ignore-package-globs:
         - github.com/forgeplex/appkit**
         - github.com/jackc/pgx/**
         - github.com/forgeplex/ledger/internal/postgres/sqlc
+        - github.com/forgeplex/ledger/internal/ledger/**
       # 业务包调用自己定义的 Store / Publisher 接口是标准形态：把驱动错误
       # 翻译成域错误是实现方（internal/postgres）的职责，不是调用点的。
+      #
+      # 这条只覆盖域根包：wrapcheck 拿来匹配的是「包名.接口名」，不是导入路径，
+      # 所以子包（ledger/session 之类）里的接口写不进这个正则——它们由上面
+      # 那条 ignore-package-globs 兜住。
       ignore-interface-regexps:
         - ^ledger\.
     forbidigo:

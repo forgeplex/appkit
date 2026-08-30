@@ -35,19 +35,30 @@ components:
       - module
       - module/**
 deps:
-  # domain 不出现在 deps：internal/ledger 不得依赖任何内部组件。
+  # 每个组件都列出自己：go-arch-lint 把「同组件内跨包 import」也当成一条边，
+  # 不显式放行的话，凡是长出子包的域（上面的 ledger/** 正是为此而设）
+  # 每一次内部 import 都会报违规，规则很快就没人看了。
+  #
+  # domain 只依赖自己：internal/ledger 不得依赖任何**其他**内部组件。
+  domain:
+    mayDependOn:
+      - domain
   postgres:
     mayDependOn:
       - domain
+      - postgres
   http:
     mayDependOn:
       - domain
+      - http
   inbox:
     mayDependOn:
       - domain
+      - inbox
   module:
     mayDependOn:
       - domain
       - postgres
       - http
       - inbox
+      - module
