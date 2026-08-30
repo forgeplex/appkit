@@ -507,10 +507,21 @@ HTTP 入站不在此列：`otelhttp` 已经产出 `http.server.request.duration`
 - 事件：outbox 发布时快照进 `Event.Meta`，relay 投递前还原进 ctx——异步链路上也连得起来（自动）。
 
 **出站 HTTP 是唯一要你自己接的一段**：合约仓库的 client 是手写的（`appkit gen`
-只生成 events/errors/wrap，不生成 client），构造请求时得调一次
-`callctx.Inject(callctx.From(ctx), req.Header.Set)`。漏了它，进程内绑定拿得到
-tenant、远程 client 拿不到——"部署形态是启动参数"就此失效，且只在真拆分那天暴露。
-这条没有机检：`apptest.Conform` 比对错误码与返回值，但看不见 client 的请求头。
+只生成 events/errors/wrap，不生成 client）。装配 client 时接上 `callctx.Transport`：
+
+```go
+client := &http.Client{Transport: callctx.Transport{Caller: "ledger"}}
+```
+
+`Caller` 填**自己**的服务名。它的语义是"谁调的我"，留空会把上一跳的名字原样透传
+下去，下游据此做的归因、限流与配额也就跟着错。链路起点看 request id，不看 caller。
+
+也可以在构造每个请求时手写 `callctx.Inject(callctx.From(ctx), req.Header.Set)`，
+但那把"会不会漏"摊到了每一个调用点上，而 `Transport` 只有装配处一处。
+
+漏了这一段，进程内绑定拿得到 tenant、远程 client 拿不到——"部署形态是启动参数"
+就此失效，且只在真拆分那天暴露。**装没装上没有机检**：`apptest.Conform` 比对
+错误码与返回值，但看不见 client 的请求头。
 
 它是 struct 的具名字段而不是 map，所以业务代码没法自己往里塞东西（那等于把防火墙拆了）。
 要读当前值：`callctx.From(ctx)`。

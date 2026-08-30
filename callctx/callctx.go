@@ -14,13 +14,16 @@
 //     还原进 ctx——异步链路上 request id 同样连得起来。
 //
 // 剩下的半条是出站 HTTP：合约仓库的 client 是手写的（appkit gen 只生成
-// events/errors/wrap，不生成 client），必须自己在构造请求时调一次
+// events/errors/wrap，不生成 client），得自己接上。装配 Transport 一次即可：
 //
-//	callctx.Inject(callctx.From(ctx), req.Header.Set)
+//	client := &http.Client{Transport: callctx.Transport{Caller: "ledger"}}
 //
-// 漏了它，进程内绑定拿得到 tenant、远程 client 拿不到——恰好是「部署形态是
-// 启动参数」失效的形态，而且只在真拆分部署那天暴露。这一条目前没有机检
-// （apptest.Conform 比对错误码与返回值，但看不见 client 的请求头）。
+// 也可以在构造每个请求时手写 callctx.Inject(callctx.From(ctx), req.Header.Set)，
+// 但那把「会不会漏」摊到了每一个调用点上，而 Transport 只有装配处一处。
+//
+// 两条路都仍然靠人接：漏了的话，进程内绑定拿得到 tenant、远程 client 拿不到，
+// 恰好是「部署形态是启动参数」失效的形态，而且只在真拆分部署那天暴露。这一条
+// 没有机检（apptest.Conform 比对错误码与返回值，看不见 client 的请求头）。
 //
 // 本包只依赖标准库。
 package callctx
@@ -28,6 +31,7 @@ package callctx
 import (
 	"context"
 	"log/slog"
+	"net/http"
 )
 
 // Meta 是跨边界传播的元数据。零值可用，字段按需填。
@@ -121,6 +125,53 @@ func Extract(get func(key string) string) Meta {
 		TenantID:  get(HeaderTenantID),
 		Caller:    get(HeaderCaller),
 	}
+}
+
+// Transport 是出站 HTTP 的 http.RoundTripper：自动把 ctx 里的白名单写进请求头。
+// 装配一次，此后该 client 发出的每个请求都带上：
+//
+//	client := &http.Client{Transport: callctx.Transport{Caller: "ledger"}}
+//
+// 这与「在每个调用点手写 Inject」的差别不在省几行，而在漏点的数量：手写时
+// 每一个新增的调用点都是一次机会，接 Transport 则整个 client 只有装配处一处。
+// 而 callctx 漏掉的失效是静默的——进程内绑定拿得到 tenant、远程 client 拿不到，
+// 只在真拆分部署那天暴露，所以漏点越少越好。
+//
+// 零值可用（Base 走 http.DefaultTransport，Caller 透传 ctx 里的值），但多数
+// 时候你该显式填 Caller，见该字段说明。
+type Transport struct {
+	// Base 是被包裹的 RoundTripper，nil 表示 http.DefaultTransport。
+	Base http.RoundTripper
+
+	// Caller 非空时覆盖写出的 Meta.Caller，填本服务的名字。
+	//
+	// Meta.Caller 的语义是「谁调的我」，所以出站时正确的值是自己，而不是把
+	// 上一跳的名字透传下去。留空即透传——下游会把这次调用归因到错误的服务上，
+	// 按 caller 做的限流与配额也就跟着错。链路起点看 RequestID，不看 Caller。
+	Caller string
+}
+
+// RoundTrip 实现 http.RoundTripper。
+func (t Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.Base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	m := From(req.Context())
+	if t.Caller != "" {
+		m.Caller = t.Caller
+	}
+	if m.IsZero() {
+		return base.RoundTrip(req)
+	}
+	// RoundTripper 的约定是不得改动传入的请求（net/http 会重试、会并发复用
+	// 同一个 *Request），所以改头之前先克隆。
+	r := req.Clone(req.Context())
+	if r.Header == nil {
+		r.Header = make(http.Header)
+	}
+	Inject(m, r.Header.Set)
+	return base.RoundTrip(r)
 }
 
 // ToMap 把非空字段写进事件 meta（dst 为 nil 时按需新建），返回结果 map。

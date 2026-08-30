@@ -83,7 +83,7 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
   不要重复埋；要加自己的指标用 `otel.Meter("{{.Module}}")` 新建，
   **不要往框架指标上加标签**（基数会失控）；
 - **request id / 租户**：读 `callctx.From(ctx)`，框架已在 HTTP 入站、契约调用、
-  事件 meta 三条路径上自动传播（出站 HTTP client 要自己 `callctx.Inject`，
+  事件 meta 三条路径上自动传播（出站 HTTP client 要自己装 `callctx.Transport`，
   但那是合约仓库的事，本仓库不写 client）；自己往 ctx 塞的值跨契约调用时会被
   防火墙剥掉。
 

@@ -134,6 +134,9 @@ func TestDomainScaffold(t *testing.T) {
 		// 否则代理会照旧手写 goroutine / ticker / 埋点。
 		mustContain(t, "AGENTS.md", readFile(t, dir, "AGENTS.md"),
 			"reg.Worker(", "job.Every(", "callctx.From(ctx)",
+			// 出站 HTTP 的正解是装 Transport，不是逐调用点写 Inject——
+			// 规程指错机制，代理就会照着摊到每个调用点的那种写法写。
+			"callctx.Transport",
 			"MIGRATION_DRIFT", "make migrate", "apptest.Conform",
 			"make lint")
 		// 规程里不许出现假的强制力：moneyfloat 还没接进 CI，这里就必须
