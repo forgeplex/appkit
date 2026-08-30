@@ -3,8 +3,8 @@
 // 框架保证契约边界的四件套（事务守卫 / ctx 防火墙 / 独立超时 / 错误规范化）
 // 在进程内绑定与远程 client 上表现一致，但**保证是保证，实现是实现**：
 // 手写的 client 忘了走 contract.Call、两侧 DTO 的 json key 对不上、领域错误
-// 在 problem+json 往返后换了码——这些都会让"部署形态是启动参数"这句话失效，
-// 而且只在真正拆分部署的那天才暴露。
+// 在 problem+json 往返后换了码、client 没把 callctx 白名单带上——这些都会让
+// "部署形态是启动参数"这句话失效，而且只在真正拆分部署的那天才暴露。
 //
 // Conform 让同一批用例分别跑过每个绑定，逐项比对可观测行为：
 //
@@ -32,6 +32,7 @@ import (
 	"testing"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/tx"
 )
 
@@ -40,6 +41,25 @@ import (
 type Binding[S any] struct {
 	Name    string
 	Service S
+
+	// SeenMeta 可选：返回服务端在最近一次调用里实际看到的 callctx.Meta。
+	//
+	// 填了它，Conform 才验得到跨边界元数据传播——那是唯一一条从返回值里看不见
+	// 的边界语义，request id 与租户走的是请求头。不填则跳过该项。
+	//
+	// 接法是让所有绑定共用同一个记录用的实现，SeenMeta 都读同一处——这正是
+	// 要比对的「同一个实现，两种到达方式」：
+	//
+	//	spy := &metaSpy{inner: echo.NewService()}
+	//	seen := func() callctx.Meta { return spy.Last() }
+	//	[]apptest.Binding[echov1.Service]{
+	//	    {Name: "local", Service: echov1.WrapService(spy, 0), SeenMeta: seen},
+	//	    {Name: "remote", Service: echov1.NewClient(srv.URL), SeenMeta: seen},
+	//	}
+	//
+	// 要么每个绑定都填，要么都不填：只填一部分时，漏掉的恰好可能是没接白名单
+	// 的那个形态，检查会安静地放过它。
+	SeenMeta func() callctx.Meta
 }
 
 // Case 是一条契约用例：一次调用加上对结果的期望。
@@ -68,7 +88,9 @@ type Case[S any] struct {
 //  2. 返回值在各绑定之间 DeepEqual——JSON 往返丢字段在这里现形；
 //  3. 事务内发起调用被拒（CodeTxBoundary），每个绑定都要拒；
 //  4. ctx 已取消时调用直接失败（CodeUnavailable），不落到实现上；
-//  5. Idempotent 用例连调两次结果一致。
+//  5. Idempotent 用例连调两次结果一致；
+//  6. 填了 Binding.SeenMeta 时：callctx 白名单真的穿过了每一种绑定——这条走的
+//     是请求头，从返回值里看不见，也是最安静的一种失效。
 //
 // 少于两个绑定会直接失败：只跑一个形态的不叫一致性测试。
 func Conform[S any](t *testing.T, bindings []Binding[S], cases []Case[S]) {
@@ -81,13 +103,20 @@ func Conform[S any](t *testing.T, bindings []Binding[S], cases []Case[S]) {
 		t.Fatal("Conform 需要至少一条用例")
 	}
 	names := make([]string, len(bindings))
+	checksMeta := bindings[0].SeenMeta != nil
 	for i, b := range bindings {
 		if b.Name == "" {
 			t.Fatal("Binding.Name 不能为空（失败信息全靠它区分形态）")
 		}
+		if (b.SeenMeta != nil) != checksMeta {
+			t.Fatalf("绑定 %q 的 SeenMeta 与其他绑定不一致——要么每个绑定都填，"+
+				"要么都不填。只填一部分时，没填的那个恰好可能就是漏了白名单的形态，"+
+				"检查会安静地放过它", b.Name)
+		}
 		names[i] = b.Name
 	}
 
+	var metaChecked bool
 	for _, c := range cases {
 		if c.Do == nil {
 			t.Fatalf("用例 %q 没有 Do", c.Name)
@@ -103,7 +132,16 @@ func Conform[S any](t *testing.T, bindings []Binding[S], cases []Case[S]) {
 			checkTxGuard(t, bindings, c)
 			checkCanceled(t, bindings, c)
 			checkIdempotent(t, bindings, c)
+			if checkMetaPropagation(t, bindings, c) {
+				metaChecked = true
+			}
 		})
+	}
+	// 填了 SeenMeta 却一次没跑到，等于配了个摆设——而摆设最擅长的就是让人
+	// 以为有网兜着。这正是本仓库刚栽过的那类坑：写下来的检查从没被执行。
+	if checksMeta && !metaChecked {
+		t.Error("填了 SeenMeta，但元数据传播检查一次都没跑：它只在期望成功的用例上做，" +
+			"而 cases 里没有 WantCode 为空的用例。补一条成功用例，否则这项配置只是摆设")
 	}
 }
 
@@ -236,6 +274,56 @@ func checkCanceled[S any](t *testing.T, bindings []Binding[S], c Case[S]) {
 			}
 		}
 	})
+}
+
+// probeMeta 是传播检查注入的哨兵值。取一眼能认出来的字符串：失败信息里看到的
+// 是空串还是它，直接区分「压根没传过来」与「传成了别的东西」。
+var probeMeta = callctx.Meta{
+	RequestID: "apptest-conform-request",
+	TenantID:  "apptest-conform-tenant",
+	Caller:    "apptest-conform-caller",
+}
+
+// checkMetaPropagation 断言 callctx 白名单真的穿过了每一种绑定，返回是否跑了。
+//
+// 只在期望成功的用例上做：期望失败的用例可能在到达实现之前就被挡回（DTO 校验、
+// 边界守卫都在实现之外），SeenMeta 什么也没记到，比出来是假阳性。
+func checkMetaPropagation[S any](t *testing.T, bindings []Binding[S], c Case[S]) bool {
+	t.Helper()
+	if c.WantCode != "" || bindings[0].SeenMeta == nil {
+		return false
+	}
+	t.Run("跨边界元数据传播", func(t *testing.T) {
+		ctx := callctx.With(t.Context(), probeMeta)
+		for _, b := range bindings {
+			if _, err := c.Do(ctx, b.Service); err != nil {
+				t.Errorf("[%s] 期望成功的用例却失败了，无从判断元数据传没传到: %v", b.Name, err)
+				continue
+			}
+			if msg := metaDiff(b.Name, probeMeta, b.SeenMeta()); msg != "" {
+				t.Error(msg)
+			}
+		}
+	})
+	return true
+}
+
+// metaDiff 比对服务端实际看到的白名单与注入的期望，不符时返回给人看的原因。
+//
+// 只比 RequestID 与 TenantID：这两个是纯透传，跨形态必须一模一样。**不比 Caller**
+// ——它的语义是「谁调的我」，出站 client 本就应该改写成自己的服务名（见
+// callctx.Transport 的 Caller 字段），跨形态不一致恰恰是对的。拿它当断言会把正确
+// 接好的 client 判红，而一条会误报的规则很快就没人看了。
+func metaDiff(binding string, want, got callctx.Meta) string {
+	if got.RequestID == want.RequestID && got.TenantID == want.TenantID {
+		return ""
+	}
+	return fmt.Sprintf(
+		"[%s] 服务端看到的白名单 = {request_id:%q tenant_id:%q}, want {%q %q}——"+
+			"元数据没穿过这层绑定，出站 client 是否漏了 callctx.Transport？"+
+			"（这种失效很安静：进程内绑定拿得到租户、远程拿不到，业务照跑，"+
+			"直到真拆分部署那天下游按租户选错了数据边界）",
+		binding, got.RequestID, got.TenantID, want.RequestID, want.TenantID)
 }
 
 // checkIdempotent 连调两次比对结果。只对显式声明幂等的用例做。

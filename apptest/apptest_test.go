@@ -9,10 +9,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
+	"github.com/forgeplex/appkit/httpserver"
 )
 
 // —— 被测契约：顶替合约仓库生成物的位置（接口 + DTO + 错误码）——
@@ -50,7 +53,30 @@ func (w wrappedEcho) Echo(ctx context.Context, req echoReq) (echoReply, error) {
 	})
 }
 
+// metaSpy 包住域内实现，记下每次调用时**服务端**看到的白名单。两个绑定共用
+// 同一个 spy，SeenMeta 就都读同一处——这正是要比对的「同一个实现，两种到达方式」。
+type metaSpy struct {
+	inner echoService
+	mu    sync.Mutex
+	last  callctx.Meta
+}
+
+func (s *metaSpy) Echo(ctx context.Context, req echoReq) (echoReply, error) {
+	s.mu.Lock()
+	s.last = callctx.From(ctx)
+	s.mu.Unlock()
+	return s.inner.Echo(ctx, req)
+}
+
+func (s *metaSpy) Last() callctx.Meta {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.last
+}
+
 // echoHandler 是提供方进程的 HTTP 出口：错误经 problem+json 出去。
+// 外面套真的 httpserver.RequestID 中间件（见 newEchoServer），入站这半条路
+// 用的就是框架自己的实现，不是手写等价物。
 func echoHandler(svc echoService) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req echoReq
@@ -70,7 +96,13 @@ func echoHandler(svc echoService) http.Handler {
 
 // remoteEcho 是合约仓库生成的 HTTP client 的手写等价物（远程绑定）：
 // 同样经 contract.Call，所以边界语义与进程内绑定同源。
-type remoteEcho struct{ base string }
+//
+// client 可换是有意的：装了 callctx.Transport 的是接对了的写法，裸
+// http.DefaultClient 就是漏了白名单的那种——两者都要有，否则证不出检查会红。
+type remoteEcho struct {
+	base   string
+	client *http.Client
+}
 
 func (c remoteEcho) Echo(ctx context.Context, req echoReq) (echoReply, error) {
 	return contract.Call(ctx, "echo", "Echo", 0, func(ctx context.Context) (echoReply, error) {
@@ -83,7 +115,7 @@ func (c remoteEcho) Echo(ctx context.Context, req echoReq) (echoReply, error) {
 			return echoReply{}, apperr.Internal(err)
 		}
 		hreq.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(hreq)
+		resp, err := c.client.Do(hreq)
 		if err != nil {
 			return echoReply{}, apperr.Unavailable(err)
 		}
@@ -109,22 +141,61 @@ func echoCall(text string) func(context.Context, echoService) (any, error) {
 	}
 }
 
+// newEchoServer 起一个提供方进程：真的 httpserver.RequestID 中间件负责入站
+// 那半条路（从请求头 Extract 进 ctx），spy 记下实现最终看到了什么。
+func newEchoServer(t *testing.T, spy *metaSpy) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(httpserver.RequestID()(echoHandler(spy)))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
 // TestConformLocalAndRemote 是本包的主证明：进程内 wrapper 与真跑 HTTP 的
 // client 拿同一批用例过一遍，全绿即"部署形态是启动参数"这句话在这条契约上成立。
+//
+// 两个绑定共用同一个 spy，SeenMeta 都读它——于是这条测试连带证明了 callctx
+// 白名单在两种到达方式下都到得了实现，而不只是错误码和返回值对得上。
 func TestConformLocalAndRemote(t *testing.T) {
 	t.Parallel()
-	srv := httptest.NewServer(echoHandler(localEcho{}))
-	t.Cleanup(srv.Close)
+	spy := &metaSpy{inner: localEcho{}}
+	srv := newEchoServer(t, spy)
+	seen := func() callctx.Meta { return spy.Last() }
 
 	Conform(t,
 		[]Binding[echoService]{
-			{Name: "local", Service: wrappedEcho{inner: localEcho{}}},
-			{Name: "remote", Service: remoteEcho{base: srv.URL}},
+			{Name: "local", Service: wrappedEcho{inner: spy}, SeenMeta: seen},
+			{Name: "remote", SeenMeta: seen, Service: remoteEcho{
+				base: srv.URL,
+				// 接对了的写法：装配一次，此后每个请求自动带上白名单。
+				client: &http.Client{Transport: callctx.Transport{Caller: "apptest-remote"}},
+			}},
 		},
 		[]Case[echoService]{
 			{Name: "回显", Do: echoCall("hi"), Want: echoReply{Echo: "hi"}, Idempotent: true},
 			{Name: "空白文本是领域错误", Do: echoCall("  "), WantCode: codeEmpty},
 		})
+}
+
+// TestSeenMetaCatchesUninstrumentedClient 是这项检查的非空证明：换成裸
+// http.DefaultClient（＝忘了装 Transport 的手写 client），服务端就什么也
+// 看不到，metaDiff 必须报出来。
+//
+// 不走 Conform 而是直接调用+比对，是因为"期望某个 t 会失败"没法用 *testing.T
+// 表达；本文件下半段的反向用例一律用这个办法——把判定抽成纯函数再直接喂它。
+func TestSeenMetaCatchesUninstrumentedClient(t *testing.T) {
+	t.Parallel()
+	spy := &metaSpy{inner: localEcho{}}
+	srv := newEchoServer(t, spy)
+
+	ctx := callctx.With(t.Context(), probeMeta)
+	client := remoteEcho{base: srv.URL, client: http.DefaultClient}
+	if _, err := client.Echo(ctx, echoReq{Text: "hi"}); err != nil {
+		t.Fatalf("调用本身应当成功（漏白名单不影响业务返回，这正是它安静的原因）: %v", err)
+	}
+	// 请求成功、返回值正确、错误码正确——Conform 原有的五项全绿，只有这一项会红。
+	if msg := metaDiff("remote", probeMeta, spy.Last()); msg == "" {
+		t.Error("裸 client 没带白名单，metaDiff 却认为一切正常——这项检查是空的")
+	}
 }
 
 // —— 以下是"这套断言真的会红"的证明。断言库最危险的失效方式是永远绿，
@@ -223,5 +294,38 @@ func TestWantBoundaryCode(t *testing.T) {
 	if msg := wantBoundaryCode("local", apperr.CodeTxBoundary,
 		apperr.New(apperr.CodeInternal, 500, "x"), "why"); msg == "" {
 		t.Fatal("错误码不符必须报错")
+	}
+}
+
+func TestMetaDiff(t *testing.T) {
+	t.Parallel()
+	want := probeMeta
+	tests := []struct {
+		name   string
+		got    callctx.Meta
+		wantOK bool
+	}{
+		{"全部到齐", want, true},
+		// 最要紧的一条：出站 client 把 Caller 改写成自己的服务名是**正确**行为
+		// （callctx.Transport 的 Caller 字段就是干这个的）。拿它当断言会把接对了
+		// 的 client 判红，而一条会误报的规则很快就没人看了。
+		{"Caller 被改写仍算通过", callctx.Meta{
+			RequestID: want.RequestID, TenantID: want.TenantID, Caller: "ledger"}, true},
+		{"Caller 为空仍算通过", callctx.Meta{
+			RequestID: want.RequestID, TenantID: want.TenantID}, true},
+		// 漏装 Transport 的典型症状：什么都没到。
+		{"什么都没传过来", callctx.Meta{}, false},
+		// 只接了一半的更隐蔽：日志串得起来，租户却丢了——下游选错数据边界。
+		{"只有 request id，租户丢了", callctx.Meta{RequestID: want.RequestID}, false},
+		{"只有租户，request id 丢了", callctx.Meta{TenantID: want.TenantID}, false},
+		{"传成了别的值", callctx.Meta{
+			RequestID: want.RequestID, TenantID: "别人的租户"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if msg := metaDiff("remote", want, tt.got); (msg == "") != tt.wantOK {
+				t.Errorf("metaDiff() = %q，期望通过 = %v", msg, tt.wantOK)
+			}
+		})
 	}
 }

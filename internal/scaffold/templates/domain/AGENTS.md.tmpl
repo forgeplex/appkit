@@ -111,6 +111,9 @@ appkit doctor   # 环境体检（GOPRIVATE/git 凭据/工作区）
 本域对外提供契约（`appkit.ProvideContract`）时再加一层：`apptest.Conform` 把同一批
 用例分别跑过 `WrapXxx(impl, 0)` 与指向 `httptest.Server` 的生成 client，比对错误码、
 返回值与边界语义。这是"拆成微服务行为不变"唯一的证明方式，不写就只有口头承诺。
+每个 `Binding` 顺手填上 `SeenMeta`（两个绑定共用一个记录 `callctx.From(ctx)` 的
+spy），把跨边界元数据也纳进来——那条走请求头，返回值里看不见，漏了的症状是
+进程内拿得到租户、远程拿不到，只在真拆分那天暴露。
 文件放 `internal/http/`——`internal/{{.Name}}/` 连测试文件也禁 `net/http`（depguard 会拦）。
 
 ## 完成的定义

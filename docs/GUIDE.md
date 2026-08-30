@@ -520,8 +520,27 @@ client := &http.Client{Transport: callctx.Transport{Caller: "ledger"}}
 但那把"会不会漏"摊到了每一个调用点上，而 `Transport` 只有装配处一处。
 
 漏了这一段，进程内绑定拿得到 tenant、远程 client 拿不到——"部署形态是启动参数"
-就此失效，且只在真拆分那天暴露。**装没装上没有机检**：`apptest.Conform` 比对
-错误码与返回值，但看不见 client 的请求头。
+就此失效，且只在真拆分那天暴露。
+
+**要验它接没接上**，给 `apptest.Conform` 的每个 `Binding` 填上 `SeenMeta`：
+
+```go
+spy := &metaSpy{inner: echo.NewService()} // 记下服务端每次看到的 callctx.Meta
+seen := func() callctx.Meta { return spy.Last() }
+
+apptest.Conform(t,
+    []apptest.Binding[echov1.Service]{
+        {Name: "local", Service: echov1.WrapService(spy, 0), SeenMeta: seen},
+        {Name: "remote", Service: echov1.NewClient(srv.URL), SeenMeta: seen},
+    }, cases)
+```
+
+两个绑定共用同一个 spy，比的就是"同一个实现、两种到达方式"。远程那条漏了
+`Transport`，request id 与租户到不了实现，这项当场红。注意它**不比 `Caller`**
+——出站 client 本就应该把它改写成自己的服务名，跨形态不一致恰恰是对的。
+
+填不填仍是自愿的，但填一次就永久有效，且填的时机是写契约测试时，
+不是三个月后加第 N 个调用点时。
 
 它是 struct 的具名字段而不是 map，所以业务代码没法自己往里塞东西（那等于把防火墙拆了）。
 要读当前值：`callctx.From(ctx)`。

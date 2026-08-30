@@ -351,7 +351,7 @@ app.Run(ctx)
 | 指标基数不失控 | 标签值只能是代码常量或 `internal/metrics` 收敛过的枚举；SQL 动词过白名单，未识别塌缩为 `other` | ▲ API 设计级：业务传不进框架指标，但自建 meter 仍可自伤 |
 | 已死的 ctx 不落到实现上 | `contract.Call` 在进 fn 前查 `ctx.Err()`——跨网络时这种调用本来就发不出去 | ★ 运行时级：两种形态由构造一致 |
 | 两种部署形态语义一致 | `apptest.Conform` 让同一批用例跑过每个绑定，比对错误码/返回值/边界语义 | ▲ 测试级：写了才有；但不写就只剩口头承诺 |
-| 出站 HTTP 也带上 `callctx` 白名单 | `callctx.Transport` 装进 `http.Client` 一次即可，不必逐调用点写 `Inject` | ▲ API 设计级：漏点从「每个调用点」收敛到「一处装配」；但没装仍然没人拦——appkit 不生成 client，`Conform` 看不见请求头 |
+| 出站 HTTP 也带上 `callctx` 白名单 | `callctx.Transport` 装进 `http.Client` 一次即可（不必逐调用点写 `Inject`）；`apptest.Conform` 填了 `Binding.SeenMeta` 就当场验请求头 | ▲ API 设计级 + 测试级：漏点从「每个调用点」收敛到「一处装配」，且验得到。但两者都得自己接——不填 `SeenMeta` 就仍是口头承诺 |
 
 逃生舱（防止约束被政治性推翻）：带理由的 `//nolint`（nolintlint 强制）、
 go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走**事件驱动读模型**
@@ -390,7 +390,8 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   三个具名字段被放回。HTTP 入站（中间件）与事件 meta（outbox/relay）两条由框架自动
   接好，异步链路也串得起 request id；**出站 HTTP 那一段要自己接**：把
   `callctx.Transport` 装进 `http.Client`（一处），而不是逐调用点写 `Inject`。
-  appkit 不生成 client，装没装上没有机检——见 §7 表末。
+  appkit 不生成 client，但装没装上验得到：给 `apptest.Conform` 的 Binding 填
+  `SeenMeta`，服务端交出「这次看到了什么」，漏了的形态当场红——见 §7 表末。
 - **本地开发**：`appkit dev` 自动 `go work init/use`（go.work 不提交）；
   发版联动用 Renovate 自动升 require。私有库配 `GOPRIVATE=github.com/forgeplex/*`。
 - **对账（reconciliation）是 PSP 一等公民**：appkit 提供 recovery point 表约定与

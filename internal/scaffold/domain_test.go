@@ -137,6 +137,9 @@ func TestDomainScaffold(t *testing.T) {
 			// 出站 HTTP 的正解是装 Transport，不是逐调用点写 Inject——
 			// 规程指错机制，代理就会照着摊到每个调用点的那种写法写。
 			"callctx.Transport",
+			// Conform 的元数据传播检查是自愿项：规程不提，就没人填，
+			// 那它和不存在没区别。
+			"SeenMeta",
 			"MIGRATION_DRIFT", "make migrate", "apptest.Conform",
 			"make lint")
 		// 规程里不许出现假的强制力：moneyfloat 还没接进 CI，这里就必须
