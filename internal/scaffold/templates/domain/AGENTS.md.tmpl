@@ -1,0 +1,100 @@
+# {{.Name}} —— AI Agent 操作规程
+
+本仓库是基于 appkit 框架的业务域（`.appkit.yml` 是框架配置）。本文件是给
+AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕开它们的路都被
+工具链堵死了，不要尝试。
+
+## 仓库地图（谁负责什么）
+
+| 路径 | 职责 | 你会经常改吗 |
+|---|---|---|
+| `internal/{{.Name}}/` | ★ 业务包：领域类型、不变量、用例编排、所需接口 | 是，主战场 |
+| `internal/postgres/` | Store 实现；**全仓唯一允许 import pgx/sqlc 的包** | 是 |
+| `internal/postgres/sqlc/` | sqlc 生成物 | **禁止手改**（make gen 重新生成） |
+| `internal/http/` | handler：只做 DTO ↔ 领域类型映射 | 是 |
+| `internal/inbox/` | 外域事件消费者 | 偶尔 |
+| `internal/module/module.go` | 唯一 wiring 落点（Provide/Mount/Migrations/Health） | 每加路由/用例改一行 |
+| `db/migrations/` | 迁移；`0001_appkit_base.sql` 是框架基础表 | 新增文件，**不改旧文件** |
+| `db/queries/` | SQL 唯一存在地（sqlc 源） | 是 |
+| `{{.Name}}.go`、`cmd/` | 导出面与部署入口 | 几乎不 |
+| `.golangci.yml`、`.go-arch-lint.yml`、`.github/` | appkit sync 物化的规则 | **禁止手改**（appkit sync 刷新） |
+
+## 三条方向性约束（lint + appkit check 机检，违规 = CI 红）
+
+1. `internal/{{.Name}}` 零 infra import：禁 pgx / gin / net/http；
+2. pgx / sqlc 只出现在 `internal/postgres`；
+3. `internal/http`、`internal/inbox` 禁止 import `internal/postgres`——
+   必须经业务包接口走逻辑。
+
+## 加一个功能 = 固定六步（按序执行）
+
+以「创建用户」为例：
+
+1. **迁移** `db/migrations/000N_users.sql`：四位序号严格递增；只操作
+   `{{.Name}}.` schema；已应用的迁移文件视为不可变，改表结构永远新开文件。
+2. **SQL** `db/queries/xxx.sql`：sqlc 注释语法（`-- name: InsertUser :exec`），
+   表名带 `{{.Name}}.` 前缀。然后 `make gen`。
+3. **业务包** `internal/{{.Name}}/`：
+   - 领域类型 + 校验（纯函数，错误用 `apperr`）；
+   - `store.go` 的 Store 接口加方法（签名只出现领域类型）;
+   - `errors.go` 加错误模板（`apperr.New("{{.Upper}}_XXX", 状态码, 消息)`）；
+   - `service.go` 加用例方法，**标准形态**：
+     ```go
+     func (s *Service) CreateUser(ctx context.Context, in CreateUser) (User, error) {
+         if err := in.validate(); err != nil { return User{}, err }  // ① 不变量
+         u := newUser(in)
+         err := s.txr.Do(ctx, func(ctx context.Context) error {      // ② 事务边界
+             if err := s.store.InsertUser(ctx, u); err != nil { return err }
+             return s.pub.Publish(ctx, evt)                          // ③ 事件同事务
+         })
+         return u, err
+     }
+     ```
+4. **Store 实现** `internal/postgres/store.go`：
+   `sqlc.New(pgtx.From(ctx, s.pool)).InsertUser(...)`——`pgtx.From` 自动感知
+   事务，不要传递任何事务对象。唯一约束冲突（pgconn.PgError 23505）在这里
+   翻译成域错误；除此之外本包不做业务判断。
+5. **handler** `internal/http/`：解码 → 调 Service → 编码；错误一律
+   `httpserver.WriteError(log, w, err)`（自动 RFC 9457）。
+6. **挂路由** `internal/module/module.go`：Setup 里构造 handler，
+   Register 里 `reg.Mount("POST /users", ...)`（照 ping 的现有样式）。
+
+## 惯用法（别自己发明）
+
+- **金额**：`money.Money`，禁 float（lint 会拦）；
+- **错误**：跨层只传 `*apperr.Error`，判定用 `apperr.Is(err, code)`，
+  禁止字符串比对；
+- **事件**：只能在 `tx.Do` 内经注入的 Publisher 发（落 outbox，提交后
+  relay 自动外发）；事务外发布会被运行时守卫拒绝；
+- **消费事件**：`reg.Consumer(topic, outbox.Inbox(pool, schema, consumer, h))`，
+  handler 必须幂等；
+- **跨域调用**：只依赖合约 module 的接口 + `appkit.Resolve`；
+  **禁止 require 其他业务域仓库**（appkit check 会拦）；事务内跨域调用
+  会得到 TX_BOUNDARY 错误——一致性走事件，不走共享事务；
+- **写接口幂等**：套 `idem.Middleware`，客户端带 `Idempotency-Key` 头。
+
+## 命令
+
+```sh
+make gen        # sqlc 生成（改了 db/queries 后必跑）
+make run        # 本地起服（config/dev.yaml；database.url 留空 = 无 DB 最小模式）
+make dev-db     # 一次性本地 Postgres（与 dev.yaml 匹配）
+make check      # 架构检查：依赖/import 边界/跨 schema SQL/迁移序号
+make test       # 全部测试（集成测试需 TEST_DATABASE_URL，缺省自动 skip）
+appkit dev      # 联调本地未发布的 appkit（生成 go.work，不提交）
+appkit sync     # 升级 appkit 后刷新 lint/CI 配置
+appkit doctor   # 环境体检（GOPRIVATE/git 凭据/工作区）
+```
+
+## 测试要求（三层，新功能三层都要有）
+
+1. 业务包单测：手写假 Store（实现接口的 struct），测不变量与错误路径，零 DB；
+2. handler 测试：httptest 直打，断言状态码与 problem+json 的 `code`；
+3. 集成测试：env-guard `TEST_DATABASE_URL`，测约束翻译与事务原子性。
+
+## 完成的定义
+
+`make gen`（如改过 SQL）之后，**`make check && make test` 全绿**才算完成。
+不要用 `//nolint` 绕过检查（必须写理由且 review 会拒）；不要修改生成物、
+已应用的迁移、`.golangci.yml` 等物化配置来让检查通过——那是在破坏约束本身，
+正确做法永远是让代码符合约束。

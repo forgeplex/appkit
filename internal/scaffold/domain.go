@@ -19,6 +19,8 @@ var domainFiles = []fileSpec{
 	{tmpl: "gitignore.tmpl", path: ".gitignore"},
 	{tmpl: "Makefile.tmpl", path: "Makefile"},
 	{tmpl: "README.md.tmpl", path: "README.md"},
+	{tmpl: "AGENTS.md.tmpl", path: "AGENTS.md"},
+	{tmpl: "CLAUDE.md.tmpl", path: "CLAUDE.md"},
 	{tmpl: "root.go.tmpl", path: "NAME.go"},
 	{tmpl: "main.go.tmpl", path: "cmd/NAMEd/main.go"},
 	{tmpl: "service.go.tmpl", path: "internal/NAME/service.go"},

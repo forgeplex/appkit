@@ -1,0 +1,49 @@
+# appkit —— AI Agent 操作规程（框架仓库）
+
+这是 forgeplex 的 Go 后端框架本体。改这里的代码影响所有下游域仓库，
+规则比业务仓库更严。设计原理见 docs/DESIGN.md，使用方视角见 docs/GUIDE.md。
+
+## 不可破坏的承诺
+
+1. **公开 API 向后兼容**：appkit 经 MVS 依赖钻石被全部域仓库共享，破坏性
+   变更 = 全域联动升级。CI 有 apidiff 门禁（基线 = 最新发版 tag）。
+   新能力用「新增」表达，不改已有签名/语义。
+2. **根包只依赖标准库**：appkit.go/registry.go/app.go/run.go 的 API 面
+   不得出现 gin/pgx/otel 等第三方类型（http.Handler、fs.FS、context 级抽象）。
+   `tx` 包同样零驱动依赖（pgx 实现在 `pgtx`）。
+3. **约束左移**：新增架构规则时按 编译器 > 代码生成 > 运行时守卫 > lint/CI >
+   约定 的顺序找落点，并在 docs/DESIGN.md §7 的对照表里诚实标注强度。
+4. **进程内 ≠ 裸调用**：contract 边界的四件套（事务守卫/ctx 防火墙/超时/
+   错误规范化）保证单体与微服务语义一致，任何改动不得削弱。
+
+## 布局速查
+
+- 运行时：根包（Module/Registry/Run）、`contract`、`config`、`apperr`、
+  `health`、`telemetry`、`httpserver`、`tx`/`pgtx`、`pgmigrate`、`outbox`、
+  `idem`、`money`、`audit`
+- 工具链：`cmd/appkit` + `internal/cli`（薄壳）+ `internal/{scaffold,archcheck,gen,doctor}`
+- 规则分发：`ruleset`（golangci/arch-lint/CI 模板，appkit sync 物化到各仓库）
+- `lint/`：独立嵌套 module（go/analysis analyzer），有自己的 go.mod
+- `internal/scaffold/templates/`：生成骨架的模板——**改模板必改
+  internal/scaffold 的测试**，且生成物必须自身通过 appkit check 与编译
+
+## 关键纪律
+
+- 基础设施表 DDL 的唯一事实源是库函数（`outbox.MigrationSQL` 等），
+  模板/文档里不落 DDL 副本；
+- 错误一律 `*apperr.Error`，错误身份 = 错误码；SQL 标识符拼接必须过
+  白名单校验或 `pgx.Identifier` 转义；
+- 金额禁 float；事务经 `tx.Do` 回调、句柄藏 ctx；
+- 生成物（sqlc/golden）禁手改，CI 做 drift check；
+- 文档改动要与行为同步：GUIDE 里每条命令都必须真实可执行。
+
+## 验证
+
+```sh
+make check                      # fmt + vet + build + test
+TEST_DATABASE_URL=postgres://... go test -race -count=1 ./...   # 含 DB 集成测试（缺省 skip）
+cd lint && go test ./...        # 嵌套 module 单独跑
+go run ./cmd/appkit new domain t -dir /tmp/t   # 改脚手架后：生成物可编译且自过 check
+```
+
+完成的定义：上述全绿 + 若动了公开 API，apidiff 相对最新 tag 零 incompatible。

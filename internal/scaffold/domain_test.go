@@ -13,6 +13,8 @@ var domainWantFiles = []string{
 	".gitignore",
 	"Makefile",
 	"README.md",
+	"AGENTS.md",
+	"CLAUDE.md",
 	"go.mod",
 	"ledger.go",
 	"cmd/ledgerd/main.go",

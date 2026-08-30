@@ -12,6 +12,8 @@ var systemWantFiles = []string{
 	".gitignore",
 	"Makefile",
 	"README.md",
+	"AGENTS.md",
+	"CLAUDE.md",
 	"go.mod",
 	"cmd/psp/main.go",
 	"config/dev.yaml",

@@ -13,6 +13,8 @@ var systemFiles = []fileSpec{
 	{tmpl: "gitignore.tmpl", path: ".gitignore"},
 	{tmpl: "Makefile.tmpl", path: "Makefile"},
 	{tmpl: "README.md.tmpl", path: "README.md"},
+	{tmpl: "AGENTS.md.tmpl", path: "AGENTS.md"},
+	{tmpl: "CLAUDE.md.tmpl", path: "CLAUDE.md"},
 	{tmpl: "main.go.tmpl", path: "cmd/NAME/main.go"},
 	{tmpl: "dev.yaml.tmpl", path: "config/dev.yaml"},
 	{tmpl: "prod.yaml.tmpl", path: "config/prod.yaml"},

@@ -1,0 +1,38 @@
+# {{.Name}} —— AI Agent 操作规程（组合仓库）
+
+本仓库是 appkit 组合仓库（composition root）：**只做 wiring + 配置 + 部署，
+零业务逻辑**。任何业务代码都应该写在对应的域仓库里——如果你发现自己想在
+这里写 if/for/SQL/HTTP handler，停下来，去域仓库。
+
+## 你在这里只做四件事
+
+1. **装配模块**（`cmd/{{.Name}}/main.go`）：`go.mod` require 域仓库 →
+   `appkit.Modules(a.Module(...), b.Module(...))`，共享连接池按数据库注入。
+2. **绑定跨域契约的远程兜底**：`appkit.Remote[av1.Service](av1.NewClient)`
+   ——target 集内的域进程内直调，集外的自动落到该 client（同一接口）。
+3. **注入事件总线**：单体单库 `appkit.Bus(outbox.NewDirectBus())`；
+   拆分部署换 NATS/Kafka 实现（同一接口，业务零改动）。
+4. **配置与部署**（`config/*.yaml`、`deploy/`）：同一镜像不同 `-target`
+   即得单体 ↔ 微服务切换，部署形态是启动参数不是架构决策。
+
+## 跨域协作规则（编译器 + 运行时守卫强制）
+
+- 域仓库互不 require；跨域调用只依赖合约 module 的接口类型；
+- 域间编排逻辑属于「流程属主」的那个域（通常是发起方），不属于本仓库；
+- 跨域强一致不存在：同步契约调用（可失败、须幂等）或 outbox 事件二选一，
+  事务内跨域调用会得到 TX_BOUNDARY 错误。
+
+## 命令
+
+```sh
+make run        # -target=all 单体起服
+appkit dev -root ..   # 生成 go.work 联调各本地仓库（不提交）
+appkit doctor   # 环境体检
+go build ./...  # 装配正确性由启动期 fail-fast 兜底：缺契约绑定/缺 Bus 起不来
+```
+
+## 完成的定义
+
+`go build ./...` 通过 + `-target=all` 能起服（healthz/readyz 200）+
+各 `-target` 拆分组合也能起服。装配错误（缺 Provide、缺 Remote、缺 Bus、
+依赖循环）全部在启动期报错，报错文案会指出缺什么——照着补即可。

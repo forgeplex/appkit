@@ -416,6 +416,11 @@ go vet -vettool=$(which appkit-lint) -moneyfloat.scope 'internal/(identity|authn
 按 SemVer 发版（CI 有 apidiff 门禁保证向后兼容），域仓库直接 require 版本即可；
 `appkit dev` 只在联调本地未发布改动时需要。
 
+**Q：想让 AI agent 参与开发？**
+`appkit new` 生成的每个仓库自带 `AGENTS.md`（+`CLAUDE.md` 引用）：仓库地图、
+三条方向性约束、加功能的固定六步、惯用法与"完成的定义"。agent 打开仓库即知
+规则；违规也会被 `make check` 与 lint 拦下——约束体系对人和 AI 一视同仁。
+
 **Q：模块还需要哪些生命周期钩子？**
 一般不需要。连接池、迁移、HTTP、relay、优雅关停都由框架或骨架接好；
 只有自定义后台任务才用 `reg.OnStart(appkit.StageWorker, ...)` + `reg.OnStop`
