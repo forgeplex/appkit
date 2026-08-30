@@ -23,6 +23,8 @@
   `idem`、`money`、`audit`
 - 工具链：`cmd/appkit` + `internal/cli`（薄壳）+ `internal/{scaffold,archcheck,gen,doctor}`
 - 规则分发：`ruleset`（golangci/arch-lint/CI 模板，appkit sync 物化到各仓库）
+  ——appkit 只生产、自己不消费，golden 测试只锁「模板文本没变」，锁不住
+  「规则从写下来那天就是错的」；**改规则模板必跑 `make test-rules`**
 - `lint/`：独立嵌套 module（go/analysis analyzer），有自己的 go.mod
 - `internal/scaffold/templates/`：生成骨架的模板——**改模板必改
   internal/scaffold 的测试**，且生成物必须自身通过 appkit check 与编译
@@ -43,6 +45,7 @@
 make check                      # fmt + vet + build + test（DB 集成测试缺省 skip）
 make test-db TEST_DATABASE_URL=postgres://...   # -race 且含 DB 集成测试
 make test-lint                  # lint/ 是嵌套 module，不在 ./... 里，必须单独跑
+make test-rules                 # 改 ruleset/templates 后：真跑两个检查器验规则（需网络）
 go run ./cmd/appkit new domain t -dir /tmp/t   # 改脚手架后：生成物可编译且自过 check
 ```
 

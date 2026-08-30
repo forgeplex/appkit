@@ -161,12 +161,11 @@ func appkitRoot(t *testing.T) string {
 	return root
 }
 
-// buildGenerated 在生成仓库里写 go.work（use 本地 appkit）后 go build ./...。
-// 依赖全部在本机 module cache（GOPROXY=off 离线构建）；环境导致的
-// 下载/校验失败降级为跳过——生成物本身的语法已由 parser 断言兜底。
-func buildGenerated(t *testing.T, dir string) {
+// writeGoWork 在生成仓库里写 go.work（use 本地 appkit），返回消解过符号链接的
+// 仓库目录与 go.work 路径——go 工具按真实路径匹配 go.work 条目，macOS 的临时
+// 目录是符号链接，不消解会匹配不上。
+func writeGoWork(t *testing.T, dir string) (string, string) {
 	t.Helper()
-	// 消解 macOS 临时目录符号链接：go 工具按真实路径匹配 go.work 条目。
 	dir = resolvePath(dir)
 	goVersion := strings.TrimPrefix(runtime.Version(), "go")
 	if !strings.HasPrefix(goVersion, "1.") {
@@ -177,6 +176,15 @@ func buildGenerated(t *testing.T, dir string) {
 	if err := os.WriteFile(workFile, []byte(work), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	return dir, workFile
+}
+
+// buildGenerated 在生成仓库里写 go.work（use 本地 appkit）后 go build ./...。
+// 依赖全部在本机 module cache（GOPROXY=off 离线构建）；环境导致的
+// 下载/校验失败降级为跳过——生成物本身的语法已由 parser 断言兜底。
+func buildGenerated(t *testing.T, dir string) {
+	t.Helper()
+	dir, workFile := writeGoWork(t, dir)
 	cmd := exec.Command("go", "build", "./...")
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GOWORK="+workFile, "GOFLAGS=", "GOPROXY=off")

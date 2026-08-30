@@ -3,7 +3,7 @@
 
 GO ?= go
 
-.PHONY: check fmt vet build test test-db test-lint all
+.PHONY: check fmt vet build test test-db test-lint test-rules all
 
 # 完成的定义（AGENTS.md）：这条全绿，且动了公开 API 时 apidiff 相对最新 tag 零 incompatible。
 check: fmt vet build test
@@ -35,4 +35,12 @@ test-db:
 test-lint:
 	cd lint && $(GO) test ./...
 
-all: check test-lint
+# 规则集端到端：生成一个「每个组件都有子包」的域仓库，用钉版本的
+# golangci-lint 与 go-arch-lint 真跑一遍，再植入已知违规确认它们会红。
+# appkit 只生产规则集、自己不消费，这是唯一的消费点——golden 测试锁的是
+# 「模板文本没变」，防不住「规则从写下来那天就是错的」。
+# 慢（要拉两个检查器）且需要网络，故 opt-in；CI 每次都跑。
+test-rules:
+	APPKIT_RULES_E2E=1 $(GO) test -count=1 -v -run TestMaterializedRules ./internal/scaffold/
+
+all: check test-lint test-rules

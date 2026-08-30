@@ -62,6 +62,12 @@ jobs:
           go build ./...
           go test ./...
 
+      # appkit 只生产规则集（ruleset/templates）、自己不消费——golden 测试锁的是
+      # 「模板文本没变」，防不住「规则从写下来那天就是错的」。这一步生成一个
+      # 每个组件都带子包的域仓库，用钉版本的检查器真跑，再植入已知违规确认会红。
+      - name: 规则集端到端（真跑 golangci-lint + go-arch-lint）
+        run: make test-rules
+
       # appkit 经 MVS 依赖钻石被全部域仓库共享，公开 API 近乎终身兼容
       # （DESIGN §9）。基线 = 最新发版 tag，破坏性变更直接红灯。
       - name: API 向后兼容门禁（apidiff vs 最新 tag）

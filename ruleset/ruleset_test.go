@@ -4,6 +4,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -254,6 +255,40 @@ func TestLinterVersionsMatchCI(t *testing.T) {
 		if !strings.Contains(string(body), tt.want) {
 			t.Errorf("domain-ci.yml 未按 %s 的钉版本调用：缺 %q\n"+
 				"（改了 ruleset 里的常量就要同步改 workflow，反之亦然）", tt.name, tt.want)
+		}
+	}
+}
+
+// TestArchLintEveryComponentAllowsItself 守住「每个组件都放行自己」。
+//
+// go-arch-lint 不区分「跨组件 import」与「同组件内跨包 import」：两者一律去查
+// deps[component(from)].mayDependOn 里有没有 component(to)。组件若没把自己列进去，
+// 它内部每一次跨包 import 都会被判违规——而 components 里给每个组件都写了
+// `xxx/**`，本来就是预期它们会长出子包的。两处自相矛盾。
+//
+// 这条漏掉时症状不会立刻出现：刚生成的骨架每个组件恰好一个包，组件内的边一条
+// 都不存在，全绿。要等下游把域拆出子包才炸，而那可能是几个月后、别人的仓库、
+// 一次和这个改动毫无关系的提交。所以必须在模板层挡住，而不是等 lint 报出来。
+//
+// 将来往模板加新组件时，这个测试就是提醒你补 mayDependOn 的那声响。
+func TestArchLintEveryComponentAllowsItself(t *testing.T) {
+	var doc struct {
+		Components map[string]any `yaml:"components"`
+		Deps       map[string]struct {
+			MayDependOn []string `yaml:"mayDependOn"`
+		} `yaml:"deps"`
+	}
+	if err := yaml.Unmarshal(mustRender(t, testConfig())[".go-arch-lint.yml"], &doc); err != nil {
+		t.Fatalf("解析 .go-arch-lint.yml: %v", err)
+	}
+	if len(doc.Components) == 0 {
+		t.Fatal("解析不到任何组件——模板结构变了，这个测试需要跟着改")
+	}
+	for name := range doc.Components {
+		if !slices.Contains(doc.Deps[name].MayDependOn, name) {
+			t.Errorf("组件 %q 没把自己列进 mayDependOn（当前 %v）——"+
+				"它一长出子包，每次组件内 import 都会被判成跨组件违规",
+				name, doc.Deps[name].MayDependOn)
 		}
 	}
 }
