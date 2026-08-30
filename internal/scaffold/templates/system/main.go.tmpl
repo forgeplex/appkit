@@ -1,111 +1,43 @@
 // Command {{.Name}} 是组合根：只做 wiring + 配置 + 部署，零业务逻辑
 // （DESIGN §5）。同一二进制以不同 -target 部署，即得 modular monolith ↔
 // 微服务切换——部署形态是启动参数，不是架构决策。
+//
+// 启动装配（配置加载/遥测/连接池/事件总线/迁移器/优雅关停）在
+// appkit/bootstrap 里，位于 module cache（只读），改不到也不必读。
+// 这里只声明两件事：装哪些域模块、target 之外的契约绑谁。
 package main
 
 import (
-	"context"
-	"flag"
-	"fmt"
-	"os"
-	"time"
-
 	"github.com/forgeplex/appkit"
-	"github.com/forgeplex/appkit/config"
-	"github.com/forgeplex/appkit/httpserver"
-	"github.com/forgeplex/appkit/telemetry"
+	"github.com/forgeplex/appkit/bootstrap"
 )
 
-// appConfig 分层加载：-config 指定的 yaml → {{.EnvPrefix}}_* 环境变量覆盖。
-type appConfig struct {
-	Addr     string    `koanf:"addr"`
-	Env      string    `koanf:"env" validate:"omitempty,oneof=dev staging prod"`
-	Database dbConfig  `koanf:"database"`
-	Log      logConfig `koanf:"log"`
-}
-
-type dbConfig struct {
-	// URL 形如 postgres://user:pass@host:5432/db?sslmode=disable。
-	// 各域共用此库（每域独占自己的 schema，DESIGN §8）。
-	URL string `koanf:"url"`
-}
-
-type logConfig struct {
-	Level  string `koanf:"level" validate:"omitempty,oneof=debug info warn error"`
-	Format string `koanf:"format" validate:"omitempty,oneof=json text"`
-}
-
 func main() {
-	target := flag.String("target", "all",
-		"本地实例化的模块集：all 或逗号分隔的模块名（如 gateway 或 ledger,relay）")
-	confFile := flag.String("config", "config/dev.yaml", "配置文件路径")
-	flag.Parse()
-
-	if err := run(*target, *confFile); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-}
-
-func run(target, confFile string) error {
-	ctx := context.Background()
-
-	cfg, err := config.Load[appConfig](config.Options{
-		Files:     []string{confFile},
-		EnvPrefix: "{{.EnvPrefix}}",
-	})
-	if err != nil {
-		return fmt.Errorf("{{.Name}}: 加载配置 %s: %w", confFile, err)
-	}
-	if cfg.Addr == "" {
-		cfg.Addr = ":8080"
-	}
-	if cfg.Env == "" {
-		cfg.Env = "dev"
-	}
-
-	tel, err := telemetry.Init(ctx, telemetry.Config{
-		ServiceName: "{{.Name}}",
-		Env:         cfg.Env,
-		LogLevel:    cfg.Log.Level,
-		LogFormat:   cfg.Log.Format,
-	})
-	if err != nil {
-		return fmt.Errorf("{{.Name}}: 初始化遥测: %w", err)
-	}
-	log := tel.Logger
-
-	// 数据库：各域共用连接池（按库共享而非按模块独占，防连接数爆炸，
-	// DESIGN §8）。require 域 repo 后取消注释：
-	// pool, err := pgtx.NewPool(ctx, cfg.Database.URL)
-
-	app := appkit.New(
-		[]appkit.Module{
-			// 各域模块在此装配（go.mod require 对应域 repo 后取消注释）：
-			// ledger.Module(ledger.Options{Log: log, Pool: pool}),
-			// gateway.Module(gateway.Options{Log: log, Pool: pool}),
+	bootstrap.Main(bootstrap.Options{
+		Service: "{{.Name}}",
+		// 各域模块在此装配（go.mod require 对应域 repo 后取消注释）。
+		// d.Pool 是各域共用的连接池（按库共享而非按模块独占，防连接数
+		// 爆炸，DESIGN §8）；d.Bus 是事件总线，relay 与消费者共用同一个。
+		Modules: func(d bootstrap.Deps) ([]appkit.Module, error) {
+			return []appkit.Module{
+				// ledger.Module(ledger.Options{Log: d.Log, Pool: d.Pool, Bus: d.Bus}),
+				// gateway.Module(gateway.Options{Log: d.Log, Pool: d.Pool, Bus: d.Bus}),
+			}, nil
 		},
-		appkit.Target(target),
-		appkit.HTTPAddr(cfg.Addr),
-		appkit.Logger(log),
-		appkit.Middleware(httpserver.Base(log)...),
-		// 迁移执行器（接入数据库后启用）：
-		// appkit.Migrator(pgmigrate.Runner(pool)),
-		// target 之外的契约自动落到 Remote 绑定（合约仓库生成的 HTTP
-		// client，实现同一接口）：
-		// appkit.Remote(ledgerv1.NewClient),
-		// appkit.Remote(authv1.NewClient),
-		// 事件总线：单体单库直投用 outbox.NewDirectBus()，拆分部署换
-		// NATS/Kafka 适配（同一 Bus 接口，业务代码不改）：
-		// appkit.Bus(outbox.NewDirectBus()),
-	)
-	runErr := app.Run(ctx)
-
-	// 遥测最后关：关停钩子产生的 span/metric 也要被 flush。
-	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := tel.Shutdown(sctx); err != nil {
-		log.Error("{{.Name}}: 遥测关停失败", "err", err)
-	}
-	return runErr
+		// 未配置 database.url 时只起探针：刚 new 出来还没 require 任何域仓库，
+		// make run 也能证明服务能起。装上域模块后配 database.url 走完整模式。
+		Minimal: func(bootstrap.Deps) ([]appkit.Module, error) { return nil, nil },
+		// target 之外的契约自动落到 Remote 绑定（合约仓库生成的 HTTP client，
+		// 实现同一接口）——消费方代码在单体与微服务下完全一致。
+		//
+		// AppOptions: func(bootstrap.Deps) []appkit.Option {
+		// 	return []appkit.Option{
+		// 		appkit.Remote(ledgerv1.NewClient),
+		// 		appkit.Remote(authv1.NewClient),
+		// 	}
+		// },
+		//
+		// 拆分部署换 NATS/Kafka 总线时（同一接口，业务代码不改）：
+		// NewBus: func() bootstrap.EventBus { return natsbus.New(...) },
+	})
 }

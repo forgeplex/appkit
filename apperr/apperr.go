@@ -23,6 +23,7 @@ const (
 	CodeUnavailable      = "UNAVAILABLE"          // 依赖不可用/超时，可重试
 	CodeTxBoundary       = "TX_BOUNDARY"          // 事务内发起跨模块调用（运行时守卫）
 	CodeIdempotency      = "IDEMPOTENCY_CONFLICT" // 同幂等键不同 payload
+	CodeMigrationDrift   = "MIGRATION_DRIFT"      // 已应用的迁移内容被改动（启动期守卫）
 )
 
 // Error 是唯一跨层传播的错误类型。值不可变：With* 方法返回副本，

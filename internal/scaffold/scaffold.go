@@ -17,6 +17,8 @@ import (
 	"text/template"
 
 	"golang.org/x/mod/module"
+
+	"github.com/forgeplex/appkit/ruleset"
 )
 
 //go:embed templates
@@ -78,6 +80,9 @@ type tmplData struct {
 	Devel         bool   // appkit 无发布版本（源码构建）：go.mod 不 require appkit
 	EnvPrefix     string // 环境变量前缀（LEDGERD / PSP）
 	PgxVersion    string // 生成 go.mod 里 pgx 的版本（跟随 appkit 自身依赖）
+	// lint 工具链版本取自 ruleset：Makefile 与 domain-ci.yml 必须同版本。
+	GolangciVersion string
+	ArchLintVersion string
 }
 
 func newData(o Options, envPrefix string) tmplData {
@@ -88,6 +93,9 @@ func newData(o Options, envPrefix string) tmplData {
 		AppkitVersion: o.AppkitVersion,
 		EnvPrefix:     envPrefix,
 		PgxVersion:    pgxVersion(),
+
+		GolangciVersion: ruleset.GolangciLintVersion,
+		ArchLintVersion: ruleset.ArchLintVersion,
 	}
 	if o.AppkitVersion == "(devel)" {
 		d.Devel = true

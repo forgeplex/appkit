@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"regexp"
 
@@ -32,6 +33,7 @@ import (
 
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/pgtx"
 	"github.com/forgeplex/appkit/tx"
 )
@@ -118,9 +120,13 @@ func Publish(ctx context.Context, db pgtx.DB, schema string, evt appkit.Event) e
 	if len(payload) == 0 {
 		payload = []byte("null")
 	}
+	// 把 callctx 白名单快照进事件 meta：事件是异步的，投递时原请求的 ctx
+	// 早没了，不在这里存下来，链路就断在 outbox 表这一行上。
+	// 写副本而不是改 evt.Meta——调用方传进来的 map 不该被我们改。
+	metaMap := callctx.ToMap(callctx.From(ctx), maps.Clone(evt.Meta))
 	var meta []byte
-	if len(evt.Meta) > 0 {
-		m, err := json.Marshal(evt.Meta)
+	if len(metaMap) > 0 {
+		m, err := json.Marshal(metaMap)
 		if err != nil {
 			return fmt.Errorf("outbox: 序列化事件 meta: %w", err)
 		}

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
 	"github.com/forgeplex/appkit/tx"
 )
@@ -31,6 +32,43 @@ func TestCallTxGuard(t *testing.T) {
 	}
 	if called {
 		t.Error("守卫拦截后 fn 不应被调用")
+	}
+}
+
+// TestCallDeadCtx 锁住"已死的 ctx 不落到实现上"：跨网络时这一刻请求根本发不
+// 出去，进程内实现却完全可能不看 ctx 照常成功——那样同一段代码拆成远程调用后
+// 行为就变了，正是本框架承诺不会发生的事。
+func TestCallDeadCtx(t *testing.T) {
+	dead := func(t *testing.T) context.Context {
+		t.Helper()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		return ctx
+	}
+	expired := func(t *testing.T) context.Context {
+		t.Helper()
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		t.Cleanup(cancel)
+		return ctx
+	}
+	for name, mk := range map[string]func(*testing.T) context.Context{
+		"已取消": dead, "已超时": expired,
+	} {
+		t.Run(name, func(t *testing.T) {
+			called := false
+			// fn 故意不看 ctx：这正是"进程内实现忽略取消"的典型写法。
+			_, err := contract.Call(mk(t), "ledger", "PostEntries", 0,
+				func(context.Context) (string, error) {
+					called = true
+					return "ok", nil
+				})
+			if !apperr.Is(err, apperr.CodeUnavailable) {
+				t.Errorf("err = %v，want apperr.Is(err, CodeUnavailable)", err)
+			}
+			if called {
+				t.Error("ctx 已死时 fn 不应被调用")
+			}
+		})
 	}
 }
 
@@ -77,6 +115,44 @@ func TestFirewall(t *testing.T) {
 			t.Errorf("Deadline() = (%v, %v), want (%v, true)", got, ok, deadline)
 		}
 	})
+
+	// 白名单是防火墙唯一的例外：这三样跨网络调用本来也会传（X-Request-Id 等），
+	// 传不过去 request id 就断在模块边界上，日志再也串不起来。
+	t.Run("保留 callctx 白名单", func(t *testing.T) {
+		want := callctx.Meta{RequestID: "r1", TenantID: "acme", Caller: "gateway"}
+		ctx := callctx.With(context.Background(), want)
+		ctx = context.WithValue(ctx, reqKey{}, "request-scoped")
+		ctx = tx.With(ctx, "fake-tx")
+
+		fw := contract.Firewall(ctx)
+		if got := callctx.From(fw); got != want {
+			t.Errorf("白名单未穿过防火墙: %+v", got)
+		}
+		// 白名单之外的一切照旧被剥掉——业务代码不能借 ctx 偷传东西。
+		if fw.Value(reqKey{}) != nil || tx.HasTx(fw) {
+			t.Error("白名单不应放宽其它值")
+		}
+	})
+
+	t.Run("无白名单时不凭空注入", func(t *testing.T) {
+		if m := callctx.From(contract.Firewall(context.Background())); !m.IsZero() {
+			t.Errorf("空 ctx 过防火墙后应仍为零值: %+v", m)
+		}
+	})
+}
+
+// TestCallPropagatesMeta 验证白名单穿过整次契约调用（含超时 ctx 与 span 注入）。
+func TestCallPropagatesMeta(t *testing.T) {
+	want := callctx.Meta{RequestID: "r1", TenantID: "acme"}
+	ctx := callctx.With(context.Background(), want)
+	got, err := contract.Call(ctx, "ledger", "Get", 0,
+		func(ctx context.Context) (callctx.Meta, error) { return callctx.From(ctx), nil })
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if got != want {
+		t.Fatalf("被调方拿到的元数据不符: %+v", got)
+	}
 }
 
 func TestCallTimeout(t *testing.T) {

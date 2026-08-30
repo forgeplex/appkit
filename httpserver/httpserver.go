@@ -16,9 +16,10 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 )
 
-const headerRequestID = "X-Request-Id"
+const headerRequestID = callctx.HeaderRequestID
 
 // isProbe 判断探针路径。AccessLog 与 OTel 共用：kubelet 每几秒打一次，
 // 既不该刷日志也不该产生 span。
@@ -37,27 +38,27 @@ func Base(log *slog.Logger) []func(http.Handler) http.Handler {
 	}
 }
 
-type requestIDKey struct{}
-
-// RequestID 读取 X-Request-Id 请求头（没有则生成 uuid），写入响应头并存进 ctx。
-// 放在链最外层，保证 Recover/AccessLog 的日志都带得上 request_id。
+// RequestID 从请求头提取跨边界元数据白名单（callctx.Meta：request id、
+// 租户、caller）存进 ctx，request id 缺省时生成 uuid 并回写响应头。
+// 放在链最外层，保证 Recover/AccessLog 的日志都带得上这些字段，
+// 也保证后续的契约调用与事件发布能把它们传下去。
 func RequestID() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			id := r.Header.Get(headerRequestID)
-			if id == "" {
-				id = uuid.NewString()
+			m := callctx.Extract(r.Header.Get)
+			if m.RequestID == "" {
+				m.RequestID = uuid.NewString()
 			}
-			w.Header().Set(headerRequestID, id)
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id)))
+			w.Header().Set(headerRequestID, m.RequestID)
+			next.ServeHTTP(w, r.WithContext(callctx.Merge(r.Context(), m)))
 		})
 	}
 }
 
 // RequestIDFrom 取出当前请求的 request id；不存在时返回空串。
+// 需要租户等其它字段时用 callctx.From(ctx)。
 func RequestIDFrom(ctx context.Context) string {
-	id, _ := ctx.Value(requestIDKey{}).(string)
-	return id
+	return callctx.From(ctx).RequestID
 }
 
 // Recover 捕获下游 panic：记录 error 级日志（含堆栈），并以 problem+json
@@ -74,13 +75,12 @@ func Recover(log *slog.Logger) func(http.Handler) http.Handler {
 				if p == http.ErrAbortHandler {
 					panic(p)
 				}
-				log.LogAttrs(r.Context(), slog.LevelError, "panic recovered",
+				log.LogAttrs(r.Context(), slog.LevelError, "panic recovered", withMeta(r,
 					slog.Any("panic", p),
 					slog.String("method", r.Method),
 					slog.String("path", r.URL.Path),
-					slog.String("request_id", RequestIDFrom(r.Context())),
 					slog.String("stack", string(debug.Stack())),
-				)
+				)...)
 				apperr.WriteProblem(w, apperr.Internal(fmt.Errorf("panic: %v", p)))
 			}()
 			next.ServeHTTP(w, r)
@@ -110,19 +110,24 @@ func AccessLog(log *slog.Logger) func(http.Handler) http.Handler {
 						status = http.StatusInternalServerError
 					}
 				}
-				log.LogAttrs(r.Context(), slog.LevelInfo, "http access",
+				log.LogAttrs(r.Context(), slog.LevelInfo, "http access", withMeta(r,
 					slog.String("method", r.Method),
 					slog.String("path", r.URL.Path),
 					slog.Int("status", status),
 					slog.Int64("bytes", sw.bytes),
 					slog.Duration("duration", time.Since(start)),
-					slog.String("request_id", RequestIDFrom(r.Context())),
-				)
+				)...)
 			}()
 			next.ServeHTTP(sw, r)
 			panicking = false
 		})
 	}
+}
+
+// withMeta 给日志属性追加 callctx 白名单里的非空字段（request_id / tenant_id /
+// caller）——这三样是把一次请求在各服务日志里串起来的钥匙，每条日志都该带。
+func withMeta(r *http.Request, attrs ...slog.Attr) []slog.Attr {
+	return append(attrs, callctx.From(r.Context()).LogAttrs()...)
 }
 
 // statusWriter 捕获状态码与响应字节数。只记录第一次 WriteHeader

@@ -40,9 +40,9 @@
 ## 验证
 
 ```sh
-make check                      # fmt + vet + build + test
-TEST_DATABASE_URL=postgres://... go test -race -count=1 ./...   # 含 DB 集成测试（缺省 skip）
-cd lint && go test ./...        # 嵌套 module 单独跑
+make check                      # fmt + vet + build + test（DB 集成测试缺省 skip）
+make test-db TEST_DATABASE_URL=postgres://...   # -race 且含 DB 集成测试
+make test-lint                  # lint/ 是嵌套 module，不在 ./... 里，必须单独跑
 go run ./cmd/appkit new domain t -dir /tmp/t   # 改脚手架后：生成物可编译且自过 check
 ```
 

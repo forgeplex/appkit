@@ -1,8 +1,12 @@
 package outbox
 
 import (
+	"context"
 	"testing"
 	"time"
+
+	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/callctx"
 )
 
 func TestRelayOptions(t *testing.T) {
@@ -81,5 +85,32 @@ func TestBackoff(t *testing.T) {
 				t.Errorf("backoff(%v, %d) = %v, want %v", tc.base, tc.attempts, got, tc.want)
 			}
 		})
+	}
+}
+
+// busFunc 把函数适配为 Bus。
+type busFunc func(context.Context, appkit.Event) error
+
+func (f busFunc) Publish(ctx context.Context, evt appkit.Event) error { return f(ctx, evt) }
+
+// TestDeliverRestoresCallMeta 验证投递前把事件 meta 里的 callctx 白名单还原进
+// ctx：消费者的日志与它再发出的事件由此接回原请求的 request id，异步链路不断。
+func TestDeliverRestoresCallMeta(t *testing.T) {
+	t.Parallel()
+	var got callctx.Meta
+	r := NewRelay(nil, "ledger", busFunc(func(ctx context.Context, _ appkit.Event) error {
+		got = callctx.From(ctx)
+		return nil
+	}))
+	err := r.deliver(context.Background(), claimedEvent{
+		id: "e1", topic: "t", payload: []byte("{}"),
+		meta: []byte(`{"appkit.request_id":"r1","appkit.tenant_id":"acme","source":"csv"}`),
+	})
+	if err != nil {
+		t.Fatalf("deliver: %v", err)
+	}
+	want := callctx.Meta{RequestID: "r1", TenantID: "acme"}
+	if got != want {
+		t.Fatalf("消费侧拿到的元数据不符: %+v", got)
 	}
 }

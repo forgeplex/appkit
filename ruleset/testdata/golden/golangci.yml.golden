@@ -26,13 +26,33 @@ linters:
             - pkg: net/http
               desc: 业务包禁止依赖 net/http；HTTP 细节放 internal/http
         # pgx 只允许出现在 internal/postgres（repo 层外无 SQL）。
+        # 组合根除外：cmd/ 与 internal/module 是连接池的注入与分发点
+        # （store/relay/迁移器都在这里装配），它们持有句柄，但不写 SQL。
         pgx-only-in-postgres:
           list-mode: lax
           files:
             - "!**/internal/postgres/**"
+            - "!**/internal/module/**"
+            - "!**/cmd/**"
           deny:
             - pkg: github.com/jackc/pgx
               desc: pgx 只允许出现在 internal/postgres；其余包经 internal/ledger 的接口访问数据
+    wrapcheck:
+      # 本框架的错误词汇是 apperr（错误身份 = 错误码，DESIGN §5.2），不是
+      # fmt.Errorf("%w")：appkit 交回的错误已在边界归一化为 *apperr.Error
+      # （tx.Do 原样返回回调自己的错误，contract.Call 出口做归一化），
+      # 再包一层只会把错误码埋进 message，让 apperr.Is 认不出来。
+      # 驱动错误同理：把 pgx/sqlc 的错误翻译成域错误是 internal/postgres 的
+      # 职责，逐个 Scan/Exec 套 fmt.Errorf 只会逼出满仓 //nolint。
+      # 放行的只有这三类——其余外部包的错误原样漏出照报（internal/postgres 里也报）。
+      ignore-package-globs:
+        - github.com/forgeplex/appkit**
+        - github.com/jackc/pgx/**
+        - github.com/forgeplex/ledger/internal/postgres/sqlc
+      # 业务包调用自己定义的 Store / Publisher 接口是标准形态：把驱动错误
+      # 翻译成域错误是实现方（internal/postgres）的职责，不是调用点的。
+      ignore-interface-regexps:
+        - ^ledger\.
     forbidigo:
       forbid:
         - pattern: '^fmt\.Print.*$'

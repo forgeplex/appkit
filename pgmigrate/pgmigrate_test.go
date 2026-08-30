@@ -327,3 +327,95 @@ func TestRunnerConcurrentReplicas(t *testing.T) {
 		t.Fatalf("已应用版本 = %v, want 2 条", got)
 	}
 }
+
+func storedChecksum(t *testing.T, pool *pgxpool.Pool, schema, version string) *string {
+	t.Helper()
+	var sum *string
+	if err := pool.QueryRow(context.Background(),
+		"SELECT checksum FROM "+pgx.Identifier{schema, "schema_migrations"}.Sanitize()+
+			" WHERE version = $1", version).Scan(&sum); err != nil {
+		t.Fatalf("查询 checksum: %v", err)
+	}
+	return sum
+}
+
+func columnExists(t *testing.T, pool *pgxpool.Pool, schema, table, column string) bool {
+	t.Helper()
+	var exists bool
+	if err := pool.QueryRow(context.Background(),
+		`SELECT EXISTS (SELECT 1 FROM information_schema.columns
+		 WHERE table_schema = $1 AND table_name = $2 AND column_name = $3)`,
+		schema, table, column).Scan(&exists); err != nil {
+		t.Fatalf("查询列存在性: %v", err)
+	}
+	return exists
+}
+
+// 改动已应用的迁移：启动期以 MIGRATION_DRIFT 拒绝。
+// 没有这道守卫时 runner 只比对 version，改动会被静默跳过，库与代码就此分叉。
+func TestRunnerRejectsModifiedMigration(t *testing.T) {
+	pool := testPool(t)
+	schema := testSchema(t, pool)
+	run := pgmigrate.Runner(pool)
+	sets := func(fsys fstest.MapFS) []appkit.MigrationSet {
+		return []appkit.MigrationSet{{Schema: schema, FS: fsys, Module: "m"}}
+	}
+
+	orig := mapFS(map[string]string{
+		"001_init.sql": "CREATE TABLE {schema}.items (v text NOT NULL);",
+	}, schema)
+	if err := run(context.Background(), sets(orig)); err != nil {
+		t.Fatalf("首次应用: %v", err)
+	}
+
+	edited := mapFS(map[string]string{
+		"001_init.sql": "CREATE TABLE {schema}.items (v text NOT NULL, extra int);",
+	}, schema)
+	err := run(context.Background(), sets(edited))
+	if err == nil {
+		t.Fatal("改动已应用的迁移必须报错")
+	}
+	if !apperr.Is(err, apperr.CodeMigrationDrift) {
+		t.Fatalf("错误码不符: %v, want %s", err, apperr.CodeMigrationDrift)
+	}
+	// 修复方法必须出现在 Error() 里：这个错误唯一的读者是盯着 stderr 的人，
+	// 而 apperr 的 details 不进 Error() 字符串。
+	for _, want := range []string{"001_init.sql", "新增迁移文件", "UPDATE "} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误信息缺少 %q，运维只能看到这一行: %v", want, err)
+		}
+	}
+	if columnExists(t, pool, schema, "items", "extra") {
+		t.Fatal("被拒的迁移不得改动 schema")
+	}
+	// 改回原内容即可继续——守卫拦的是不一致，不是拦人。
+	if err := run(context.Background(), sets(orig)); err != nil {
+		t.Fatalf("恢复原内容后应放行: %v", err)
+	}
+}
+
+// 旧版本 appkit 写入的历史行没有 checksum：回填而非报错，升级不需人工干预。
+func TestRunnerBackfillsLegacyChecksum(t *testing.T) {
+	pool := testPool(t)
+	schema := testSchema(t, pool)
+	run := pgmigrate.Runner(pool)
+	fsys := mapFS(map[string]string{
+		"001_init.sql": "CREATE TABLE {schema}.items (v text NOT NULL);",
+	}, schema)
+	sets := []appkit.MigrationSet{{Schema: schema, FS: fsys, Module: "m"}}
+
+	if err := run(context.Background(), sets); err != nil {
+		t.Fatalf("首次应用: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		"UPDATE "+pgx.Identifier{schema, "schema_migrations"}.Sanitize()+
+			" SET checksum = NULL"); err != nil {
+		t.Fatalf("模拟旧版本历史行: %v", err)
+	}
+	if err := run(context.Background(), sets); err != nil {
+		t.Fatalf("老库应放行: %v", err)
+	}
+	if got := storedChecksum(t, pool, schema, "001_init.sql"); got == nil {
+		t.Fatal("checksum 应被回填")
+	}
+}

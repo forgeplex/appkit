@@ -117,11 +117,24 @@ func TestRender_域名与模块替换(t *testing.T) {
 			"require-explanation: true",
 			"require-specific: true",
 			"wrapcheck",
+			// 组合根持连接池是设计，不是越界：pgx 规则须放行 internal/module
+			// 与 cmd/（GUIDE §3 就是这么写的），否则脚手架生成的第一份代码
+			// 就被自己的规则集判红。
+			"!**/internal/module/**",
+			"!**/cmd/**",
+			// 框架的错误词汇是 apperr 而非 fmt.Errorf("%w")，
+			// 且业务包调自己的 Store 接口是标准形态——两者都不该被 wrapcheck 拦。
+			"github.com/forgeplex/appkit**",
+			"github.com/jackc/pgx/**",
+			"github.com/forgeplex/ledger/internal/postgres/sqlc",
+			`^ledger\.`,
 		}},
 		{".go-arch-lint.yml", []string{
 			`"ledger"`,
 			`"ledger/**"`,
 			"mayDependOn",
+			// deepScan 会把组合根的依赖注入判成 domain → postgres，必须关掉。
+			"deepScan: false",
 		}},
 		{".github/workflows/ci.yml", []string{
 			"uses: forgeplex/appkit/.github/workflows/domain-ci.yml@main",
@@ -218,6 +231,30 @@ func TestWorkflows_合法YAML(t *testing.T) {
 				t.Errorf("%s 缺少片段 %q", tt.path, tt.want)
 			}
 		})
+	}
+}
+
+// TestLinterVersionsMatchCI 守住"本地跑的 lint 与 CI 跑的是同一个二进制"。
+// 域仓库 Makefile 的 lint 目标由 GolangciLintVersion / ArchLintVersion 渲染，
+// domain-ci.yml 里是写死的 go run ...@版本——两处飘了就会出现本地绿、CI 红，
+// 而且是最难查的那种（同一份配置、不同版本的检查器）。
+func TestLinterVersionsMatchCI(t *testing.T) {
+	body, err := os.ReadFile("../.github/workflows/domain-ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"golangci-lint", "golangci-lint@" + ruleset.GolangciLintVersion + " "},
+		{"go-arch-lint", "go-arch-lint@" + ruleset.ArchLintVersion + " "},
+	}
+	for _, tt := range tests {
+		if !strings.Contains(string(body), tt.want) {
+			t.Errorf("domain-ci.yml 未按 %s 的钉版本调用：缺 %q\n"+
+				"（改了 ruleset 里的常量就要同步改 workflow，反之亦然）", tt.name, tt.want)
+		}
 	}
 }
 

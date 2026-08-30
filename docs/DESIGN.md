@@ -84,9 +84,18 @@ appkit/                          # module github.com/forgeplex/appkit
 │                                #   —— 只依赖 stdlib（http.Handler、fs.FS、context），
 │                                #   不暴露 gin/pgx 类型，防止框架兼容性被第三方库绑架
 ├── run.go                       # App.Run：模块拓扑排序装配、-target 过滤、
-│                                #   signal.NotifyContext、正序启动/逆序优雅关停
+│                                #   signal.NotifyContext、正序启动/逆序优雅关停；
+│                                #   App.Migrate：只应用迁移即返回（initContainer 用）
+├── worker.go                    # Registry.Worker：长驻后台任务的托管注册
+│                                #   （关停等待 + 异常退出上报，见 §8）
+├── bootstrap/                   # ★ 隔离层：域/组合服务 main() 的全部固定装配
+│                                #   （配置→遥测→池→总线→模块→运行→反序关停）。
+│                                #   用户仓库的 main 只声明"装哪些模块"，
+│                                #   装配代码位于 module cache（0444）改不到
 ├── contract/                    # 跨模块契约绑定：Local/Remote 绑定、进程内拦截器链
 │                                #   （ctx 防火墙、超时、错误规范化、span —— 见 §5）
+├── callctx/                     # 可穿过 ctx 防火墙的元数据白名单（request/tenant/caller）
+│                                #   —— 具名字段而非 map，业务代码无法往里塞东西
 ├── config/                      # koanf 分层加载 file→env→flag；unmarshal 强类型 +
 │                                #   validator 校验，启动 fail-fast；按模块前缀分区
 ├── health/                      # liveness/readiness 分离注册表；
@@ -111,7 +120,12 @@ appkit/                          # module github.com/forgeplex/appkit
 ├── outbox/                      # 同事务 Publish 落表、relay(SKIP LOCKED 轮询)、
 │                                #   inbox 消费去重；Bus 接口可插拔：
 │                                #   directbus(单库直投 inbox) / natsbus / kafkabus
+├── job/                         # 跨副本互斥的周期任务：Postgres advisory lock
+│                                #   （不建表、副本崩溃自动放锁），配 Registry.Worker 用
 ├── audit/                       # 审计钩子：写操作记录 actor/before/after，同事务落库
+├── apptest/                     # 契约一致性套件：同一批用例跑过每个绑定（进程内 wrapper /
+│                                #   远程 client），比对错误码、返回值、边界语义
+│                                #   —— 把"两种部署形态语义一致"从承诺变成可运行断言
 ├── ruleset/                     # .golangci.yml / .go-arch-lint.yml 模板
 │                                #   （由 appkit sync 物化进各 repo，CI 做 drift check）
 ├── ci/                          # GitHub Actions reusable workflows（域 repo 一行 uses:）
@@ -122,6 +136,8 @@ appkit/                          # module github.com/forgeplex/appkit
 │                                #   dev                 go work init/use 全部子 repo
 │                                #   check               架构检查（含 SQL 跨 schema 引用扫描）
 └── internal/                    # 框架私有实现（拓扑排序、lifecycle runner、gin 装配等）
+    └── metrics/                 # ★ 自动埋点的唯一定义处：指标名与标签集在框架内钉死，
+                                 #   业务不参与——指标的成本在基数不在采集（见 §8）
 
 appkit-lint/                     # ★ 独立 module：自研 go/analysis analyzers
                                  #   （独立是为了不把 x/tools 依赖污染进业务依赖图）
@@ -283,8 +299,15 @@ app.Run(ctx)
    静态分析对这条规则只能"提高绕过成本"，运行时守卫才是真正可执行的）。
 3. **超时 + 错误规范化**：错误一律折叠为 apperr，错误身份是错误码——
    `apperr.Is(err, ledgerv1.CodeInsufficientFunds)` 在单体（原始错误）和
-   微服务（RFC 9457 反序列化重建）两种模式下行为完全一致。
+   微服务（RFC 9457 反序列化重建）两种模式下行为完全一致。发起时 ctx 已取消/
+   超时的调用在进 fn 前就失败（`CodeUnavailable`）：跨网络时这种调用本来就发不
+   出去，而进程内实现完全可能不看 ctx 照常成功——不挡住，两种形态就此分叉。
 4. **观测**：跨模块调用产生与 RPC 同名的 span/metric，两种模式下监控视图一致。
+
+这四条是**框架的承诺**，而承诺需要被验证：`apptest.Conform` 让同一批用例分别
+跑过进程内 wrapper 与远程 client，比对错误码、返回值与上述边界语义。手写 client
+漏了 `contract.Call`、两侧 DTO 的 json key 对不上、领域错误在 problem+json 往返后
+换了码——这些都只在真正拆分部署的那天才暴露，除非有一条一致性测试提前把它逼出来。
 
 跨模块一致性只有两条路：**同步契约调用**（视为可失败、须幂等）或 **outbox 事件**。
 禁止：跨模块共享事务、跨 schema JOIN、传指针。
@@ -303,20 +326,32 @@ app.Run(ctx)
 ## 7. 约束落地对照表（诚实分级）
 
 > 原则：能左移就左移；标不到"不可绕过"的，诚实标为"提高绕过成本"。
+> 强度记号：★ 绕不过｜▲ 提高绕过成本｜✗ 尚未落地（写在这里是为了不假装它已生效）。
 
 | 规则 | 落点 | 强度 |
 |---|---|---|
 | 域 repo 互不依赖、看不到彼此实现 | 独立 module + internal/ + CI 检查 go.mod require 清单 | ★ 编译器级，不可绕过 |
 | 跨域只经契约类型 | 唯一可见类型就是 contracts 生成接口 | ★ 编译器级 |
 | 契约/事件/错误码单一事实源 | 只有生成物，无手写类型 | ★ 生成级 + drift check |
-| http 包不写 SQL、业务包零 infra import | depguard + go-arch-lint（配置由 `appkit sync` 物化、CI 验证未漂移；物化同时解决 IDE 集成与 golangci-lint 无配置继承的问题） | ▲ CI 级，nolint 需写理由 |
-| 金额禁 float、导出方法首参 ctx（限 service 层） | appkit-lint 自研 analyzer（少而精，控制误报） | ▲ CI 级 |
+| http 包不写 SQL、业务包零 infra import | depguard + go-arch-lint：配置由 `appkit sync` 物化（同时解决 IDE 集成与 golangci-lint 无配置继承），CI 先验未漂移**再按它跑这两个检查器**，版本与域仓库 `make lint` 同源（`ruleset.GolangciLintVersion` / `ArchLintVersion`） | ▲ CI 级，nolint 需写理由 |
+| 金额禁 float、导出方法首参 ctx（限 service 层） | appkit-lint 自研 analyzer（少而精，控制误报）；**尚未接进域仓库**——`lint/` 是独立嵌套 module，接入要么给它单独发版走 `go vet -vettool`，要么用 golangci custom plugin 出定制二进制（里程碑 4） | ✗ 未落地：现状只能手动跑，等同约定 |
 | 事务不泄漏到业务代码 | pgtx 回调式 API，业务只见 ctx | ★ API 设计级 |
 | 事务内禁跨模块调用 | contract.Call 运行时守卫（HasTx 检查）；前提是调用经生成 wrapper（ProvideContract 强制包裹；生成流水线就绪前靠约定） | ▲ 运行时级，测试即暴露 |
 | 忘发事件不可能 | outbox.Publish 是事务 API 的一等公民 | ★ API 设计级 |
 | 生成物禁手改 | CI 重新生成后 `git diff --exit-code` | ▲ CI 级 |
 | appkit/contracts 向后兼容 | apidiff / oasdiff 门禁 | ▲ CI 级 |
 | CI 本身不可绕过 | reusable workflow + branch protection required checks | 组织级 |
+| 启动装配改不坏 | `bootstrap.Main` 收走 main() 的固定装配，代码在 module cache（0444 只读）；用户仓库的 main 只声明模块清单 | ▲ 物理级：改不动，但可绕开自己写 main（骨架默认不绕） |
+| 规则集不被改松 | `appkit check` 内联 `ruleset.Check`（配置缺失同样算漂移），不再只靠 CI 那一步 | ▲ 本地+CI 级 |
+| 已应用的迁移不可变 | 历史表存内容 sha256，启动期逐个比对，不符即 `MIGRATION_DRIFT` 拒绝启动；`.gitattributes` 钉 `*.sql eol=lf` 消除跨平台误报 | ★ 运行时级，启动即暴露 |
+| 没人跑迁移不可能 | 登记了迁移却既无 `Migrator` 又无 `SkipMigrations()` → 启动报错；`-migrate` 无 `database.url` 亦报错 | ★ 装配级 fail-fast |
+| 长驻任务死了必被发现 | `Registry.Worker` 托管：异常退出上报主循环并触发关停（不再是"探针绿着、事件停摆"） | ★ API 设计级 |
+| ctx 只能传白名单元数据 | `callctx.Meta` 是具名字段的 struct 而非 map，防火墙剥值后只放回它 | ★ 编译器级：塞不进去 |
+| 周期任务多副本不重跑 | `job.Every` 用 Postgres advisory lock（session 级，连接断开自动释放） | ▲ API 设计级：正确写法零成本，裸 ticker 拦不住 |
+| 指标基数不失控 | 标签值只能是代码常量或 `internal/metrics` 收敛过的枚举；SQL 动词过白名单，未识别塌缩为 `other` | ▲ API 设计级：业务传不进框架指标，但自建 meter 仍可自伤 |
+| 已死的 ctx 不落到实现上 | `contract.Call` 在进 fn 前查 `ctx.Err()`——跨网络时这种调用本来就发不出去 | ★ 运行时级：两种形态由构造一致 |
+| 两种部署形态语义一致 | `apptest.Conform` 让同一批用例跑过每个绑定，比对错误码/返回值/边界语义 | ▲ 测试级：写了才有；但不写就只剩口头承诺 |
+| 出站 HTTP 也带上 `callctx` 白名单 | 手写 client 自觉调 `callctx.Inject`；appkit 不生成 client，`Conform` 看不见请求头 | ✗ 未落地：纯约定。漏了它，进程内有 tenant、远程没有，且只在真拆分那天暴露 |
 
 逃生舱（防止约束被政治性推翻）：带理由的 `//nolint`（nolintlint 强制）、
 go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走**事件驱动读模型**
@@ -326,6 +361,11 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
 
 - **每域独占 Postgres schema**（单体单库多 schema；拆分后可平移为多库），独立迁移历史表；
   连接池按数据库共享而非按模块独占（防连接数爆炸）。
+- **迁移的施加时机是部署决策**：默认随进程启动（多副本经 advisory lock 串行，安全但
+  N 个副本同时改 schema）；规模上来后改为 initContainer/Job 里跑 `<svc> -migrate`
+  （只应用迁移即退出，不监听端口），服务副本再以 `appkit.SkipMigrations()` 起来。
+  两条路径用的是同一份模块声明，不存在"迁移清单和服务清单不是同一份"的漂移。
+  已应用的迁移内容不可变（sha256 守卫），改结构一律新增文件。
 - **outbox/inbox/幂等/审计表每 schema 一套**，由脚手架的首个 migration 生成。
 - **relay 投递语义**：claim/lease 两段式（短事务租约后释放连接再投递，杜绝
   hold-and-wait 连接池死锁）；至少一次投递 + inbox 按 (consumer, event_id) 去重；
@@ -339,6 +379,17 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   App 以 `appkit.Bus(...)` 装配；声明了消费者却未配 Bus 属启动错误（fail-fast）。
 - **业务层发事件不碰 infra 类型**：wiring 期构造 `outbox.NewPublisher(pool, schema)`，
   业务包按"接口放消费方"依赖单方法接口 `Publish(ctx, evt) error`。
+- **长驻任务一律经 `reg.Worker(name, run)`**：框架起 goroutine、关停等它退出、异常退出
+  上报主循环并触发关停。自己起 goroutine 的三种典型写错（关停不等、关停预算耗尽不放手、
+  崩了没人管）都收在这一处。周期任务再套 `job.Every(pool, job.Task{...})` 拿跨副本互斥。
+- **可观测性自动就位，业务不写埋点**：契约调用、outbox 投递与死信、周期任务、数据库查询
+  四条路径由框架产出 RED 指标（HTTP 入站由 otelhttp 出，不重复埋）；outbox 积压深度与
+  最老待投递年龄以 gauge 观测（告警看年龄而不是条数）。标签集在 `internal/metrics` 钉死，
+  业务无法追加维度——指标事故几乎都源于"顺手加一个标签"。
+- **跨边界元数据走 `callctx` 白名单**：ctx 防火墙剥掉一切值，只有 request/tenant/caller
+  三个具名字段被放回。HTTP 入站（中间件）与事件 meta（outbox/relay）两条由框架自动
+  接好，异步链路也串得起 request id；**出站 HTTP 那一段是手写 client 的责任**
+  （`callctx.Inject`），appkit 不生成 client，也没有机检——见 §7 表末。
 - **本地开发**：`appkit dev` 自动 `go work init/use`（go.work 不提交）；
   发版联动用 Renovate 自动升 require。私有库配 `GOPRIVATE=github.com/forgeplex/*`。
 - **对账（reconciliation）是 PSP 一等公民**：appkit 提供 recovery point 表约定与
@@ -369,13 +420,25 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
    （markdown 合约翻译为 OpenAPI + 事件 schema、oapi-codegen 流水线、tag 发布），
    在各业务/合约仓库落地，不在 appkit 内。
 4. ✅ **CLI + ruleset + lint**（2026-08 已实现）：
-   - `appkit new domain|system`（骨架 26 文件，基础迁移由 outbox/idem/audit.MigrationSQL
+   - `appkit new domain|system`（域骨架 24 文件，基础迁移由 outbox/idem/audit.MigrationSQL
      运行期拼装——库函数是 DDL 唯一事实源；生成仓库可离线完整编译且通过自身 check/sync）
    - `appkit dev`（go.work 联调）、`appkit sync [--check]`（物化 golangci-lint v2 /
      go-arch-lint v3 配置 + CI 引用，带生成头与漂移检测）
-   - `appkit check`（go.mod 域间依赖铁律、import 方向矩阵、SQL 跨 schema 扫描、迁移编号）
+   - `appkit check`（go.mod 域间依赖铁律、import 方向矩阵、SQL 跨 schema 扫描、迁移编号、
+     规则集漂移）
    - `audit` 包（同事务审计）、`ruleset` 包、`.github/workflows/domain-ci.yml`（reusable）
    - `lint/` 嵌套 module：`moneyfloat`（金额禁浮点，-scope 圈定业务包）、`ctxstruct`
      两个 go/analysis analyzer + `appkit-lint` multichecker
-5. ⬜ **试点迁移 ledger**（已有最清晰的数据层：sqlc + outbox 已在用），验证约束体系。
-6. ⬜ **psp 组合 repo**：先 `-target=all` 单体上线，拆分是之后的部署决策而非架构决策。
+5. ✅ **隔离与运维面**（2026-08 已实现）：把"每个仓库一字不差、却最容易被改坏"的部分
+   全部收进框架，用户仓库只留声明：
+   - `bootstrap`（main() 的全部装配，位于只读 module cache）、`Registry.Worker`
+     （长驻任务托管）、`App.Migrate` + `-migrate` + `SkipMigrations`
+   - `pgmigrate` 迁移内容 sha256 不可变守卫（配 `.gitattributes` 的 `*.sql eol=lf`）
+   - `callctx`（穿越 ctx 防火墙的元数据白名单，HTTP 头 ↔ ctx ↔ 事件 meta 三向传播）
+   - `job`（advisory lock 跨副本互斥的周期任务）
+   - `internal/metrics`（四条路径的 RED 指标 + outbox 积压 gauge，标签集框架内钉死）
+   - `apptest.Conform`（契约一致性套件：同一批用例过每个绑定，比对错误码/返回值/
+     边界语义）+ `contract.Call` 在进 fn 前拦掉已死的 ctx——**§5.3 的四件套至此
+     既是承诺也是可运行的断言**
+6. ⬜ **试点迁移 ledger**（已有最清晰的数据层：sqlc + outbox 已在用），验证约束体系。
+7. ⬜ **psp 组合 repo**：先 `-target=all` 单体上线，拆分是之后的部署决策而非架构决策。

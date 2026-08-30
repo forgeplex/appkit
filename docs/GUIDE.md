@@ -97,7 +97,7 @@ appkit new domain authn    -dir authn
 appkit new domain clients  -dir clients
 ```
 
-每个仓库生成 21 个文件（含 `new` 时自动物化的 lint / CI 配置——不需要再跑
+每个仓库生成 24 个文件（含 `new` 时自动物化的 lint / CI 配置——不需要再跑
 `appkit sync`，它只在升级 appkit 后用来刷新），**生成即合规**（骨架自身通过
 `appkit check` 与 `appkit sync --check`）。以 identity 为例，你需要知道的文件：
 
@@ -111,9 +111,16 @@ appkit new domain clients  -dir clients
 | `db/migrations/0001_appkit_base.sql` | outbox/inbox/幂等/审计四张基础表（生成期由框架库函数拼装） | 别动；自己的表从 `0002_` 开始 |
 | `db/queries/` + `sqlc.yaml` | SQL 唯一存在地；sqlc 生成到 `internal/postgres/sqlc` | 写 `.sql`，`make gen` |
 | `identity.go` | 唯一导出面：`Module()`（只有组合仓库和本仓 cmd/ 会 import） | 一般不动 |
-| `cmd/identityd/` | 独立微服务部署入口（`database.url` 留空 = 最小模式） | 一般不动 |
+| `cmd/identityd/` | 独立微服务部署入口：只声明"装哪些模块"，装配本身在 `appkit/bootstrap` | 一般不动 |
 | `config/dev.yaml` | 运行配置；任意键可被 `IDENTITYD_*` 环境变量覆盖 | 完整模式时填 `database.url` |
 | `.appkit.yml` | 框架配置：`check`/`sync`/`dev` 读取 | 接入合约仓库后填 `contracts:` |
+| `.gitattributes` | 钉 `*.sql eol=lf`（迁移校验和跨平台一致）+ 折叠生成物 | 别动（`appkit sync` 维护） |
+
+**三类代码是分开的，这是刻意的**：框架在 module cache 里（0444 只读，改不到）；
+框架生成的公共代码（lint/CI 配置、sqlc 产物、基础迁移）带生成头且由 `appkit check`
+守着漂移；你写的代码只在 `internal/` 那几个包里。启动装配这种"每个仓库一字不差、
+改坏了框架无从知情"的部分已经收进 `bootstrap`——`cmd/identityd/main.go` 只剩一份
+模块清单，二十来行。
 
 生成后立刻执行（每个域仓库都要）：
 
@@ -124,7 +131,7 @@ appkit dev       # 生成 go.work。★ appkit 未发版期间，appkit 的 chec
                  # go work use <appkit 路径>），否则依赖解析会走远程
 make run         # 零依赖试跑：最小模式（仅 /healthz /readyz /identity/ping）
 make run-db      # 完整模式：自动起一次性开发 Postgres（docker）并注入 database.url
-make check && make test
+make check && make lint && make test   # = CI 跑的那几条
 ```
 
 ### 三条方向性约束（写代码前记住，工具会替你把关）
@@ -283,6 +290,47 @@ appkit gen wrap -src identityv1 -iface Service -system identity -out identityv1/
   `reg.Consumer(identityv1.TopicUserCreated, outbox.Inbox(pool, "authn", "authn", handler))`
   ——inbox 按 (consumer, event_id) 去重，handler 天然幂等。
 
+### 给契约加一条一致性测试（`apptest`）
+
+上面那句"进程内和远程语义一致"是框架的承诺，但**承诺归承诺，你的 client 归你的
+client**。json key 两侧对不上、手写 client 漏了 `contract.Call`、领域错误在
+problem+json 往返后换了码——这些都只在真正拆分部署的那天才炸，而那天你多半正在
+救别的火。`apptest.Conform` 让同一批用例分别跑过两个绑定，当场比对。
+
+测试写在**提供方的域仓库**里（这里是 identity）：只有它同时拿得到真实实现和真实
+的 HTTP handler，把 client 指向 `httptest.Server` 就得到了一条真跑网络的绑定。
+
+```go
+func TestIdentityConformance(t *testing.T) {
+    srv := httptest.NewServer(identityHTTPHandler(newContractImpl(svc)))
+    t.Cleanup(srv.Close)
+
+    apptest.Conform(t,
+        []apptest.Binding[identityv1.Service]{
+            {Name: "local", Service: identityv1.WrapService(newContractImpl(svc), 0)},
+            {Name: "remote", Service: identityv1.NewClient(srv.URL)},
+        },
+        []apptest.Case[identityv1.Service]{
+            {Name: "凭据正确", Do: verify("a@b.c", "right"),
+                Want: identityv1.VerifyCredentialReply{UserID: "u-1", OK: true},
+                Idempotent: true},
+            {Name: "凭据错误", Do: verify("a@b.c", "wrong"),
+                WantCode: identityv1.CodeBadCredential},
+        })
+}
+
+func verify(email, pw string) func(context.Context, identityv1.Service) (any, error) {
+    return func(ctx context.Context, s identityv1.Service) (any, error) {
+        return s.VerifyCredential(ctx, identityv1.VerifyCredentialRequest{Email: email, Password: pw})
+    }
+}
+```
+
+每条用例除了你写的期望，还自动附带四条不用写的断言：**返回值跨形态 DeepEqual**、
+**事务内调用被拒**（`TX_BOUNDARY`）、**ctx 已取消时不落到实现上**（`UNAVAILABLE`）、
+以及标了 `Idempotent` 的连调两次结果一致。少于两个绑定 `Conform` 直接失败——
+只跑一个形态的不叫一致性测试。
+
 ## 6. 第五步：组合仓库
 
 ```sh
@@ -370,7 +418,104 @@ curl -X POST localhost:8080/identity/users \
 TEST_DATABASE_URL='postgres://postgres:dev@127.0.0.1:54329/identity_dev?sslmode=disable' make test
 ```
 
-## 8. 第七步：CI 与约束收口
+## 8. 第七步：上线前要知道的四件事
+
+这四件事在单实例本地跑不出问题，一上多副本就全是坑。框架都接好了，
+你只需要知道开关在哪。
+
+### ① 迁移什么时候跑
+
+默认随进程启动。多副本同时起来也安全（同 schema 经 advisory lock 串行），
+但 N 个副本轮流改 schema 不是你想要的部署方式。规模上来后改成两步：
+
+```sh
+./identityd -migrate -config=config/prod.yaml   # initContainer / Job：应用完迁移即退出
+./identityd -target=all -config=config/prod.yaml
+```
+
+`-migrate` 用的是与正常启动同一份模块声明，不存在"迁移清单和服务清单不是同一份"。
+配了 `-migrate` 却没有 `database.url` 会直接报错——空转成功比失败更危险。
+服务副本要显式声明迁移由外部施加时，加 `appkit.SkipMigrations()`：
+
+```go
+AppOptions: func(bootstrap.Deps) []appkit.Option {
+    return []appkit.Option{appkit.SkipMigrations()}
+},
+```
+
+**已应用的迁移不可再改**：历史表记着每个文件的 sha256，改动已应用的文件会让服务
+以 `MIGRATION_DRIFT` 拒绝启动，错误里带修复方法。要改结构就新增一个迁移文件——
+改老文件不会让库跟着变，只会让库和代码静默分叉，通常到生产才暴露。
+
+### ② 后台任务用 `reg.Worker`，别自己起 goroutine
+
+```go
+reg.Worker("reconcile", myLoop)   // 框架起 goroutine、关停等它退出、崩了报上来
+```
+
+自己 `go func()` 的三种写法每次都要重写一遍，且每次都容易漏：关停不等它（数据半路
+截断）、`OnStop` 里没 `select` ctx（关停预算耗尽也不放手，进程吊死）、run 崩了没人管
+（探针依然绿着，事件却已停摆）。这三件都收在 `Worker` 里了。
+
+### ③ 周期任务必须跨副本互斥
+
+"每小时清理一次过期数据"在两个副本上就是每小时跑两遍。多数时候只是浪费，
+偶尔是重复入账、重复发通知：
+
+```go
+reg.Worker("cleanup", job.Every(m.opts.Pool, job.Task{
+    Name:     "identity.cleanup",   // 集群内唯一，带域前缀
+    Interval: time.Hour,
+    Run:      svc.CleanupExpired,
+}))
+```
+
+锁是 Postgres 的 session 级 advisory lock：不建表、不留垃圾，副本被 `kill -9`
+连接一断就自动放锁。抢不到锁的副本跳过本轮（不排队——周期任务迟一轮无所谓，
+排队积压才是事故）。只想加锁不要循环时用 `job.WithLock(ctx, pool, name, fn)`。
+
+### ④ 指标已经有了，别自己埋
+
+框架自动产出这些（业务代码一行不写；未配 OTLP 端点时全局 provider 是 noop，近乎零成本）：
+
+| 指标 | 标签 | 看它做什么 |
+|---|---|---|
+| `appkit.contract.call.duration` | system, method, outcome, error_code | 跨模块调用的 RED——进程内与远程同口径 |
+| `appkit.outbox.delivery.duration` | topic, outcome | 投递速率与失败率 |
+| `appkit.outbox.dead` | topic | 进死信的事件数，非零就该有人看 |
+| `appkit.outbox.pending` / `.oldest_pending.age` | schema | **告警看年龄不看条数**：积压 1000 条 200ms 清掉是正常的，积压 3 条最老的躺了 20 分钟说明投递停了 |
+| `appkit.job.run.duration` | job, outcome（ok/error/skipped） | 任务悄悄停了（曲线归零）比任务报错更难发现 |
+| `appkit.db.query.duration` | db.operation, outcome | 最常见的故障源，也最常没埋点 |
+
+HTTP 入站不在此列：`otelhttp` 已经产出 `http.server.request.duration`（带正确的
+`http.route`），再埋一遍就是双重计数。
+
+标签集由框架钉死、业务加不进去，这是故意的：指标的成本在基数不在采集，
+一个把 URL、错误消息或用户 id 当标签的埋点足以打爆后端存储。`db.operation`
+只取白名单内的 SQL 动词，认不出的一律塌缩成 `other`。
+
+需要自己加指标时用 `otel.Meter("你的域名")` 自建，别往框架标签上挂维度。
+
+### 附：跨服务的 request id 是怎么串起来的
+
+`contract` 的 ctx 防火墙会剥掉 ctx 里的一切值（进程内调用不该比跨网络调用能多传
+东西），但 `callctx.Meta` 的三个字段例外——request id、tenant id、caller
+在真实的跨网络调用里本来就会传：
+
+- HTTP 入站：`httpserver` 中间件从请求头读进 ctx（自动）；
+- 契约调用（进程内）：防火墙剥值后把它放回（自动）；
+- 事件：outbox 发布时快照进 `Event.Meta`，relay 投递前还原进 ctx——异步链路上也连得起来（自动）。
+
+**出站 HTTP 是唯一要你自己接的一段**：合约仓库的 client 是手写的（`appkit gen`
+只生成 events/errors/wrap，不生成 client），构造请求时得调一次
+`callctx.Inject(callctx.From(ctx), req.Header.Set)`。漏了它，进程内绑定拿得到
+tenant、远程 client 拿不到——"部署形态是启动参数"就此失效，且只在真拆分那天暴露。
+这条没有机检：`apptest.Conform` 比对错误码与返回值，但看不见 client 的请求头。
+
+它是 struct 的具名字段而不是 map，所以业务代码没法自己往里塞东西（那等于把防火墙拆了）。
+要读当前值：`callctx.From(ctx)`。
+
+## 9. 第八步：CI 与约束收口
 
 每个域仓库的 `.github/workflows/ci.yml`（`appkit sync` 生成）只有一行引用：
 
@@ -381,17 +526,27 @@ jobs:
 ```
 
 这条流水线做：gofmt → vet → build → `test -race`（带 Postgres service）→
-`appkit check` → `appkit sync --check`（lint 配置漂移即失败）→ `go mod tidy` 漂移检查。
+`appkit check` → `appkit sync --check`（lint 配置漂移即失败）→ **golangci-lint +
+go-arch-lint** → `go mod tidy` 漂移检查。
+顺序不是随手排的：**先验规则集未漂移，再按规则集跑检查器**——反过来就可能在
+一份被改松的配置上跑出绿色。`appkit check` 本身也查规则集漂移（含配置文件被删），
+所以本地 `make check` 就能拦下"把规则改松让检查变绿"这条路，不必等 CI。
 配合 branch protection，**约束在 CI 不可绕过**；`//nolint` 必须写理由（nolintlint）。
 
-自研 analyzer（金额禁浮点、ctx 禁存 struct）：
+两个检查器的版本由 `ruleset.GolangciLintVersion` / `ruleset.ArchLintVersion` 钉死，
+域仓库 `make lint` 从同一处渲染——本地跑的和 CI 跑的是同一个二进制，
+不会出现"本地绿、CI 红"。升级 appkit 后 `appkit sync` 刷新配置，
+`make lint` 自然跟着换版本。
+
+自研 analyzer（金额禁浮点、ctx 禁存 struct）**尚未接进域仓库 CI**（`lint/` 是独立
+嵌套 module，接入方式见 lint/README.md「里程碑 4」）。现在只能手动跑：
 
 ```sh
 go install github.com/forgeplex/appkit/lint/cmd/appkit-lint@latest
 go vet -vettool=$(which appkit-lint) -moneyfloat.scope 'internal/(identity|authn)' ./...
 ```
 
-## 9. 规则速查
+## 10. 规则速查
 
 | 你想做 | 正确做法 | 错误做法（会被什么拦住） |
 |---|---|---|
@@ -400,8 +555,14 @@ go vet -vettool=$(which appkit-lint) -moneyfloat.scope 'internal/(identity|authn
 | 发领域事件 | 用例事务内 `pub.Publish` | 事务外发（守卫拒绝）；直连 broker（业务包 import 不到） |
 | 处理外域事件 | `reg.Consumer` + `outbox.Inbox` 包裹 | 裸 handler（重复投递=重复执行） |
 | 写 SQL | `db/queries/*.sql` + sqlc | handler/service 里拼 SQL（depguard 拦 pgx import） |
-| 表示金额 | `money.Money` | float64（appkit-lint 报错） |
+| 表示金额 | `money.Money` | float64（appkit-lint 能报，但它还没进 CI——这条目前靠自觉） |
 | 返回错误 | 合约错误码（`apperr.Is(err, identityv1.CodeXxx)` 单体/微服务行为一致） | 字符串比对、裸 errors.New 跨层 |
+| 跑后台任务 | `reg.Worker(name, run)` | 自己 `go func()`（关停不等它、崩了没人管） |
+| 跑周期任务 | `reg.Worker(name, job.Every(pool, ...))` | 裸 `time.Ticker`（多副本每轮重复执行） |
+| 改数据库结构 | 新增 `000N_xxx.sql` | 改已应用的迁移文件（启动报 MIGRATION_DRIFT） |
+| 加业务指标 | `otel.Meter("你的域名")` 自建 | 往框架指标上加标签（基数无界） |
+| 传 request id / 租户 | `callctx.Meta`（入站/契约/事件自动，出站 client 自己 `Inject`） | 自己往 ctx 塞值（跨契约调用会被防火墙剥掉） |
+| 确认拆分部署不会变行为 | 提供方域仓库里写一条 `apptest.Conform`（local + remote 两个绑定） | 只测本地实现（远程那条路径第一次跑就是在生产） |
 
 ## FAQ
 
@@ -423,5 +584,12 @@ go vet -vettool=$(which appkit-lint) -moneyfloat.scope 'internal/(identity|authn
 
 **Q：模块还需要哪些生命周期钩子？**
 一般不需要。连接池、迁移、HTTP、relay、优雅关停都由框架或骨架接好；
-只有自定义后台任务才用 `reg.OnStart(appkit.StageWorker, ...)` + `reg.OnStop`
-（stop 里等 worker 退出务必 `select` 上 ctx，见 outbox/relay.go 顶部示例）。
+自定义后台任务用 `reg.Worker(name, run)` 一行（框架负责起协程、关停等待、
+异常上报）。`reg.OnStart` / `reg.OnStop` 留给真正需要自定义时序的场景。
+
+**Q：我能改坏框架吗？**
+框架代码在 module cache 里（`0444` 只读），改不到。启动装配也已经收进
+`appkit/bootstrap`，你的 `main.go` 只剩模块清单。框架生成的公共代码
+（lint/CI 配置、sqlc 产物、基础迁移）留在你仓库里但带生成头，改了会被
+`appkit check` 拦下——包括"把规则改松"这一手。你写的代码在 `internal/`，
+和上面两类不共处一处。

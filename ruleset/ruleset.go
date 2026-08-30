@@ -11,6 +11,15 @@ import (
 	"text/template"
 )
 
+// 域仓库 lint 工具链的钉版本。域仓库的 Makefile（lint 目标）与 appkit 的
+// .github/workflows/domain-ci.yml 必须跑同一个版本——版本不一致就会出现
+// 「本地绿、CI 红」，而这正是规则集物化要消灭的那类事故。
+// 两处一致由 ruleset 的 TestLinterVersionsMatchCI 守住；升级改这里。
+const (
+	GolangciLintVersion = "v2.13.2"
+	ArchLintVersion     = "v1.18.0"
+)
+
 //go:embed templates/*.tmpl
 var tmplFS embed.FS
 

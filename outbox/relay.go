@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/callctx"
+	"github.com/forgeplex/appkit/internal/metrics"
 )
 
 // Relay 轮询参数默认值。
@@ -104,6 +106,7 @@ type Relay struct {
 	retrySQL       string
 	deadSQL        string
 	releaseSQL     string
+	backlogSQL     string
 }
 
 // NewRelay 构造 Relay。schema 不合法时 panic。
@@ -146,6 +149,13 @@ func NewRelay(pool *pgxpool.Pool, schema string, bus Bus, opts ...RelayOption) *
 		releaseSQL: fmt.Sprintf(
 			`UPDATE %s.outbox SET claimed_until = NULL WHERE id = ANY($1)`,
 			ident(schema)),
+		// WHERE 子句必须与 outbox_unpublished_idx 的部分索引条件逐字一致，
+		// 否则退化成全表扫描。
+		backlogSQL: fmt.Sprintf(
+			`SELECT count(*),
+			        COALESCE(EXTRACT(EPOCH FROM (now() - min(created_at))), 0)
+			 FROM %s.outbox WHERE published_at IS NULL AND failed_at IS NULL`,
+			ident(schema)),
 	}
 	for _, o := range opts {
 		o(r)
@@ -157,6 +167,10 @@ func NewRelay(pool *pgxpool.Pool, schema string, bus Bus, opts ...RelayOption) *
 // 单轮失败（数据库抖动、某 handler 出错甚至 panic）不终止循环：失败的事件
 // 按退避重试、成功的照常推进，这正是 outbox 的至少一次语义；错误仅记日志。
 func (r *Relay) Run(ctx context.Context) error {
+	// 积压观测量的生命周期就是 relay 的生命周期：没在跑 relay 的进程不报这个数。
+	// 跑着 relay 的多个副本会各报一份同一张表的读数（这是 gauge 观测共享状态的
+	// 固有形态），看板按实例取 max 而不是 sum。
+	defer metrics.ObserveOutboxBacklog(r.schema, r.backlog)()
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -177,6 +191,31 @@ func (r *Relay) Run(ctx context.Context) error {
 		case <-time.After(r.interval):
 		}
 	}
+}
+
+// backlogTimeout 给积压查询一个独立的短预算：它是观测，不该拖住采集周期，
+// 更不该在数据库慢的时候和投递抢连接。
+const backlogTimeout = 3 * time.Second
+
+// backlog 读一次待投递积压。查询命中 outbox_unpublished_idx 部分索引
+// （只覆盖未发布且非死信的行），代价随积压量而非历史总量增长——
+// 已发布的历史行再多也不影响这次读数。
+func (r *Relay) backlog(ctx context.Context) (metrics.Backlog, error) {
+	ctx, cancel := context.WithTimeout(ctx, backlogTimeout)
+	defer cancel()
+
+	var (
+		pending int64
+		ageSec  float64
+	)
+	err := r.pool.QueryRow(ctx, r.backlogSQL).Scan(&pending, &ageSec)
+	if err != nil {
+		return metrics.Backlog{}, fmt.Errorf("outbox: 读取积压深度: %w", err)
+	}
+	return metrics.Backlog{
+		Pending:   pending,
+		OldestAge: time.Duration(ageSec * float64(time.Second)),
+	}, nil
 }
 
 // claimedEvent 是 claim 阶段选中的一行。attempts 供失败退避决策；meta 延迟
@@ -306,7 +345,13 @@ func (r *Relay) deliver(ctx context.Context, ce claimedEvent) (err error) {
 			return fmt.Errorf("meta 反序列化: %w", err)
 		}
 	}
-	return r.bus.Publish(ctx, appkit.Event{ID: ce.id, Topic: ce.topic, Payload: ce.payload, Meta: m})
+	// 还原发布时的 callctx 白名单：消费者的日志与再发出的事件由此接上原请求的
+	// request id，异步链路不断。ctx 的取消/超时仍是 relay 自己的。
+	ctx = callctx.With(ctx, callctx.FromMap(m))
+	start := time.Now()
+	perr := r.bus.Publish(ctx, appkit.Event{ID: ce.id, Topic: ce.topic, Payload: ce.payload, Meta: m})
+	metrics.OutboxDelivery(ctx, ce.topic, perr, start)
+	return perr
 }
 
 // recordFailure 给失败事件记退避；达重试上限则置 failed_at 进入死信，
@@ -317,6 +362,7 @@ func (r *Relay) recordFailure(ctx context.Context, ce claimedEvent, cause error)
 		if _, err := r.pool.Exec(ctx, r.deadSQL, ce.id, cause.Error()); err != nil {
 			return fmt.Errorf("outbox: 标记死信: %w", err)
 		}
+		metrics.OutboxDead(ctx, ce.topic)
 		r.log.Error("outbox: 事件投递重试达上限，转入死信（failed_at），需人工处理",
 			"schema", r.schema, "event_id", ce.id, "topic", ce.topic,
 			"attempts", attempts, "err", cause)

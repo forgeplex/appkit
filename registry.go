@@ -26,6 +26,8 @@ type Registry struct {
 	stops      []stopHook
 	// startStages 记录每个模块最近一次 OnStart 的 stage，供 OnStop 定序。
 	startStages map[string]int
+	// workerErr 承接 Worker 的异常退出，带缓冲避免写侧阻塞。
+	workerErr chan error
 
 	// current 是正在 Register/Setup 的模块名，用于归属与报错。
 	current string
@@ -87,6 +89,7 @@ func newRegistry() *Registry {
 		remotes:     make(map[reflect.Type]*binding),
 		health:      health.NewRegistry(),
 		startStages: make(map[string]int),
+		workerErr:   make(chan error, 1),
 	}
 }
 

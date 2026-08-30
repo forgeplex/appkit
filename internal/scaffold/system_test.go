@@ -44,13 +44,14 @@ func TestSystemScaffold(t *testing.T) {
 
 	t.Run("main.go 组合根样例", func(t *testing.T) {
 		main := readFile(t, dir, "cmd/psp/main.go")
+		// 组合根只声明装什么、绑谁；-target/配置/遥测/连接池/关停都在
+		// bootstrap 里（module cache 只读），生成物里改不到。
 		mustContain(t, "cmd/psp/main.go", main,
-			`flag.String("target"`,
-			"appkit.New(",
-			"httpserver.Base(log)",
-			"appkit.Remote(", // Remote 注释样例
-			"appkit.Bus(",    // Bus 注释样例
-			"ledger.Module(", // Modules 注释样例
+			"bootstrap.Main(bootstrap.Options{",
+			`Service: "psp"`,
+			"ledger.Module(",     // Modules 注释样例
+			"appkit.Remote(",     // Remote 注释样例
+			"bootstrap.EventBus", // 换总线注释样例
 		)
 	})
 
@@ -68,7 +69,10 @@ func TestSystemScaffold(t *testing.T) {
 		mustContain(t, "config/dev.yaml", readFile(t, dir, "config/dev.yaml"), "env: dev")
 		mustContain(t, "config/prod.yaml", readFile(t, dir, "config/prod.yaml"), "env: prod")
 		mustContain(t, "deploy/README.md", readFile(t, dir, "deploy/README.md"),
-			"-target=all", "-target=relay")
+			"-target=all", "-target=relay",
+			// 迁移与告警是部署时才想起来的两件事，写在这里而不是散在别处。
+			"-migrate", "appkit.SkipMigrations()", "MIGRATION_DRIFT",
+			"appkit.outbox.oldest_pending.age")
 	})
 }
 

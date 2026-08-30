@@ -1,143 +1,66 @@
 // Command {{.Name}}d 是 {{.Name}} 域的独立部署入口：只装本域模块。
-// 外域契约在此绑 Remote client（合约仓库生成物）——见 appkit.Remote 注释。
+//
+// 启动装配（配置加载/遥测/连接池/事件总线/迁移器/优雅关停）全部在
+// appkit/bootstrap 里——那段代码在 module cache 里只读，改不到也不必读。
+// 这里只声明两件事：装哪些模块、外域契约绑谁。
 package main
 
 import (
-	"context"
-	"flag"
-	"fmt"
 	"net/http"
-	"os"
-	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgeplex/appkit"
-	"github.com/forgeplex/appkit/config"
-	"github.com/forgeplex/appkit/httpserver"
-	"github.com/forgeplex/appkit/outbox"
-	"github.com/forgeplex/appkit/pgmigrate"
-	"github.com/forgeplex/appkit/pgtx"
-	"github.com/forgeplex/appkit/telemetry"
+	"github.com/forgeplex/appkit/bootstrap"
 
 	{{.Name}} "{{.Module}}"
 	{{.Name}}http "{{.Module}}/internal/http"
 )
 
-// appConfig 分层加载：-config 指定的 yaml（可缺省，纯环境变量也能起服）
-// → {{.EnvPrefix}}_* 环境变量覆盖。例：{{.EnvPrefix}}_DATABASE__URL 覆盖 database.url。
-type appConfig struct {
-	Addr     string    `koanf:"addr"`
-	Env      string    `koanf:"env" validate:"omitempty,oneof=dev staging prod"`
-	Database dbConfig  `koanf:"database"`
-	Log      logConfig `koanf:"log"`
-}
-
-type dbConfig struct {
-	// URL 形如 postgres://user:pass@host:5432/db?sslmode=disable。
-	// 留空 = 最小模式（仅探针与 /ping，数据面未启用）——方便零依赖试跑；
-	// 生产部署应始终配置。
-	URL string `koanf:"url"`
-}
-
-type logConfig struct {
-	Level  string `koanf:"level" validate:"omitempty,oneof=debug info warn error"`
-	Format string `koanf:"format" validate:"omitempty,oneof=json text"`
-}
-
 func main() {
-	target := flag.String("target", "all",
-		"本地实例化的模块集：all 或逗号分隔的模块名")
-	confFile := flag.String("config", "config/dev.yaml", "配置文件路径（可缺省）")
-	flag.Parse()
-
-	if err := run(*target, *confFile); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
+	bootstrap.Main(bootstrap.Options{
+		Service: "{{.Name}}d",
+		Modules: func(d bootstrap.Deps) ([]appkit.Module, error) {
+			return []appkit.Module{
+				{{.Name}}.Module({{.Name}}.Options{Log: d.Log, Pool: d.Pool, Bus: d.Bus}),
+			}, nil
+		},
+		Minimal: minimal,
+		// 外域契约绑远程 client（合约仓库生成，实现同一契约接口）：
+		// 提供方在 -target 内就走进程内直调，不在就走这里的 client——
+		// 消费方代码两种形态下完全一致。
+		//
+		// AppOptions: func(d bootstrap.Deps) []appkit.Option {
+		// 	return []appkit.Option{appkit.Remote(otherv1.NewClient)}
+		// },
+	})
 }
 
-func run(target, confFile string) error {
-	ctx := context.Background()
-
-	cfg, err := config.Load[appConfig](config.Options{
-		Files:     []string{confFile},
-		EnvPrefix: "{{.EnvPrefix}}",
-		Optional:  true,
-	})
-	if err != nil {
-		return fmt.Errorf("{{.Name}}d: 加载配置: %w", err)
-	}
-	if cfg.Addr == "" {
-		cfg.Addr = ":8080"
-	}
-	if cfg.Env == "" {
-		cfg.Env = "dev"
-	}
-
-	tel, err := telemetry.Init(ctx, telemetry.Config{
-		ServiceName: "{{.Name}}d",
-		Env:         cfg.Env,
-		LogLevel:    cfg.Log.Level,
-		LogFormat:   cfg.Log.Format,
-	})
-	if err != nil {
-		return fmt.Errorf("{{.Name}}d: 初始化遥测: %w", err)
-	}
-	log := tel.Logger
-
-	var (
-		modules []appkit.Module
-		opts    = []appkit.Option{
-			appkit.Target(target),
-			appkit.HTTPAddr(cfg.Addr),
-			appkit.Logger(log),
-			appkit.Middleware(httpserver.Base(log)...),
-		}
-		pool *pgxpool.Pool
-	)
-	if cfg.Database.URL == "" {
-		log.Warn("{{.Name}}d: 未配置 database.url，最小模式启动：" +
-			"仅 /healthz /readyz 与 " + {{.Name}}http.PingPattern +
-			"，数据面（迁移/outbox/幂等/审计）未启用。" +
-			"完整模式：make run-db，或在 config/dev.yaml 填 database.url")
-		modules = []appkit.Module{appkit.ModuleFunc("{{.Name}}", registerMinimal)}
-	} else {
-		pool, err = pgtx.NewPool(ctx, cfg.Database.URL)
-		if err != nil {
-			return fmt.Errorf("{{.Name}}d: 连接数据库（本地开发可先 make dev-db）: %w", err)
-		}
-		defer pool.Close()
-		// 单库直投总线：relay 经它把本域事件投给订阅方（inbox 去重）。
-		// 拆分部署换 NATS/Kafka 实现，业务代码零改动。
-		bus := outbox.NewDirectBus()
-		modules = []appkit.Module{
-			{{.Name}}.Module({{.Name}}.Options{Log: log, Pool: pool, Bus: bus}),
-		}
-		opts = append(opts,
-			appkit.Migrator(pgmigrate.Runner(pool)),
-			appkit.Bus(bus),
-			// 外域契约绑远程 client（手写或合约仓库生成，实现同一契约接口）：
-			// appkit.Remote(otherv1.NewClient),
-		)
-	}
-
-	runErr := appkit.New(modules, opts...).Run(ctx)
-
-	// 遥测最后关：关停钩子产生的 span/metric 也要被 flush。
-	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := tel.Shutdown(sctx); err != nil {
-		log.Error("{{.Name}}d: 遥测关停失败", "err", err)
-	}
-	return runErr
-}
-
-// registerMinimal 是无数据库的占位模块：证明服务能跑，不装任何业务。
+// minimal 是未配置 database.url 时的占位模块：证明服务能跑，不装任何业务。
 // 路由与完整模块同一 pattern——切换模式不移动端点。
-func registerMinimal(reg *appkit.Registry) error {
-	reg.Mount({{.Name}}http.PingPattern, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("pong (最小模式)\n"))
-	}))
-	return nil
+func minimal(bootstrap.Deps) ([]appkit.Module, error) {
+	return []appkit.Module{
+		appkit.ModuleFunc("{{.Name}}", func(reg *appkit.Registry) error {
+			reg.Mount({{.Name}}http.PingPattern, http.HandlerFunc(
+				func(w http.ResponseWriter, _ *http.Request) {
+					_, _ = w.Write([]byte("pong (最小模式)\n"))
+				}))
+			return nil
+		}),
+	}, nil
 }
+
+// 需要额外配置项（第三方地址、超时…）时，不必重复声明 addr/env/database/log：
+// 用同一份文件与环境变量再加载一次自己的结构即可。
+//
+//	type myConfig struct {
+//		Stripe struct {
+//			Key string `koanf:"key" validate:"required"`
+//		} `koanf:"stripe"`
+//	}
+//
+//	Modules: func(d bootstrap.Deps) ([]appkit.Module, error) {
+//		cfg, err := config.Load[myConfig](d.Config)
+//		if err != nil {
+//			return nil, err
+//		}
+//		...
+//	}

@@ -19,6 +19,7 @@ import (
 //
 // 启动顺序：Register（声明）→ Remote 绑定 → 依赖图解析（fail-fast）→ 迁移 →
 // Setup（装配）→ 消费者订阅 Bus → OnStart 按 stage 升序 → HTTP 监听 → 置 ready。
+// 就绪后阻塞在三件事上：关停信号、HTTP 服务异常退出、长驻 Worker 异常退出。
 // 关停顺序：readyz 置 503 摘流量 → drain 等待 → HTTP Shutdown → OnStop 按启动
 // 逆序（stage 降序、同 stage 注册逆序）。启动中途失败时，先取消启动钩子派生的
 // ctx（叫停已启动的 worker），再只对实际启动过的 stage 执行 OnStop。
@@ -42,10 +43,8 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.reg.resolveAll(); err != nil {
 		return err
 	}
-	if a.cfg.migrator != nil && len(a.reg.migrations) > 0 {
-		if err := a.cfg.migrator(ctx, a.reg.migrations); err != nil {
-			return fmt.Errorf("appkit: 迁移失败: %w", err)
-		}
+	if err := a.migrate(ctx); err != nil {
+		return err
 	}
 	if err := a.reg.runSetups(ctx); err != nil {
 		return err
@@ -80,6 +79,10 @@ func (a *App) Run(ctx context.Context) error {
 		case err := <-a.serverErr:
 			serveErr = fmt.Errorf("appkit: HTTP 服务异常退出: %w", err)
 			log.Error("appkit: HTTP 服务异常退出，进入关停", "err", err)
+		case err := <-a.reg.workerErr:
+			// 长驻 worker 死了而进程还活着 = 探针绿着但事件停摆。同 HTTP 异常退出处理。
+			serveErr = err
+			log.Error("appkit: 后台 worker 异常退出，进入关停", "err", err)
 		}
 	} else {
 		log.Error("appkit: 启动失败，进入关停", "err", startErr)
@@ -88,6 +91,60 @@ func (a *App) Run(ctx context.Context) error {
 	cancelRun()
 	shutdownErr := a.shutdown(server, maxStage)
 	return errors.Join(startErr, serveErr, shutdownErr)
+}
+
+// Migrate 只做「声明 → 应用迁移」然后返回：不解析依赖图、不跑 Setup/OnStart、
+// 不监听端口。供部署的前置步骤使用（K8s initContainer 或 Job）——多副本滚动
+// 更新时先由一个 Job 把 schema 迁到位，服务副本再带 SkipMigrations 起来，
+// 避免 N 个副本同时改 schema。
+//
+// 迁移清单与 Run 用的是同一份模块声明，不存在「迁移用的清单和服务用的不是
+// 同一份」这种漂移。必须注入 Migrator，否则报错（此处 SkipMigrations 无意义）。
+func (a *App) Migrate(ctx context.Context) error {
+	enabled, err := a.enabledModules()
+	if err != nil {
+		return err
+	}
+	if err := a.register(enabled); err != nil {
+		return err
+	}
+	if len(a.reg.migrations) == 0 {
+		a.cfg.logger.Info("appkit: 无迁移可应用", "target", a.cfg.target)
+		return nil
+	}
+	if a.cfg.migrator == nil {
+		return fmt.Errorf("appkit: Migrate 需要迁移执行器：注入 appkit.Migrator(pgmigrate.Runner(pool))")
+	}
+	a.cfg.logger.Info("appkit: 应用迁移", "target", a.cfg.target, "sets", len(a.reg.migrations))
+	if err := a.cfg.migrator(ctx, a.reg.migrations); err != nil {
+		return fmt.Errorf("appkit: 迁移失败: %w", err)
+	}
+	a.cfg.logger.Info("appkit: 迁移完成")
+	return nil
+}
+
+// migrate 应用全部已声明迁移。登记了迁移却没有执行器属装配错误，fail-fast——
+// 静默跳过迁移＝服务对着旧 schema 跑，症状要到第一条查询才出现，且长得像业务 bug。
+// 迁移确实由进程外施加（K8s initContainer 跑 appkit migrate）时，
+// 用 SkipMigrations 显式声明。
+func (a *App) migrate(ctx context.Context) error {
+	sets := a.reg.migrations
+	if len(sets) == 0 {
+		return nil
+	}
+	if a.cfg.migrator == nil {
+		if !a.cfg.skipMigrations {
+			return fmt.Errorf("appkit: 有 %d 个迁移集待应用（如模块 %q 的 schema %q）但未注入迁移执行器："+
+				"注入 appkit.Migrator(pgmigrate.Runner(pool))，或以 appkit.SkipMigrations() 声明由进程外施加",
+				len(sets), sets[0].Module, sets[0].Schema)
+		}
+		a.cfg.logger.Info("appkit: 跳过迁移（SkipMigrations）", "sets", len(sets))
+		return nil
+	}
+	if err := a.cfg.migrator(ctx, sets); err != nil {
+		return fmt.Errorf("appkit: 迁移失败: %w", err)
+	}
+	return nil
 }
 
 // subscribeConsumers 把 Registry.Consumer 登记的消费者逐条订阅到 Bus。

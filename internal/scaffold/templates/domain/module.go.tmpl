@@ -81,22 +81,11 @@ func (m *mod) Register(reg *appkit.Registry) error {
 	}))
 
 	// outbox relay：轮询本域 outbox 表并经 Bus 外发（退避/死信见 outbox 包文档）。
-	// OnStop 必须 select ctx——关停预算耗尽时不能吊死整个进程。
+	// reg.Worker 管住 goroutine 的三件事——关停等它退出、超预算不吊死、
+	// 崩了掀翻进程而不是让探针继续绿着——都在框架里，这里只交一个函数。
 	if m.opts.Bus != nil {
 		relay := outbox.NewRelay(m.opts.Pool, Schema, m.opts.Bus)
-		done := make(chan error, 1)
-		reg.OnStart(appkit.StageWorker, func(ctx context.Context) error {
-			go func() { done <- relay.Run(ctx) }()
-			return nil
-		})
-		reg.OnStop(func(ctx context.Context) error {
-			select {
-			case err := <-done:
-				return err
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		})
+		reg.Worker("outbox-relay", relay.Run)
 	} else {
 		m.opts.Log.Warn("{{.Name}}: 未注入 Bus，outbox relay 未启动——本域事件只落表不外发")
 	}

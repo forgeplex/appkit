@@ -8,11 +8,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/forgeplex/appkit/internal/metrics"
 	"github.com/forgeplex/appkit/tx"
 )
 
@@ -49,6 +51,9 @@ func NewPool(ctx context.Context, dsn string, opts ...PoolOption) (*pgxpool.Pool
 	if err != nil {
 		return nil, fmt.Errorf("pgtx: 解析 DSN: %w", err)
 	}
+	// 默认埋点在 opts 之前装：需要自己的 tracer（如 otelpgx）的用户用
+	// PoolOption 覆盖掉即可。
+	cfg.ConnConfig.Tracer = queryTracer{}
 	for _, o := range opts {
 		o(cfg)
 	}
@@ -61,6 +66,31 @@ func NewPool(ctx context.Context, dsn string, opts ...PoolOption) (*pgxpool.Pool
 		return nil, fmt.Errorf("pgtx: ping: %w", err)
 	}
 	return pool, nil
+}
+
+// queryTracer 给每条 Query/QueryRow/Exec 记一条耗时与结果指标。
+// 数据库是最常见的故障源，也是最容易"没埋点所以查不出来"的一层。
+type queryTracer struct{}
+
+type traceKey struct{}
+
+// traceState 在 start 时算好 SQL 动词——TraceQueryEnd 拿不到 SQL，
+// 而 CommandTag 在出错时是空的，恰好是最需要知道动词的时候。
+type traceState struct {
+	start time.Time
+	op    string
+}
+
+func (queryTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	return context.WithValue(ctx, traceKey{}, traceState{start: time.Now(), op: metrics.Operation(data.SQL)})
+}
+
+func (queryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryEndData) {
+	st, ok := ctx.Value(traceKey{}).(traceState)
+	if !ok {
+		return
+	}
+	metrics.DBQueryOp(ctx, st.op, data.Err, st.start)
 }
 
 // Transactor 实现 tx.Transactor。

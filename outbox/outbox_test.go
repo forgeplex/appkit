@@ -2,13 +2,16 @@ package outbox_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/outbox"
 	"github.com/forgeplex/appkit/tx"
 )
@@ -162,5 +165,64 @@ func TestInboxRejectsEmptyConsumer(t *testing.T) {
 	t.Parallel()
 	if !panics(func() { outbox.Inbox(nil, "s", "", nil) }) {
 		t.Fatal("Inbox 空 consumer 应 panic")
+	}
+}
+
+// captureDB 只记录 Exec 的参数，用于在无数据库的情况下断言写进 outbox 的内容。
+type captureDB struct{ args []any }
+
+func (d *captureDB) Exec(_ context.Context, _ string, args ...any) (pgconn.CommandTag, error) {
+	d.args = args
+	return pgconn.CommandTag{}, nil
+}
+func (d *captureDB) Query(context.Context, string, ...any) (pgx.Rows, error) { return nil, nil }
+func (d *captureDB) QueryRow(context.Context, string, ...any) pgx.Row        { return nil }
+
+// TestPublishSnapshotsCallMeta 验证发布时把 callctx 白名单快照进事件 meta：
+// 事件是异步的，投递时原请求早就结束了，不在这里存下来链路就断了。
+// 业务自己写的 meta 必须原样保留。
+func TestPublishSnapshotsCallMeta(t *testing.T) {
+	t.Parallel()
+	ctx := tx.With(context.Background(), "fake-tx")
+	ctx = callctx.With(ctx, callctx.Meta{RequestID: "r1", TenantID: "acme"})
+
+	db := &captureDB{}
+	err := outbox.Publish(ctx, db, "ledger", appkit.Event{
+		Topic:   "ledger.posted.v1",
+		Payload: []byte(`{}`),
+		Meta:    map[string]string{"source": "csv"},
+	})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	raw, ok := db.args[3].([]byte)
+	if !ok {
+		t.Fatalf("meta 参数类型不符: %T", db.args[3])
+	}
+	var got map[string]string
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("meta 反序列化: %v", err)
+	}
+	if m := callctx.FromMap(got); m.RequestID != "r1" || m.TenantID != "acme" {
+		t.Fatalf("白名单未落进事件 meta: %v", got)
+	}
+	if got["source"] != "csv" {
+		t.Fatalf("业务 meta 被覆盖: %v", got)
+	}
+}
+
+// TestPublishLeavesCallerMetaUntouched 验证不修改调用方传进来的 map。
+func TestPublishLeavesCallerMetaUntouched(t *testing.T) {
+	t.Parallel()
+	ctx := callctx.With(tx.With(context.Background(), "fake-tx"),
+		callctx.Meta{RequestID: "r1"})
+	mine := map[string]string{"source": "csv"}
+	if err := outbox.Publish(ctx, &captureDB{}, "ledger",
+		appkit.Event{Topic: "t", Meta: mine}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(mine) != 1 {
+		t.Fatalf("调用方的 meta 被就地改了: %v", mine)
 	}
 }

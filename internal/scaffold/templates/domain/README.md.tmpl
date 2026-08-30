@@ -9,13 +9,20 @@ github.com/forgeplex/appkit，设计文档 docs/DESIGN.md）。
 appkit dev     # 生成 go.work，联调本地 appkit / 各域仓库（go.work 不提交）
 make run       # ★ 零依赖试跑：最小模式（仅 /healthz /readyz /ping，数据面未启用）
 make run-db    # 完整模式：自动起一次性开发 Postgres（docker）并注入 database.url
-make check     # 架构检查
+make migrate   # 只应用迁移然后退出（生产上这一步跑在 initContainer/Job 里）
+make check     # 架构检查（依赖方向 + SQL 跨 schema + 规则集漂移）
+make lint      # golangci-lint + go-arch-lint（钉版本经 go run，无需预装）
 make test
 ```
 
 lint / CI 配置（.golangci.yml、.go-arch-lint.yml、.github/workflows/ci.yml）
-已在 `appkit new` 时物化；升级 appkit 后跑 `appkit sync` 刷新，CI 会校验未漂移。
+已在 `appkit new` 时物化；升级 appkit 后跑 `appkit sync` 刷新，`make check` 与
+CI 都会校验未漂移（改松规则不会让检查变绿）。CI 先验漂移、再按这份配置跑
+`make lint` 的那两个检查器，版本与本地钉在同一个。
 运行配置在 `config/dev.yaml`，任意键可被 `{{.EnvPrefix}}_*` 环境变量覆盖。
+
+**已应用的迁移不可再改**：历史表存着每个文件的 sha256，改动已应用的文件会让服务
+以 `MIGRATION_DRIFT` 拒绝启动（错误信息里带修复命令）。改结构一律新增 `000N_*.sql`。
 
 ## 结构
 

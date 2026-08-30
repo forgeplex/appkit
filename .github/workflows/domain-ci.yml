@@ -59,6 +59,15 @@ jobs:
       - name: appkit sync 漂移检查
         run: go run github.com/forgeplex/appkit/cmd/appkit sync --check
 
+      # 先验规则集未漂移，再按规则集跑 lint——否则跑的可能是被改松的配置。
+      # 版本必须与 ruleset.GolangciLintVersion / ruleset.ArchLintVersion 一致
+      # （域仓库 Makefile 的 lint 目标从那里渲染），否则本地绿、CI 红。
+      - name: golangci-lint（depguard / wrapcheck / forbidigo）
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run ./...
+
+      - name: go-arch-lint（组件依赖矩阵）
+        run: go run github.com/fe3dback/go-arch-lint@v1.18.0 check
+
       - name: go.mod 整洁检查
         run: |
           go mod tidy

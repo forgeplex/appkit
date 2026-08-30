@@ -12,6 +12,24 @@
 一个 Deployment 装配全部模块；跨模块调用走进程内契约绑定
 （仍经 contract.Call：ctx 防火墙、事务守卫、超时、错误规范化）。
 
+## 迁移
+
+默认随进程启动应用（多副本经 advisory lock 串行，安全）。副本数上来后改成两步，
+避免 N 个副本轮流改 schema：
+
+```
+{{.Name}} -migrate -config=config/prod.yaml     # initContainer 或 Job：应用完即退出
+{{.Name}} -target=all -config=config/prod.yaml  # 服务副本
+```
+
+`-migrate` 与正常启动用的是同一份模块声明，不存在"迁移清单和服务清单不是同一份"。
+要让服务副本显式声明"迁移由外部施加"，在 main.go 的 `AppOptions` 里加
+`appkit.SkipMigrations()`——登记了迁移却既没执行器又没这个声明，启动即报错，
+"没人跑迁移"不靠沉默表达。
+
+已应用的迁移内容不可变（sha256 守卫，不符即 `MIGRATION_DRIFT` 拒绝启动）；
+改结构一律新增迁移文件。
+
 ## 拆分（之后的部署决策）
 
 同一镜像、不同 Deployment、不同 -target：
@@ -26,3 +44,17 @@
 - 事件总线从 directbus 切 NATS/Kafka（同一 Bus 接口，业务代码不改）；
 - 每个进程都暴露 /healthz（liveness）与 /readyz（readiness）；
   SIGTERM 后 readyz 先置 503 摘流量再优雅关停，K8s 配 preStop 缓冲。
+
+## 看板与告警
+
+框架自动产出指标（业务代码零埋点），最少要盯这三条：
+
+- `appkit.outbox.oldest_pending.age`（按 schema）——**投递停摆的告警看年龄不看条数**：
+  积压 1000 条 200ms 清掉是正常的，积压 3 条最老的躺了 20 分钟说明 relay 已经停了。
+  多个 relay 副本各报一份同一张表的读数，按实例取 `max` 而不是 `sum`。
+- `appkit.outbox.dead`（按 topic）——进死信的事件数，非零就该有人看。
+- `appkit.contract.call.duration`（按 system/method/outcome）——跨模块调用的 RED；
+  拆分部署后这条曲线的形状不该变（进程内与远程同口径）。
+
+另有 `appkit.job.run.duration`（周期任务，注意 outcome=skipped 是正常的多副本互斥）
+与 `appkit.db.query.duration`。HTTP 入站指标由 otelhttp 产出，不在 appkit 命名空间里。

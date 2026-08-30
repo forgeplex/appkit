@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 )
 
 // captureHandler 收集 slog 记录，供断言日志字段。
@@ -128,6 +129,25 @@ func TestRequestID(t *testing.T) {
 func TestRequestIDFrom_Empty(t *testing.T) {
 	if got := RequestIDFrom(context.Background()); got != "" {
 		t.Fatalf("空 ctx 应返回空串, got %q", got)
+	}
+}
+
+// TestRequestIDExtractsWhitelist 验证入站中间件把整个 callctx 白名单取进 ctx，
+// 而不只是 request id——租户与 caller 同样要能传到下游模块与事件。
+func TestRequestIDExtractsWhitelist(t *testing.T) {
+	var got callctx.Meta
+	h := RequestID()(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		got = callctx.From(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Header.Set(callctx.HeaderRequestID, "req-1")
+	req.Header.Set(callctx.HeaderTenantID, "acme")
+	req.Header.Set(callctx.HeaderCaller, "gateway")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	want := callctx.Meta{RequestID: "req-1", TenantID: "acme", Caller: "gateway"}
+	if got != want {
+		t.Fatalf("白名单提取不符: %+v", got)
 	}
 }
 

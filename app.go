@@ -29,6 +29,7 @@ type appConfig struct {
 	drainDelay      time.Duration
 	remotes         []func(*Registry)
 	migrator        func(ctx context.Context, sets []MigrationSet) error
+	skipMigrations  bool
 	bus             Subscriber
 	httpServerOpts  []func(*http.Server)
 }
@@ -98,6 +99,15 @@ func HTTPServer(fn func(*http.Server)) Option {
 // 启动时在依赖解析之后、Setup 之前应用全部已声明的 MigrationSet。
 func Migrator(fn func(ctx context.Context, sets []MigrationSet) error) Option {
 	return func(c *appConfig) { c.migrator = fn }
+}
+
+// SkipMigrations 声明迁移由进程外施加（典型是 K8s initContainer 或 Job 里
+// 跑 appkit migrate），本进程启动时不执行。
+//
+// 登记了迁移、既没注入 Migrator 也没声明 SkipMigrations，启动即报错：
+// 「没人跑迁移」不能靠沉默表达。
+func SkipMigrations() Option {
+	return func(c *appConfig) { c.skipMigrations = true }
 }
 
 // New 构造 App。modules 全集在此声明，实际启用集由 Target 决定。

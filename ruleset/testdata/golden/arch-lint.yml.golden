@@ -6,6 +6,11 @@ workdir: internal
 allow:
   # 第三方依赖的限制由 depguard 承担，这里只管内部拓扑。
   depOnAnyVendor: true
+  # deepScan 追依赖注入的实参流向，与组合根模式天然冲突：
+  # internal/module 把 postgres.NewStore(...) 注入 ledger.NewService(...)
+  # 会被判成「domain 依赖 postgres」——而这恰恰是 wiring 的定义。
+  # import 层的方向矩阵（下面的 deps）已经拦住真正的越界，不靠 deepScan。
+  deepScan: false
   # 允许尚未建出的组件目录（如暂无 inbox 的域）。
   ignoreNotFoundComponents: true
 components:

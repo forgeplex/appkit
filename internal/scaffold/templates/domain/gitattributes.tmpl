@@ -1,0 +1,13 @@
+# 迁移文件参与 sha256 校验（pgmigrate 的不可变性守卫）：换行必须跨平台一致，
+# 否则在 Windows 上 checkout 会把 LF 变 CRLF，触发误报的 MIGRATION_DRIFT。
+*.sql text eol=lf
+
+# 框架产物与工具生成物：GitHub PR 里默认折叠。
+# 折叠不是为了隐藏，而是让"有人手改了生成物"这件事在 diff 里更打眼。
+# 内容漂移由 appkit check 拦下，改这些文件不会让检查变绿。
+.golangci.yml            linguist-generated=true
+.go-arch-lint.yml        linguist-generated=true
+.gitattributes           linguist-generated=true
+.github/workflows/ci.yml linguist-generated=true
+internal/postgres/sqlc/** linguist-generated=true
+*.gen.go                 linguist-generated=true

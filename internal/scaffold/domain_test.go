@@ -4,6 +4,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/forgeplex/appkit/ruleset"
 )
 
 // domainWantFiles 是域仓库骨架的完整文件集（name=ledger），
@@ -11,6 +13,7 @@ import (
 var domainWantFiles = []string{
 	".appkit.yml",
 	".gitignore",
+	".gitattributes",
 	"Makefile",
 	"README.md",
 	"AGENTS.md",
@@ -60,10 +63,12 @@ func TestDomainScaffold(t *testing.T) {
 	t.Run("运行配置与最小模式", func(t *testing.T) {
 		mustContain(t, "config/dev.yaml", readFile(t, dir, "config/dev.yaml"),
 			"database:", `url: ""`, "LEDGERD_DATABASE__URL")
+		// 总线/迁移器/遥测的装配已收进 bootstrap（生成物里不再出现，
+		// 也就改不坏）；main 只声明最小模式装什么。
 		mustContain(t, "main.go", readFile(t, dir, "cmd/ledgerd/main.go"),
-			"appkit.ModuleFunc(", "最小模式", "outbox.NewDirectBus()", "appkit.Bus(bus)")
+			"appkit.ModuleFunc(", "最小模式", "Minimal: minimal")
 		mustContain(t, "module.go", readFile(t, dir, "internal/module/module.go"),
-			"outbox.NewRelay(", "appkit.StageWorker")
+			"outbox.NewRelay(", `reg.Worker("outbox-relay"`)
 	})
 
 	t.Run("lint 与 CI 配置已物化", func(t *testing.T) {
@@ -104,15 +109,39 @@ func TestDomainScaffold(t *testing.T) {
 			"package ledger", "go:embed db/migrations/*.sql", "func Module(")
 		mustContain(t, "Makefile", readFile(t, dir, "Makefile"),
 			"run github.com/forgeplex/appkit/cmd/appkit check",
-			"sqlc/cmd/sqlc@", "dev-db", "run-db")
+			"sqlc/cmd/sqlc@", "dev-db", "run-db",
+			// 迁移可单独施加：生产上这一步在 initContainer/Job 里跑。
+			"migrate: dev-db", "./cmd/ledgerd -migrate",
+			// lint 与 CI 必须钉同一版本（ruleset 是唯一事实源），
+			// 否则「本地绿、CI 红」，而且查起来最费劲。
+			"golangci-lint@"+ruleset.GolangciLintVersion,
+			"go-arch-lint@"+ruleset.ArchLintVersion)
 		mustContain(t, "main.go", readFile(t, dir, "cmd/ledgerd/main.go"),
-			"httpserver.Base(log)", "pgmigrate.Runner(pool)", "telemetry.Init", "config.Load")
+			"bootstrap.Main(bootstrap.Options{", `Service: "ledgerd"`,
+			"Modules: func(d bootstrap.Deps)", "ledger.Module(")
 		mustContain(t, "module.go", readFile(t, dir, "internal/module/module.go"),
 			`Schema = "ledger"`, "reg.Migrations(Schema", "reg.Health(", "appkit.Provide(")
 		mustContain(t, "sqlc.yaml", readFile(t, dir, "sqlc.yaml"),
 			"internal/postgres/sqlc", `schema: "db/migrations"`)
 		mustContain(t, "README.md", readFile(t, dir, "README.md"),
-			"appkit sync", "appkit dev")
+			"appkit sync", "appkit dev", "make migrate", "MIGRATION_DRIFT",
+			"make lint")
+		// 迁移参与 sha256 校验：换行必须跨平台一致，否则 Windows 上 checkout
+		// 就会触发误报的 MIGRATION_DRIFT。
+		mustContain(t, ".gitattributes", readFile(t, dir, ".gitattributes"),
+			"*.sql text eol=lf", "linguist-generated=true")
+		// AGENTS.md 是 AI 代理唯一会读的规程：新增的框架能力必须在这里出现，
+		// 否则代理会照旧手写 goroutine / ticker / 埋点。
+		mustContain(t, "AGENTS.md", readFile(t, dir, "AGENTS.md"),
+			"reg.Worker(", "job.Every(", "callctx.From(ctx)",
+			"MIGRATION_DRIFT", "make migrate", "apptest.Conform",
+			"make lint")
+		// 规程里不许出现假的强制力：moneyfloat 还没接进 CI，这里就必须
+		// 明说没有机检。写成"lint 会拦"会让代理以为有网兜着。
+		if agents := readFile(t, dir, "AGENTS.md"); strings.Contains(agents, "禁 float（lint 会拦）") ||
+			!strings.Contains(agents, "没有机检") {
+			t.Error("AGENTS.md 对金额规则的强制力描述与现状不符（moneyfloat 尚未接进 CI）")
+		}
 	})
 }
 
