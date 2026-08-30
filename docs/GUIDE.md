@@ -532,12 +532,22 @@ apptest.Conform(t,
     []apptest.Binding[echov1.Service]{
         {Name: "local", Service: echov1.WrapService(spy, 0), SeenMeta: seen},
         {Name: "remote", Service: echov1.NewClient(srv.URL), SeenMeta: seen},
-    }, cases)
+    },
+    []apptest.Case[echov1.Service]{
+        // 检查跑在这条上：它要额外发一次真实调用，得有 Idempotent 授权。
+        {Name: "回显", Do: echoCall("hi"), Want: ..., Idempotent: true},
+        ...
+    })
 ```
 
 两个绑定共用同一个 spy，比的就是"同一个实现、两种到达方式"。远程那条漏了
-`Transport`，request id 与租户到不了实现，这项当场红。注意它**不比 `Caller`**
-——出站 client 本就应该把它改写成自己的服务名，跨形态不一致恰恰是对的。
+`Transport`，request id 与租户到不了实现，这项当场红。
+
+两处容易踩的：它**不比 `Caller`**——出站 client 本就应该把它改写成自己的服务名，
+跨形态不一致恰恰是对的；它只跑在**声明了 `Idempotent` 且期望成功**的用例上——
+要额外发一次真实调用，非幂等的经不起白跑一遍（一条"创建订单"会被创建两次），
+`Idempotent` 正是你已经声明过的"重复执行是安全的"。一条这样的用例都没有时，
+`Conform` 会直接告诉你这项配置成了摆设。
 
 填不填仍是自愿的，但填一次就永久有效，且填的时机是写契约测试时，
 不是三个月后加第 N 个调用点时。

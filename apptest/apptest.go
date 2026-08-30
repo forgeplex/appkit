@@ -47,6 +47,9 @@ type Binding[S any] struct {
 	// 填了它，Conform 才验得到跨边界元数据传播——那是唯一一条从返回值里看不见
 	// 的边界语义，request id 与租户走的是请求头。不填则跳过该项。
 	//
+	// 检查跑在「期望成功且声明了 Idempotent」的用例上（它要额外发一次真实调用），
+	// 所以至少得有一条那样的用例，否则 Conform 会报「配了个摆设」。
+	//
 	// 接法是让所有绑定共用同一个记录用的实现，SeenMeta 都读同一处——这正是
 	// 要比对的「同一个实现，两种到达方式」：
 	//
@@ -79,6 +82,9 @@ type Case[S any] struct {
 
 	// Idempotent 声明这个调用重复执行应当得到相同结果。置 true 后
 	// Conform 会连调两次并比对——重试与 at-least-once 投递下这是前提。
+	//
+	// 它同时是 Conform 额外发真实调用的**唯一授权**：元数据传播检查也只在
+	// Idempotent 用例上做。留 false 的用例，Conform 保证只让它到达实现一次。
 	Idempotent bool
 }
 
@@ -90,7 +96,8 @@ type Case[S any] struct {
 //  4. ctx 已取消时调用直接失败（CodeUnavailable），不落到实现上；
 //  5. Idempotent 用例连调两次结果一致；
 //  6. 填了 Binding.SeenMeta 时：callctx 白名单真的穿过了每一种绑定——这条走的
-//     是请求头，从返回值里看不见，也是最安静的一种失效。
+//     是请求头，从返回值里看不见，也是最安静的一种失效。同样只在 Idempotent
+//     用例上做（要额外发一次真实调用）。
 //
 // 少于两个绑定会直接失败：只跑一个形态的不叫一致性测试。
 func Conform[S any](t *testing.T, bindings []Binding[S], cases []Case[S]) {
@@ -140,8 +147,9 @@ func Conform[S any](t *testing.T, bindings []Binding[S], cases []Case[S]) {
 	// 填了 SeenMeta 却一次没跑到，等于配了个摆设——而摆设最擅长的就是让人
 	// 以为有网兜着。这正是本仓库刚栽过的那类坑：写下来的检查从没被执行。
 	if checksMeta && !metaChecked {
-		t.Error("填了 SeenMeta，但元数据传播检查一次都没跑：它只在期望成功的用例上做，" +
-			"而 cases 里没有 WantCode 为空的用例。补一条成功用例，否则这项配置只是摆设")
+		t.Error("填了 SeenMeta，但元数据传播检查一次都没跑：它只在「期望成功且声明了 " +
+			"Idempotent」的用例上做（要额外发一次真实调用，非幂等的经不起白跑一遍）。" +
+			"补一条这样的用例，否则这项配置只是摆设")
 	}
 }
 
@@ -286,11 +294,16 @@ var probeMeta = callctx.Meta{
 
 // checkMetaPropagation 断言 callctx 白名单真的穿过了每一种绑定，返回是否跑了。
 //
-// 只在期望成功的用例上做：期望失败的用例可能在到达实现之前就被挡回（DTO 校验、
-// 边界守卫都在实现之外），SeenMeta 什么也没记到，比出来是假阳性。
+// 两个门控条件各有各的道理：
+//   - 期望成功：期望失败的用例可能在到达实现之前就被挡回（DTO 校验、边界守卫
+//     都在实现之外），SeenMeta 什么也没记到，比出来是假阳性；
+//   - 声明了 Idempotent：这项检查要额外发一次**真实**调用，非幂等的用例经不起
+//     白跑一遍——一条「创建订单」会被创建两次。Idempotent 正是使用者已经声明过
+//     的「这个调用重复执行是安全的」，checkIdempotent 用的也是同一个授权。
+//     测试框架擅自替人多跑一次有副作用的调用，比不做这项检查危险得多。
 func checkMetaPropagation[S any](t *testing.T, bindings []Binding[S], c Case[S]) bool {
 	t.Helper()
-	if c.WantCode != "" || bindings[0].SeenMeta == nil {
+	if c.WantCode != "" || !c.Idempotent || bindings[0].SeenMeta == nil {
 		return false
 	}
 	t.Run("跨边界元数据传播", func(t *testing.T) {

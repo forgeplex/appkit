@@ -55,15 +55,19 @@ func (w wrappedEcho) Echo(ctx context.Context, req echoReq) (echoReply, error) {
 
 // metaSpy 包住域内实现，记下每次调用时**服务端**看到的白名单。两个绑定共用
 // 同一个 spy，SeenMeta 就都读同一处——这正是要比对的「同一个实现，两种到达方式」。
+// 它同时数调用次数：Conform 额外发的真实调用有没有超出授权，只有从实现这一侧
+// 才数得准（被边界守卫挡回的那些压根到不了这里）。
 type metaSpy struct {
 	inner echoService
 	mu    sync.Mutex
 	last  callctx.Meta
+	calls int
 }
 
 func (s *metaSpy) Echo(ctx context.Context, req echoReq) (echoReply, error) {
 	s.mu.Lock()
 	s.last = callctx.From(ctx)
+	s.calls++
 	s.mu.Unlock()
 	return s.inner.Echo(ctx, req)
 }
@@ -72,6 +76,13 @@ func (s *metaSpy) Last() callctx.Meta {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.last
+}
+
+// Calls 返回真正到达实现的调用次数。
+func (s *metaSpy) Calls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
 }
 
 // echoHandler 是提供方进程的 HTTP 出口：错误经 problem+json 出去。
@@ -196,6 +207,54 @@ func TestSeenMetaCatchesUninstrumentedClient(t *testing.T) {
 	if msg := metaDiff("remote", probeMeta, spy.Last()); msg == "" {
 		t.Error("裸 client 没带白名单，metaDiff 却认为一切正常——这项检查是空的")
 	}
+}
+
+// TestMetaPropagationNeedsIdempotentGrant 守住「Conform 不替你多跑有副作用的调用」。
+//
+// 元数据传播检查要额外发一次真实请求。首版对所有期望成功的用例都发，于是一条
+// 「创建订单」用例填上 SeenMeta 之后就会真的创建两单——测试框架擅自制造副作用，
+// 比不做这项检查危险得多。现在它要 Case.Idempotent 授权，而 Idempotent 的语义
+// 恰好就是「重复执行是安全的」。
+//
+// 直接调 checkMetaPropagation 而不走 Conform：要数的是**额外**调用，从实现那侧
+// 数才准，而且不必去猜 Conform 其余各项各自发了几次。
+func TestMetaPropagationNeedsIdempotentGrant(t *testing.T) {
+	t.Parallel()
+	spy := &metaSpy{inner: localEcho{}}
+	bindings := []Binding[echoService]{
+		{Name: "local", Service: wrappedEcho{inner: spy}, SeenMeta: spy.Last},
+		{Name: "remote", Service: wrappedEcho{inner: spy}, SeenMeta: spy.Last},
+	}
+
+	t.Run("非幂等用例不跑，且一次额外调用都不发", func(t *testing.T) {
+		before := spy.Calls()
+		if ran := checkMetaPropagation(t, bindings, Case[echoService]{
+			Name: "创建订单", Do: echoCall("hi")}); ran {
+			t.Error("没声明 Idempotent 却跑了传播检查——那会替使用者多创建一单")
+		}
+		if n := spy.Calls() - before; n != 0 {
+			t.Errorf("非幂等用例上多发了 %d 次真实调用，want 0", n)
+		}
+	})
+
+	t.Run("幂等用例才跑，每个绑定各一次", func(t *testing.T) {
+		before := spy.Calls()
+		if ran := checkMetaPropagation(t, bindings, Case[echoService]{
+			Name: "回显", Do: echoCall("hi"), Idempotent: true}); !ran {
+			t.Fatal("声明了 Idempotent 的成功用例必须跑传播检查，否则这项配置形同虚设")
+		}
+		if n, want := spy.Calls()-before, len(bindings); n != want {
+			t.Errorf("发了 %d 次真实调用，want %d（每个绑定各一次）", n, want)
+		}
+	})
+
+	t.Run("期望失败的用例不跑", func(t *testing.T) {
+		// 失败可能发生在到达实现之前，spy 什么也没记到，比出来是假阳性。
+		if ran := checkMetaPropagation(t, bindings, Case[echoService]{
+			Name: "空白文本", Do: echoCall("  "), WantCode: codeEmpty, Idempotent: true}); ran {
+			t.Error("期望失败的用例不该跑传播检查")
+		}
+	})
 }
 
 // —— 以下是"这套断言真的会红"的证明。断言库最危险的失效方式是永远绿，
