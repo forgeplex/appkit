@@ -45,8 +45,9 @@ appkit doctor
 ```
 
 它会检查 Go 版本、GOPRIVATE 覆盖面、git 凭据、docker，以及——在仓库目录里——
-是否处于 go.work 工作区（appkit 未打 tag 前，域仓库编译**必须**在工作区内，
-否则 go 会去远程解析 appkit 版本）。任何 ✗ 都附带可直接复制的修复命令。
+是否处于 go.work 工作区（go.mod 尚未 require appkit 发版版本、或要联调本地
+未发布改动时，编译**必须**在工作区内，否则 go 会去远程解析 appkit 版本）。
+任何 ✗ 都附带可直接复制的修复命令。
 
 **故障对照表：**
 
@@ -56,12 +57,14 @@ appkit doctor
 | `fatal: could not read Username for 'https://github.com'` | ② git SSH 重写 / 令牌 |
 | `go: finding module for package github.com/forgeplex/appkit/...`（本地开发时） | 不在 go.work 工作区：仓库目录跑 `appkit dev` |
 
-构建 CLI（appkit 发版打 tag 后可改用 `go install github.com/forgeplex/appkit/cmd/appkit@latest`）：
+安装 CLI（appkit 自 v0.1.0 起按 SemVer 发版）：
 
 ```sh
-git clone git@github.com:forgeplex/appkit.git
-cd appkit && go build -o ~/bin/appkit ./cmd/appkit
+go install github.com/forgeplex/appkit/cmd/appkit@latest
 ```
+
+要用未发布的最新改动时才需要源码构建：`git clone` 后
+`go build -o ~/bin/appkit ./cmd/appkit`。
 
 本地数据库不用提前准备：域仓库骨架自带 `make dev-db`（一次性 docker Postgres，
 端口 54329）与 `make run-db`。只有跑组合仓库或自建库时才需要自己起一个
@@ -409,8 +412,9 @@ go vet -vettool=$(which appkit-lint) -moneyfloat.scope 'internal/(identity|authn
 
 **Q：`appkit dev` 和发版是什么关系？**
 本地联调用 go.work（不提交）；跨仓库正式依赖靠 tag：改了合约仓库 → 打 tag →
-域仓库升 require → 域仓库打 tag → 组合仓库升 require。appkit 未发 v0.1.0 前，
-所有仓库都靠 `appkit dev` 联调。
+域仓库升 require → 域仓库打 tag → 组合仓库升 require。appkit 自 v0.1.0 起
+按 SemVer 发版（CI 有 apidiff 门禁保证向后兼容），域仓库直接 require 版本即可；
+`appkit dev` 只在联调本地未发布改动时需要。
 
 **Q：模块还需要哪些生命周期钩子？**
 一般不需要。连接池、迁移、HTTP、relay、优雅关停都由框架或骨架接好；

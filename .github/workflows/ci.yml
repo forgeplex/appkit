@@ -26,6 +26,8 @@ jobs:
       TEST_DATABASE_URL: postgres://postgres:appkit@127.0.0.1:55499/appkit_test?sslmode=disable
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # apidiff 门禁需要完整历史与 tag
 
       - uses: actions/setup-go@v5
         with:
@@ -59,3 +61,23 @@ jobs:
           cd lint
           go build ./...
           go test ./...
+
+      # appkit 经 MVS 依赖钻石被全部域仓库共享，公开 API 近乎终身兼容
+      # （DESIGN §9）。基线 = 最新发版 tag，破坏性变更直接红灯。
+      - name: API 向后兼容门禁（apidiff vs 最新 tag）
+        run: |
+          base=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -z "$base" ]; then
+            echo "无发版 tag，跳过 apidiff"
+            exit 0
+          fi
+          git worktree add /tmp/apidiff-base "$base"
+          (cd /tmp/apidiff-base && go run golang.org/x/exp/cmd/apidiff@latest -m -w /tmp/base.export github.com/forgeplex/appkit)
+          go run golang.org/x/exp/cmd/apidiff@latest -m -w /tmp/head.export github.com/forgeplex/appkit
+          out=$(go run golang.org/x/exp/cmd/apidiff@latest -m -incompatible /tmp/base.export /tmp/head.export 2>/dev/null)
+          if [ -n "$out" ]; then
+            echo "相对 $base 存在破坏性 API 变更（appkit 必须向后兼容，见 docs/DESIGN.md §9）:"
+            echo "$out"
+            exit 1
+          fi
+          echo "相对 $base 无破坏性变更"
