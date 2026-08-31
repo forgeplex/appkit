@@ -28,10 +28,12 @@ func TestNew(t *testing.T) {
 	}{
 		{"合法大写三位", "USD", ""},
 		{"合法人民币", "CNY", ""},
+		{"资产代码四位", "USDT", ""},
+		{"资产代码六位（上限）", "ABCDEF", ""},
 		{"小写", "usd", money.CodeInvalidCurrency},
 		{"混合大小写", "Usd", money.CodeInvalidCurrency},
 		{"两位", "US", money.CodeInvalidCurrency},
-		{"四位", "USDT", money.CodeInvalidCurrency},
+		{"七位（超上限）", "ABCDEFG", money.CodeInvalidCurrency},
 		{"空串", "", money.CodeInvalidCurrency},
 		{"含数字", "US1", money.CodeInvalidCurrency},
 		{"含非 ASCII", "ÜSD", money.CodeInvalidCurrency},

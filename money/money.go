@@ -1,9 +1,14 @@
-// Package money 提供不可变的金额值类型：decimal 数额 + ISO 4217 币种。
+// Package money 提供不可变的金额值类型：decimal 数额 + 币种代码。
 //
 // 全系统金额禁用 float（appkit-lint 强制），金额只以 Money 或 decimal.Decimal
 // 流转；JSON 里 amount 一律是字符串。数额保留构造时的标度（scale）：
 // Parse("10.50") 的字符串形态始终是 "10.50" 而非 "10.5"。
-// 数据库 NUMERIC 映射见子包 pgxmoney。
+//
+// Money 是领域层值对象，不是持久化类型：单个 NUMERIC 列还原不了币种，
+// 落库时金额（decimal.Decimal——sqlc 经脚手架全局 override 映射 NUMERIC，
+// pgx 原生编解码，无需注册 codec）与币种分列存储，读出后再由领域层组装。
+// 币种白名单与各资产标度（USD=2、USDT=6…）属业务知识，放资产注册表之类
+// 的表，不进本包。
 package money
 
 import (
@@ -36,7 +41,7 @@ const (
 
 var (
 	errInvalidCurrency = apperr.New(CodeInvalidCurrency, http.StatusUnprocessableEntity,
-		"currency 必须是 3 位大写字母的 ISO 4217 代码")
+		"currency 必须是 3-6 位大写字母（ISO 4217 或资产代码，如 USDT）")
 	errInvalidAmount = apperr.New(CodeInvalidAmount, http.StatusUnprocessableEntity,
 		"amount 必须是十进制数字字符串")
 	errCurrencyMismatch = apperr.New(CodeCurrencyMismatch, http.StatusUnprocessableEntity,
@@ -50,8 +55,9 @@ type Money struct {
 	currency string
 }
 
-// New 构造 Money。currency 只校验格式（3 位大写字母），不校验是否在
-// ISO 4217 现行表内——币种白名单属业务合约层。
+// New 构造 Money。currency 只校验格式（3-6 位大写字母），不校验代码
+// 是否真实存在——ISO 4217 恰好 3 位，资产代码更长（USDT/USDC/WBTC），
+// 币种白名单属业务合约层（资产注册表）。
 func New(amount decimal.Decimal, currency string) (Money, error) {
 	if !validCurrency(currency) {
 		return Money{}, errInvalidCurrency.WithDetail("currency", currency)
@@ -100,8 +106,10 @@ func Zero(currency string) Money {
 	return Money{currency: currency}
 }
 
+// validCurrency 接受 3-6 位大写 ASCII 字母：ISO 4217 是 3 位，多资产
+// 场景下还要容得下 USDT/USDC/WBTC 这类资产代码。只查格式。
 func validCurrency(c string) bool {
-	if len(c) != 3 {
+	if len(c) < 3 || len(c) > 6 {
 		return false
 	}
 	for i := 0; i < len(c); i++ {

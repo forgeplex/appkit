@@ -12,6 +12,17 @@ sql:
         sql_package: "pgx/v5"
         emit_interface: true
         overrides:
-          # 金额列一律 NUMERIC ↔ money.Money：全系统禁 float 金额（DESIGN §2）。
+          # 金额列一律 NUMERIC ↔ decimal.Decimal（全系统禁 float，DESIGN §2）。
+          #   - 不用 money.Money：它不实现 pgx/database-sql 编解码接口，且单个
+          #     NUMERIC 列还原不了币种——生成代码一碰金额列就在运行期
+          #     "cannot scan numeric (OID 1700)"，编译期无感。decimal.Decimal
+          #     经 driver.Valuer/sql.Scanner 由 pgx 原生处理，无需注册 codec
+          #     （pgxmoney 已废弃）。真库机检见 internal/scaffold 的
+          #     TestDomainNumericOverrideRoundTrips。
+          #   - 全局而非列级：数组参数（@amounts::numeric[]）与算术结果列
+          #     （posted + sqlc.arg(x)）没有列名可匹配，列级 override 会漏。
+          #   币种与标度（USD=2、USDT=6…）属业务知识，落资产注册表之类的表；
+          #     JSON/合约边界金额一律字符串。首个金额列生成后 go mod tidy
+          #     会带上 shopspring/decimal。
           - db_type: "pg_catalog.numeric"
-            go_type: "github.com/forgeplex/appkit/money.Money"
+            go_type: "github.com/shopspring/decimal.Decimal"

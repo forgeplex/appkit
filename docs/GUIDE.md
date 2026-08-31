@@ -214,7 +214,9 @@ idemMW := idem.Middleware(idem.NewStore(m.opts.Pool, Schema), m.opts.Log)
 reg.Mount("POST /identity/users", idemMW(usersHandler))
 ```
 
-敏感变更再加 `audit.Recorder`（与业务写同事务）；金额一律 `money.Money`。
+敏感变更再加 `audit.Recorder`（与业务写同事务）；金额存储/运算用
+`decimal.Decimal`（sqlc 脚手架已全局 override NUMERIC），需要"币种+金额"
+绑定时用领域层的 `money.Money`（不落库，币种另列存），JSON 边界一律字符串。
 
 ### 4.1 看清整个域的 schema（`make schema`）
 
@@ -689,7 +691,7 @@ go vet -vettool=$(which appkit-lint) -moneyfloat.scope 'internal/(identity|authn
 | 发领域事件 | 用例事务内 `pub.Publish` | 事务外发（守卫拒绝）；直连 broker（业务包 import 不到） |
 | 处理外域事件 | `reg.Consumer` + `outbox.Inbox` 包裹 | 裸 handler（重复投递=重复执行） |
 | 写 SQL | `db/queries/*.sql` + sqlc | handler/service 里拼 SQL（depguard 拦 pgx import） |
-| 表示金额 | `money.Money` | float64（appkit-lint 能报，但它还没进 CI——这条目前靠自觉） |
+| 表示金额 | `decimal.Decimal`（存储/运算，sqlc 全局 override NUMERIC）+ `money.Money`（需币种绑定时，领域层）+ JSON 边界字符串 | float64（appkit-lint 能报，但它还没进 CI——这条目前靠自觉） |
 | 返回错误 | 合约错误码（`apperr.Is(err, identityv1.CodeXxx)` 单体/微服务行为一致） | 字符串比对、裸 errors.New 跨层 |
 | 跑后台任务 | `reg.Worker(name, run)` | 自己 `go func()`（关停不等它、崩了没人管） |
 | 跑周期任务 | `reg.Worker(name, job.Every(pool, ...))` | 裸 `time.Ticker`（多副本每轮重复执行） |

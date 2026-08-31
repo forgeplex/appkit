@@ -21,7 +21,8 @@ import (
 // PoolOption 配置连接池。
 type PoolOption func(*pgxpool.Config)
 
-// WithAfterConnect 注册连接建立后的回调（典型用途：注册 money 的 NUMERIC codec）。
+// WithAfterConnect 注册连接建立后的回调（典型用途：连接级初始化，如经
+// otelpgx 装追踪、SET 本连接生效的 GUC）。
 // 多次调用按注册顺序依次执行，任一回调出错该连接即建立失败。
 func WithAfterConnect(fn func(context.Context, *pgx.Conn) error) PoolOption {
 	return func(c *pgxpool.Config) {

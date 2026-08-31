@@ -6,6 +6,11 @@
 // pgtype.NumericValuer / NumericScanner，经 TryWrap*PlanFuncs 把
 // decimal.Decimal 转到 wrapper，编解码本身仍走内建 codec（文本与二进制
 // 两种线格式都覆盖），不引入额外依赖。
+//
+// Deprecated: 本包没有存在必要。shopspring/decimal 自带 driver.Valuer 与
+// sql.Scanner，pgx v5 对未注册的类型自动回落到这两个接口——实测有无本包，
+// decimal.Decimal 读写 NUMERIC 的结果完全一致（含数组、NULL、CopyFrom、
+// Batch、简单协议、高精度）。新代码直接用 decimal.Decimal 即可，不要接入。
 package pgxmoney
 
 import (
@@ -20,6 +25,8 @@ import (
 // Register 把 NUMERIC ↔ decimal.Decimal 编解码注册到 conn 的 type map。
 // type map 归单个连接所有，因此要在建连钩子里对每条连接调用
 // （pgxpool.Config.AfterConnect）。
+//
+// Deprecated: 无需注册，见包文档。
 func Register(conn *pgx.Conn) {
 	registerMap(conn.TypeMap())
 }

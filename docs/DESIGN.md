@@ -108,8 +108,9 @@ appkit/                          # module github.com/forgeplex/appkit
 │                                #   RFC 9457 (problem+json) 映射；
 │                                #   ★ 错误身份 = 错误码（apperr.Is(err, code)），
 │                                #   保证单体/微服务两种模式下错误判定行为一致
-├── money/                       # Money(decimal + currency)；pgx NUMERIC codec；
-│                                #   sqlc override 模板；全系统禁 float 金额
+├── money/                       # Money(decimal + currency) 领域值对象，不落库；
+│                                #   NUMERIC 持久化走 decimal.Decimal（pgx 原生
+│                                #   编解码，pgxmoney 已废弃）；全系统禁 float 金额
 ├── idem/                        # 幂等：Stripe 式 claim 先行（独立事务 INSERT ON CONFLICT
 │                                #   占位 in-progress，防双重执行竞态）+ 响应缓存 +
 │                                #   同 key 异 payload 422 + recovery point
@@ -359,6 +360,7 @@ app.Run(ctx)
 | 指标基数不失控 | 标签值只能是代码常量或 `internal/metrics` 收敛过的枚举；SQL 动词过白名单，未识别塌缩为 `other` | ▲ API 设计级：业务传不进框架指标，但自建 meter 仍可自伤 |
 | 已死的 ctx 不落到实现上 | `contract.Call` 在进 fn 前查 `ctx.Err()`——跨网络时这种调用本来就发不出去 | ★ 运行时级：两种形态由构造一致 |
 | 两种部署形态语义一致 | `apptest.Conform` 让同一批用例跑过每个绑定，比对错误码/返回值/边界语义 | ▲ 测试级：写了才有；但不写就只剩口头承诺 |
+| 脚手架的 sqlc NUMERIC override 真能过 pgx | override 只指向 decimal.Decimal（pgx 经 Valuer/Scanner 原生编解码）；`internal/scaffold` 的 `TestDomainNumericOverrideRoundTrips` 把渲染后声明的类型真库读写一遍（27 位小数 + NULL）。编译测试对"扫描不了 OID 1700"结构性失明——money.Money 那次教训就是编译全绿、运行即炸 | ▲ 测试级：需 `TEST_DATABASE_URL`（`make test-db`），无 DB 时 skip |
 | 出站 HTTP 也带上 `callctx` 白名单 | `callctx.Transport` 装进 `http.Client` 一次即可（不必逐调用点写 `Inject`）；`apptest.Conform` 填了 `Binding.SeenMeta` 就当场验请求头 | ▲ API 设计级 + 测试级：漏点从「每个调用点」收敛到「一处装配」，且验得到。但两者都得自己接——不填 `SeenMeta` 就仍是口头承诺 |
 
 逃生舱（防止约束被政治性推翻）：带理由的 `//nolint`（nolintlint 强制）、

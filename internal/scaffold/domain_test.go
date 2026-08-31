@@ -131,8 +131,18 @@ func TestDomainScaffold(t *testing.T) {
 			"Modules: func(d bootstrap.Deps)", "ledger.Module(")
 		mustContain(t, "module.go", readFile(t, dir, "internal/module/module.go"),
 			`Schema = "ledger"`, "reg.Migrations(Schema", "reg.Health(", "appkit.Provide(")
-		mustContain(t, "sqlc.yaml", readFile(t, dir, "sqlc.yaml"),
-			"internal/postgres/sqlc", `schema: "db/migrations"`)
+		sqlcYml := readFile(t, dir, "sqlc.yaml")
+		mustContain(t, "sqlc.yaml", sqlcYml,
+			"internal/postgres/sqlc", `schema: "db/migrations"`,
+			// 金额 override 只能指向 pgx 编得进/扫得出的类型。money.Money
+			// 编译期无感、运行期扫描失败——那是真库用例的职责，这里先锁住
+			// 不得退回（TestDomainNumericOverrideRoundTrips 负责正向验证）。
+			`go_type: "github.com/shopspring/decimal.Decimal"`,
+			"不用 money.Money")
+		// 注释里可以解释为什么不用它，但 go_type 不许指回去。
+		if strings.Contains(sqlcYml, `go_type: "github.com/forgeplex/appkit/money.Money"`) {
+			t.Error("sqlc.yaml 不得把 NUMERIC override 指向 money.Money：运行期无法扫描（真库机检见 domain_db_test.go）")
+		}
 		mustContain(t, "README.md", readFile(t, dir, "README.md"),
 			"appkit sync", "appkit dev", "make migrate", "MIGRATION_DRIFT",
 			"make schema", "db/SCHEMA.md",
