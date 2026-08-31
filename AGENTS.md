@@ -59,9 +59,9 @@ go run ./cmd/appkit new domain t -dir /tmp/t   # 改脚手架后：生成物可�
 ```sh
 git tag -a vX.Y.Z -F /tmp/msg            # 1. tag：正文即事实源
 make changelog && git add CHANGELOG.md   # 2. 重生成镜像（禁手改）并提交
+git push origin main vX.Y.Z              # 3. 先推——gh 的 --verify-tag 只认远端 tag
 gh release create vX.Y.Z --verify-tag \
-  --title vX.Y.Z --notes-file /tmp/msg   # 3. Release 正文 = tag message
-git push origin main vX.Y.Z
+  --title vX.Y.Z --notes-file /tmp/msg   # 4. Release 正文 = tag message
 ```
 
 版本号走 SemVer，但 0.x 期间号是节拍不是承诺：**minor 留给改默认行为/
