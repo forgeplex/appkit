@@ -77,6 +77,10 @@ func TestMigrationSQL(t *testing.T) {
 				"WHERE published_at IS NULL AND failed_at IS NULL",
 				// inbox 去重键是 (consumer, event_id)。
 				"consumer", "PRIMARY KEY (consumer, event_id)",
+				// 框架自己也守「建表就写说明」这条：机检见
+				// internal/schemadoc 的 TestFrameworkTablesAllDocumented。
+				`COMMENT ON TABLE "ledger".outbox IS '`,
+				`COMMENT ON TABLE "ledger".inbox IS '`,
 			},
 		},
 		{

@@ -57,6 +57,13 @@ func TestDomainScaffold(t *testing.T) {
 			`CREATE TABLE IF NOT EXISTS "ledger".inbox`,
 			`CREATE TABLE IF NOT EXISTS "ledger"."idempotency_keys"`,
 			`CREATE TABLE IF NOT EXISTS "ledger".audit_log`,
+			// 框架建的表也得有说明——否则 db/SCHEMA.md 里一半的表在教域作者
+			// 补 COMMENT，另一半是框架自己没补的。机检见 internal/schemadoc
+			// 的 TestFrameworkTablesAllDocumented。
+			`COMMENT ON TABLE "ledger".outbox IS '`,
+			`COMMENT ON TABLE "ledger".inbox IS '`,
+			`COMMENT ON TABLE "ledger"."idempotency_keys" IS '`,
+			`COMMENT ON TABLE "ledger".audit_log IS '`,
 		)
 	})
 
@@ -112,6 +119,9 @@ func TestDomainScaffold(t *testing.T) {
 			"sqlc/cmd/sqlc@", "dev-db", "run-db",
 			// 迁移可单独施加：生产上这一步在 initContainer/Job 里跑。
 			"migrate: dev-db", "./cmd/ledgerd -migrate",
+			// schema 文档要能一条命令重新生成，否则「产出禁手改」就只是句空话：
+			// 没人愿意为了改一行注释去手搓 DSN。
+			"schema: dev-db", "cmd/appkit schema -dsn '$(DEV_DB_URL)'",
 			// lint 与 CI 必须钉同一版本（ruleset 是唯一事实源），
 			// 否则「本地绿、CI 红」，而且查起来最费劲。
 			"golangci-lint@"+ruleset.GolangciLintVersion,
@@ -125,11 +135,15 @@ func TestDomainScaffold(t *testing.T) {
 			"internal/postgres/sqlc", `schema: "db/migrations"`)
 		mustContain(t, "README.md", readFile(t, dir, "README.md"),
 			"appkit sync", "appkit dev", "make migrate", "MIGRATION_DRIFT",
+			"make schema", "db/SCHEMA.md",
 			"make lint")
 		// 迁移参与 sha256 校验：换行必须跨平台一致，否则 Windows 上 checkout
 		// 就会触发误报的 MIGRATION_DRIFT。
 		mustContain(t, ".gitattributes", readFile(t, dir, ".gitattributes"),
-			"*.sql text eol=lf", "linguist-generated=true")
+			"*.sql text eol=lf", "linguist-generated=true",
+			// schema 产出是生成物：PR 里折叠，让「有人手改了它」更打眼。
+			"db/SCHEMA.md             linguist-generated=true",
+			"db/schema/**             linguist-generated=true")
 		// AGENTS.md 是 AI 代理唯一会读的规程：新增的框架能力必须在这里出现，
 		// 否则代理会照旧手写 goroutine / ticker / 埋点。
 		mustContain(t, "AGENTS.md", readFile(t, dir, "AGENTS.md"),
@@ -140,6 +154,9 @@ func TestDomainScaffold(t *testing.T) {
 			// Conform 的元数据传播检查是自愿项：规程不提，就没人填，
 			// 那它和不存在没区别。
 			"SeenMeta",
+			// 迁移是追加日志，一张表的真实形状散在 N 个文件里。规程不指向
+			// db/schema/，代理就会继续在脑子里重放整条迁移历史（并且重放错）。
+			"db/schema/", "make schema", "COMMENT ON TABLE",
 			"MIGRATION_DRIFT", "make migrate", "apptest.Conform",
 			"make lint")
 		// 规程里不许出现假的强制力：moneyfloat 还没接进 CI，这里就必须

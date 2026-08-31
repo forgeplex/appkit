@@ -111,6 +111,12 @@ func ensureSchema(ctx context.Context, pool *pgxpool.Pool, schema string) error 
 			" ADD COLUMN IF NOT EXISTS checksum text"); err != nil {
 			return fmt.Errorf("补齐迁移历史表 checksum 列: %w", err)
 		}
+		// 历史表是本框架唯一不经迁移文件建出来的表，说明也就只能落在这里。
+		// 语句幂等，每次启动重设一遍等价于不变。
+		if _, err := ptx.Exec(ctx, "COMMENT ON TABLE "+historyTable(schema)+
+			" IS '迁移历史：version + 内容 sha256，启动期逐个比对，不符即拒绝启动。'"); err != nil {
+			return fmt.Errorf("写迁移历史表说明: %w", err)
+		}
 		return nil
 	})
 }

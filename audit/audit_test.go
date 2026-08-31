@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -28,6 +29,15 @@ func TestMigrationSQLRejectsBadSchema(t *testing.T) {
 			}()
 			audit.MigrationSQL(s)
 		}()
+	}
+}
+
+// 框架自己也守「建表就写说明」这条：机检见 internal/schemadoc 的
+// TestFrameworkTablesAllDocumented，这里只留一条不需要 DB 的哨兵。
+func TestMigrationSQLDocumentsTable(t *testing.T) {
+	sql := audit.MigrationSQL("ledger")
+	if want := `COMMENT ON TABLE "ledger".audit_log IS '`; !strings.Contains(sql, want) {
+		t.Errorf("缺少 %q:\n%s", want, sql)
 	}
 }
 

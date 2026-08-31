@@ -10,6 +10,7 @@ appkit dev     # 生成 go.work，联调本地 appkit / 各域仓库（go.work �
 make run       # ★ 零依赖试跑：最小模式（仅 /healthz /readyz /ping，数据面未启用）
 make run-db    # 完整模式：自动起一次性开发 Postgres（docker）并注入 database.url
 make migrate   # 只应用迁移然后退出（生产上这一步跑在 initContainer/Job 里）
+make schema    # 从迁移重新生成 db/SCHEMA.md 与 db/schema/（表结构总览 + ER 图）
 make check     # 架构检查（依赖方向 + SQL 跨 schema + 规则集漂移）
 make lint      # golangci-lint + go-arch-lint（钉版本经 go run，无需预装）
 make test
@@ -23,6 +24,8 @@ CI 都会校验未漂移（改松规则不会让检查变绿）。CI 先验漂�
 
 **已应用的迁移不可再改**：历史表存着每个文件的 sha256，改动已应用的文件会让服务
 以 `MIGRATION_DRIFT` 拒绝启动（错误信息里带修复命令）。改结构一律新增 `000N_*.sql`。
+迁移因此是一条追加日志，读不出「这张表现在长什么样」——`make schema` 把它重放一遍，
+产出 `db/SCHEMA.md`（表清单 + ER 图）与 `db/schema/<表>.{sql,md}`，提交进仓库。
 
 ## 结构
 
@@ -35,6 +38,8 @@ internal/http/           transport：实现合约生成的 server 接口，只�
 internal/inbox/          外域事件消费者：inbox 去重后调业务包
 internal/module/         装配层：Provide / Mount / Migrations / Health
 db/migrations/           只允许操作 "{{.Name}}" schema；0001 为 appkit 基础设施表
+db/SCHEMA.md             ★ 看表结构从这进：表清单 + ER 图（make schema 生成，禁手改）
+db/schema/               每表一份 DDL 与详情页；框架表隔在 _appkit/
 db/queries/              sqlc 查询源；make gen 生成 internal/postgres/sqlc
 ```
 

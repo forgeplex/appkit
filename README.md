@@ -40,6 +40,7 @@ go run github.com/forgeplex/appkit/cmd/appkit help
 | `appkit dev` | go.work 多仓本地联调（幂等） |
 | `appkit sync [--check]` | 物化/校验 lint 配置与 CI 引用（漂移即 CI 失败） |
 | `appkit check` | 架构检查：域间依赖铁律、import 方向矩阵、SQL 跨 schema、迁移编号 |
+| `appkit schema [-check]` | 从 `db/migrations` 派生 `db/SCHEMA.md` + `db/schema/`（表清单、ER 图、每表 DDL），要连 DB |
 | `appkit gen events\|errors\|wrap` | 从 yaml 生成事件/错误码；从接口生成 contract.Call 拦截 wrapper |
 
 ## 快速开始

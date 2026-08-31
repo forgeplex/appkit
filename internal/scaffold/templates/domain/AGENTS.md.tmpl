@@ -15,6 +15,7 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 | `internal/inbox/` | 外域事件消费者 | 偶尔 |
 | `internal/module/module.go` | 唯一 wiring 落点（Provide/Mount/Migrations/Health） | 每加路由/用例改一行 |
 | `db/migrations/` | 迁移；`0001_appkit_base.sql` 是框架基础表 | 新增文件，**不改旧文件** |
+| `db/SCHEMA.md`、`db/schema/` | 表结构总览 + ER 图 + 每表详情，从迁移派生 | **禁止手改**（make schema 重新生成） |
 | `db/queries/` | SQL 唯一存在地（sqlc 源） | 是 |
 | `{{.Name}}.go`、`cmd/` | 导出面与部署入口 | 几乎不 |
 | `.golangci.yml`、`.go-arch-lint.yml`、`.github/` | appkit sync 物化的规则 | **禁止手改**（appkit sync 刷新） |
@@ -33,6 +34,12 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 1. **迁移** `db/migrations/000N_users.sql`：四位序号严格递增；只操作
    `{{.Name}}.` schema；已应用的迁移文件**是**不可变的——历史表存着内容 sha256，
    改动会让服务以 `MIGRATION_DRIFT` 拒绝启动，改表结构永远新开文件。
+   动手前先读 `db/schema/<表>.sql` 看这张表**现在**长什么样——迁移是追加日志，
+   一张表的真实形状散在 N 个文件里，别在脑子里重放整条历史。
+   建表时在同一个迁移里写 `COMMENT ON TABLE {{.Name}}.users IS '…'`——表的用途
+   属于 schema 设计，写在迁移里才会跟着表一起演进，写在外部文档里必腐；缺了会在
+   `db/SCHEMA.md` 里被标 ⚠（不阻断 CI，但 review 时看得见）。
+   写完跑 `make schema` 重新生成 schema 文档，产出一并提交。
 2. **SQL** `db/queries/xxx.sql`：sqlc 注释语法（`-- name: InsertUser :exec`），
    表名带 `{{.Name}}.` 前缀。然后 `make gen`。
 3. **业务包** `internal/{{.Name}}/`：
@@ -91,6 +98,7 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 
 ```sh
 make gen        # sqlc 生成（改了 db/queries 后必跑）
+make schema     # 重新生成 db/SCHEMA.md 与 db/schema/（改了迁移后必跑，需 docker）
 make run        # 本地起服（config/dev.yaml；database.url 留空 = 无 DB 最小模式）
 make dev-db     # 一次性本地 Postgres（与 dev.yaml 匹配）
 make migrate    # 只应用迁移然后退出（生产上跑在 initContainer/Job 里）
@@ -119,8 +127,10 @@ spy），把跨边界元数据也纳进来——那条走请求头，返回值�
 
 ## 完成的定义
 
-`make gen`（如改过 SQL）之后，**`make check && make lint && make test` 全绿**才算完成
+`make gen`（如改过 SQL）与 `make schema`（如改过迁移）之后，
+**`make check && make lint && make test` 全绿**才算完成
 （这三条就是 CI 跑的那几条，本地绿基本等于 CI 绿）。
+schema 文档漂移由 CI 单独一步 `appkit schema -check` 拦，忘了重新生成会红。
 不要用 `//nolint` 绕过检查（必须写理由且 review 会拒）；不要修改生成物、
 已应用的迁移、`.golangci.yml` 等物化配置来让检查通过——那是在破坏约束本身，
 正确做法永远是让代码符合约束。

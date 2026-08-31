@@ -69,7 +69,11 @@ func MigrationSQL(schema string) string {
     body         bytea,
     created_at   timestamptz NOT NULL DEFAULT now(),
     completed_at timestamptz
-);`
+);
+
+COMMENT ON TABLE ` + tbl + ` IS '幂等键：claim 先行占位防双重执行，完成后缓存响应供重放。';
+COMMENT ON COLUMN ` + tbl + `.payload_hash IS '同 key 异 payload 判 422 的依据。';
+COMMENT ON COLUMN ` + tbl + `.owner_token IS 'claim 的持有者，超时接管时据此判断归属。';`
 }
 
 // Store 是幂等记录的存取层。每个操作都是独立短事务（单语句自动提交），

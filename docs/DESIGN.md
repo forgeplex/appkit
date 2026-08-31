@@ -135,6 +135,8 @@ appkit/                          # module github.com/forgeplex/appkit
 │                                #   sync                物化/刷新 lint 配置与 CI 引用
 │                                #   dev                 go work init/use 全部子 repo
 │                                #   check               架构检查（含 SQL 跨 schema 引用扫描）
+│                                #   schema              从 db/migrations 派生 schema 文档
+│                                #                       与 ER 图（-check 做漂移检查）
 └── internal/                    # 框架私有实现（拓扑排序、lifecycle runner、gin 装配等）
     └── metrics/                 # ★ 自动埋点的唯一定义处：指标名与标签集在框架内钉死，
                                  #   业务不参与——指标的成本在基数不在采集（见 §8）
@@ -209,7 +211,11 @@ ledger/                          # module github.com/forgeplex/ledger
 ├── db/
 │   ├── migrations/              # ★ 只允许操作 "ledger" schema；
 │   │                            #   每域独占 Postgres schema + 独立迁移历史表
-│   └── queries/                 # sqlc .sql 源；appkit check 扫描跨 schema 表引用
+│   ├── queries/                 # sqlc .sql 源；appkit check 扫描跨 schema 表引用
+│   ├── SCHEMA.md                # 表清单 + 按外键分簇的 Mermaid ER 图（人的入口）
+│   └── schema/                  # 每表一份 .sql（DDL，给 agent/grep）+ .md（给 review）；
+│                                #   _appkit/ 下隔离框架表。全部由 appkit schema 从
+│                                #   migrations 派生，禁手改，CI drift check（见 §7）
 ├── .golangci.yml                # appkit sync 物化（带 appkit 版本头），CI 校验未漂移
 ├── .go-arch-lint.yml            # 方向性约束矩阵
 └── .github/workflows/ci.yml     # 一行 uses: forgeplex/appkit/ci
@@ -345,6 +351,8 @@ app.Run(ctx)
 | 规则集不被改松 | `appkit check` 内联 `ruleset.Check`（配置缺失同样算漂移），不再只靠 CI 那一步 | ▲ 本地+CI 级 |
 | 已应用的迁移不可变 | 历史表存内容 sha256，启动期逐个比对，不符即 `MIGRATION_DRIFT` 拒绝启动；`.gitattributes` 钉 `*.sql eol=lf` 消除跨平台误报 | ★ 运行时级，启动即暴露 |
 | 没人跑迁移不可能 | 登记了迁移却既无 `Migrator` 又无 `SkipMigrations()` → 启动报错；`-migrate` 无 `database.url` 亦报错 | ★ 装配级 fail-fast |
+| schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`，产出因此是迁移的纯函数；CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（分区、生成列、RLS、继承…）点名报错而非静默输出残缺 DDL | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行——`domain-ci.yml` 经 `@main` 被全部存量域仓库共享，硬加检查会让它们在合并那一刻集体变红。代价是从不启用的仓库永远不被检查；跑过一次 `make schema` 就永久转严 |
+| 表有说明（`COMMENT ON TABLE`） | 缺的表在 `db/SCHEMA.md` 表清单里标 ⚠ 缺说明，并给出该补的那一句 | ▲ 生成物级，本表最弱的一条：不阻断 CI（刻意的，存量仓库不会突然红），且 `db/SCHEMA.md` 带 `linguist-generated` 在 PR diff 里默认折叠——没人主动打开就看不见 |
 | 长驻任务死了必被发现 | `Registry.Worker` 托管：异常退出上报主循环并触发关停（不再是"探针绿着、事件停摆"） | ★ API 设计级 |
 | ctx 只能传白名单元数据 | `callctx.Meta` 是具名字段的 struct 而非 map，防火墙剥值后只放回它 | ★ 编译器级：塞不进去 |
 | 周期任务多副本不重跑 | `job.Every` 用 Postgres advisory lock（session 级，连接断开自动释放） | ▲ API 设计级：正确写法零成本，裸 ticker 拦不住 |
@@ -428,6 +436,9 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
      go-arch-lint v3 配置 + CI 引用，带生成头与漂移检测）
    - `appkit check`（go.mod 域间依赖铁律、import 方向矩阵、SQL 跨 schema 扫描、迁移编号、
      规则集漂移）
+   - `appkit schema [-check]`（迁移 → 一次性临时库 → `pg_catalog` → `db/SCHEMA.md` +
+     `db/schema/`：表清单、按外键连通分量分簇的 Mermaid ER 图、每表 DDL/表格/一跳邻域图。
+     `appkit check` 保持纯静态不碰 DB，所以这是独立命令 + 独立 CI 步骤）
    - `audit` 包（同事务审计）、`ruleset` 包、`.github/workflows/domain-ci.yml`（reusable）
    - `lint/` 嵌套 module：`moneyfloat`（金额禁浮点，-scope 圈定业务包）、`ctxstruct`
      两个 go/analysis analyzer + `appkit-lint` multichecker

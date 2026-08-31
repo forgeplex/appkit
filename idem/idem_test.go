@@ -44,6 +44,9 @@ func TestMigrationSQL(t *testing.T) {
 				"owner_token  uuid NOT NULL",
 				"state        text NOT NULL CHECK (state IN ('in_progress', 'completed'))",
 				"headers      jsonb",
+				// 框架自己也守「建表就写说明」这条：机检见
+				// internal/schemadoc 的 TestFrameworkTablesAllDocumented。
+				`COMMENT ON TABLE "ledger"."idempotency_keys" IS '`,
 			},
 		},
 		{

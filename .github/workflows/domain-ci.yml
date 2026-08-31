@@ -59,6 +59,14 @@ jobs:
       - name: appkit sync 漂移检查
         run: go run github.com/forgeplex/appkit/cmd/appkit sync --check
 
+      # schema 文档漂移：改了迁移却没跑 make schema 就会红。
+      # 不加 if: 守卫也不加 continue-on-error——跳不跳由命令自己按启用门决定：
+      # db/SCHEMA.md 与 db/schema/ 都不存在的仓库打一条 ::notice 后退出 0，
+      # 任一存在就严格检查。本文件经 @main 被全部存量域仓库共享，
+      # 硬加一个新检查会让它们在合并那一刻集体变红。
+      - name: appkit schema 漂移检查
+        run: go run github.com/forgeplex/appkit/cmd/appkit schema -check
+
       # 先验规则集未漂移，再按规则集跑 lint——否则跑的可能是被改松的配置。
       # 版本必须与 ruleset.GolangciLintVersion / ruleset.ArchLintVersion 一致
       # （域仓库 Makefile 的 lint 目标从那里渲染），否则本地绿、CI 红。

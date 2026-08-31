@@ -77,6 +77,11 @@ CREATE TABLE IF NOT EXISTS %[1]s.inbox (
     processed_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (consumer, event_id)
 );
+
+COMMENT ON TABLE %[1]s.outbox IS '事务性事件外发：业务写与事件落表同事务提交，relay 轮询后投递。';
+COMMENT ON COLUMN %[1]s.outbox.meta IS 'callctx 白名单快照——事件是异步的，投递时原请求的 ctx 早已消失。';
+COMMENT ON COLUMN %[1]s.outbox.claimed_until IS 'relay 的领取租约到期时刻，过期后其它副本可重新领取。';
+COMMENT ON TABLE %[1]s.inbox IS '事件消费去重：主键 (consumer, event_id)，同一事件每个消费者各消费一次。';
 `
 
 // MigrationSQL 返回 outbox/inbox 两张表的 DDL，域 repo 把它写进自己 schema

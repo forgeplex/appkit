@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS ` + q + `.audit_log (
 );
 CREATE INDEX IF NOT EXISTS audit_log_entity_idx
     ON ` + q + `.audit_log (entity, entity_id, at);
+
+COMMENT ON TABLE ` + q + `.audit_log IS '审计流水：与业务写同事务落库，记录 actor/action/before/after。';
 `
 }
 
