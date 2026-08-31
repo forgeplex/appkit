@@ -341,7 +341,7 @@ app.Run(ctx)
 | 跨域只经契约类型 | 唯一可见类型就是 contracts 生成接口 | ★ 编译器级 |
 | 契约/事件/错误码单一事实源 | 只有生成物，无手写类型 | ★ 生成级 + drift check |
 | http 包不写 SQL、业务包零 infra import | depguard + go-arch-lint：配置由 `appkit sync` 物化（同时解决 IDE 集成与 golangci-lint 无配置继承），CI 先验未漂移**再按它跑这两个检查器**，版本与域仓库 `make lint` 同源（`ruleset.GolangciLintVersion` / `ArchLintVersion`） | ▲ CI 级，nolint 需写理由 |
-| 金额禁 float、导出方法首参 ctx（限 service 层） | appkit-lint 自研 analyzer（少而精，控制误报）；**尚未接进域仓库**——`lint/` 是独立嵌套 module，接入要么给它单独发版走 `go vet -vettool`，要么用 golangci custom plugin 出定制二进制（里程碑 4） | ✗ 未落地：现状只能手动跑，等同约定 |
+| 金额禁 float、ctx 不进 struct、decimal 不上 JSON 面 | appkit-lint 自研 analyzer（moneyfloat[-scope 圈定业务包] / ctxstruct / decjson）；domain-ci.yml 与域仓库 `make lint` 都跑它，版本随 go.mod 钉的 appkit 走（规则与依赖同版本升级，不搞 @main 惊喜；go.work 联调仓库退 @main） | ▲ CI 级：默认只查生产代码——测试夹具低一档，且存量域的测试不该被规则升级卡红（`-<name>.tests=true` 可连测试查） |
 | 事务不泄漏到业务代码 | pgtx 回调式 API，业务只见 ctx | ★ API 设计级 |
 | 事务内禁跨模块调用 | contract.Call 运行时守卫（HasTx 检查）；前提是调用经生成 wrapper（ProvideContract 强制包裹；生成流水线就绪前靠约定） | ▲ 运行时级，测试即暴露 |
 | 忘发事件不可能 | outbox.Publish 是事务 API 的一等公民 | ★ API 设计级 |

@@ -125,7 +125,9 @@ func TestDomainScaffold(t *testing.T) {
 			// lint 与 CI 必须钉同一版本（ruleset 是唯一事实源），
 			// 否则「本地绿、CI 红」，而且查起来最费劲。
 			"golangci-lint@"+ruleset.GolangciLintVersion,
-			"go-arch-lint@"+ruleset.ArchLintVersion)
+			"go-arch-lint@"+ruleset.ArchLintVersion,
+			// appkit-lint 进 make lint：版本取法与 domain-ci.yml 一致。
+			"lint/cmd/appkit-lint@$(APPKITLINT_VERSION)", "APPKITLINT_VERSION ?=")
 		mustContain(t, "main.go", readFile(t, dir, "cmd/ledgerd/main.go"),
 			"bootstrap.Main(bootstrap.Options{", `Service: "ledgerd"`,
 			"Modules: func(d bootstrap.Deps)", "ledger.Module(")
@@ -169,11 +171,12 @@ func TestDomainScaffold(t *testing.T) {
 			"db/schema/", "make schema", "COMMENT ON TABLE",
 			"MIGRATION_DRIFT", "make migrate", "apptest.Conform",
 			"make lint")
-		// 规程里不许出现假的强制力：moneyfloat 还没接进 CI，这里就必须
-		// 明说没有机检。写成"lint 会拦"会让代理以为有网兜着。
-		if agents := readFile(t, dir, "AGENTS.md"); strings.Contains(agents, "禁 float（lint 会拦）") ||
-			!strings.Contains(agents, "没有机检") {
-			t.Error("AGENTS.md 对金额规则的强制力描述与现状不符（moneyfloat 尚未接进 CI）")
+		// 规程里不许出现假的强制力：appkit-lint 已接进 make lint 与 CI，
+		// 规程就不许再说"没有机检"（反向同样成立——哪天机检撤了，这句
+		// 断言会逼着把规程改回诚实的说法）。
+		if agents := readFile(t, dir, "AGENTS.md"); strings.Contains(agents, "没有机检") ||
+			!strings.Contains(agents, "appkit-lint") {
+			t.Error("AGENTS.md 对金额规则的强制力描述与现状不符（appkit-lint 已在 make lint 与 CI）")
 		}
 	})
 }

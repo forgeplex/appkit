@@ -43,9 +43,14 @@ schema: dev-db
 # 钉版本经 go run 执行，无需预装；本机装了可 GOLANGCI=golangci-lint make lint。
 GOLANGCI ?= $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GolangciVersion}}
 ARCHLINT ?= $(GO) run github.com/fe3dback/go-arch-lint@{{.ArchLintVersion}}
+# appkit-lint 是嵌套 module（不进业务依赖图），@版本直接拉取。版本随
+# go.mod 钉的 appkit——规则与依赖同版本升级，与 domain-ci.yml 同一套取法；
+# go.work 联调取不到版本时退 @main。
+APPKITLINT_VERSION ?= $(shell v=$$($(GO) list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $$2}'); case "$$v" in v*) echo "$$v";; *) echo main;; esac)
 lint:
 	$(GOLANGCI) run ./...
 	$(ARCHLINT) check
+	$(GO) run github.com/forgeplex/appkit/lint/cmd/appkit-lint@$(APPKITLINT_VERSION) ./...
 
 # appkit 架构检查：依赖方向、go.mod require 清单、SQL 跨 schema 引用。
 check:

@@ -76,6 +76,17 @@ jobs:
       - name: go-arch-lint（组件依赖矩阵）
         run: go run github.com/fe3dback/go-arch-lint@v1.18.0 check
 
+      # 自研检查器：金额禁 float / decimal 不上 JSON 面 / ctx 不进 struct。
+      # 版本随域仓库 go.mod 钉的 appkit 走（规则与依赖同版本升级，不搞
+      # @main 惊喜）；go.work 联调仓库取不到版本时退 @main。
+      # 默认只查生产代码——存量域的测试文件不该被规则升级一夜卡红，
+      # 要连测试一起查在本地 make lint 里显式 -xxx.tests=true。
+      - name: appkit-lint（moneyfloat / ctxstruct / decjson）
+        run: |
+          v=$(go list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $2}')
+          case "$v" in v*) ;; *) v=main ;; esac
+          go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@"$v" ./...
+
       - name: go.mod 整洁检查
         run: |
           go mod tidy

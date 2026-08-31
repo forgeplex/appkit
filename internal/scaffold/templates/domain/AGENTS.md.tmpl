@@ -71,9 +71,11 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 
 - **金额**：存储与运算用 `decimal.Decimal`（sqlc 已把 NUMERIC 全局 override
   成它，无需注册任何 codec）；需要把"币种+金额"绑在一起时才用 `money.Money`
-  （领域层值对象，不落库——币种另列存）。JSON/合约边界金额一律字符串。
-  禁 float。**禁 float 这条没有机检**（appkit-lint 的 moneyfloat
-  尚未接进 CI），写错不会变红，只会在对账时变错——请自己守住；
+  （领域层值对象，不落库——币种另列存）。JSON/合约边界金额一律字符串，
+  入站解析用 `money.ParseCanonical`（规范形态：拒 "+80"/"080"/"8e1"/负零，
+  同值同串，幂等指纹与签名才不歪）。禁 float、decimal 不上 JSON 面都有
+  机检：`make lint` 与 CI 的 appkit-lint（moneyfloat/decjson，默认只查
+  生产代码，`-xxx.tests=true` 连测试一起查）；
 - **错误**：跨层只传 `*apperr.Error`，判定用 `apperr.Is(err, code)`，
   禁止字符串比对；
 - **事件**：只能在 `tx.Do` 内经注入的 Publisher 发（落 outbox，提交后

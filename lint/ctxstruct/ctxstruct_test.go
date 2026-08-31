@@ -21,3 +21,9 @@ func TestAnalyzer(t *testing.T) {
 		})
 	}
 }
+
+// TestSkipTests 默认只查生产代码：skiptests 包的违规只在 _test.go 里且无
+// want 注释——若默认行为被改坏（开始查测试文件），会冒出未期望的诊断。
+func TestSkipTests(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), ctxstruct.Analyzer, "skiptests")
+}

@@ -438,3 +438,50 @@ func TestImmutable(t *testing.T) {
 		t.Fatalf("接收者被改写: %q", got)
 	}
 }
+
+func TestParseCanonical(t *testing.T) {
+	tests := []struct {
+		name     string
+		amount   string
+		currency string
+		wantCode string // 空串表示期望成功
+	}{
+		{"整数", "80", "USD", ""},
+		{"带标度", "80.00", "USD", ""},
+		{"零", "0", "USD", ""},
+		{"零带标度", "0.00", "USDT", ""},
+		{"负数", "-3.5", "USD", ""},
+		{"正号", "+80", "USD", money.CodeInvalidAmount},
+		{"前导零", "080", "USD", money.CodeInvalidAmount},
+		{"裸小数点前", ".5", "USD", money.CodeInvalidAmount},
+		{"裸小数点后", "5.", "USD", money.CodeInvalidAmount},
+		{"科学计数法小写", "8e1", "USD", money.CodeInvalidAmount},
+		{"科学计数法大写", "1E10", "USD", money.CodeInvalidAmount},
+		{"负零", "-0", "USD", money.CodeInvalidAmount},
+		{"负零带标度", "-0.00", "USD", money.CodeInvalidAmount},
+		{"空串", "", "USD", money.CodeInvalidAmount},
+		{"空白", " 80", "USD", money.CodeInvalidAmount},
+		{"币种非法", "80", "usd", money.CodeInvalidCurrency},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := money.ParseCanonical(tt.amount, tt.currency)
+			if tt.wantCode == "" {
+				if err != nil {
+					t.Fatalf("ParseCanonical(%q, %q): %v", tt.amount, tt.currency, err)
+				}
+				return
+			}
+			if !apperr.Is(err, tt.wantCode) {
+				t.Fatalf("err = %v, want code %s", err, tt.wantCode)
+			}
+		})
+	}
+
+	// 指数与位数域约束与 Parse 同源：极端形态在这里也拦得住。
+	for _, s := range []string{"1e31", "1" + strings.Repeat("0", 39)} {
+		if _, err := money.ParseCanonical(s, "USD"); !apperr.Is(err, money.CodeInvalidAmount) {
+			t.Errorf("ParseCanonical(%q…): err = %v, want %s", s[:4], err, money.CodeInvalidAmount)
+		}
+	}
+}

@@ -3,6 +3,8 @@
 // 全系统金额禁用 float（appkit-lint 强制），金额只以 Money 或 decimal.Decimal
 // 流转；JSON 里 amount 一律是字符串。数额保留构造时的标度（scale）：
 // Parse("10.50") 的字符串形态始终是 "10.50" 而非 "10.5"。
+// 入站解析用 ParseCanonical：只收规范形态（拒 "+80"/"080"/"8e1"/负零），
+// 同值只有一种字节形态，幂等指纹与签名才可比。
 //
 // Money 是领域层值对象，不是持久化类型：单个 NUMERIC 列还原不了币种，
 // 落库时金额（decimal.Decimal——sqlc 经脚手架全局 override 映射 NUMERIC，
@@ -15,6 +17,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
+	"strings"
 
 	"github.com/shopspring/decimal"
 
@@ -81,6 +85,37 @@ func Parse(amount string, currency string) (Money, error) {
 		return Money{}, errInvalidAmount.WithDetail("amount", amount).WithCause(err)
 	}
 	return New(d, currency)
+}
+
+// canonicalForm 是入站金额唯一可接受的形态：可选负号 + (0|[1-9]\d*) +
+// 可选小数部分。"+80"、"080"、".5"、"5."、"8e1" 与 "80"/"0.5" 同值不同串，
+// 过不了这道闸——它们会把幂等指纹、请求签名、对账的字符串比对打歪
+// （idem 的指纹吃原始字节，"80" 与 "80.00" 本就是两个不同的 hash，
+// 再放任 "+80"/"8e1" 进来，同值的形态就更多了）。
+var canonicalForm = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?$`)
+
+// ParseCanonical 按 Parse 的全部约束解析，且只接受规范形态的金额字符串
+// （并拒绝 "-0"）。入站 DTO 用它：同值只有一种字节形态，是幂等指纹与
+// 签名可比的前提。出站渲染不受此限——按资产标度定宽是 DTO 层的事。
+func ParseCanonical(amount string, currency string) (Money, error) {
+	if len(amount) > maxAmountLen {
+		return Money{}, errInvalidAmount.
+			WithMessage("amount 字符串过长（最多 %d 字节）", maxAmountLen).
+			WithDetail("length", len(amount))
+	}
+	if !canonicalForm.MatchString(amount) {
+		return Money{}, errInvalidAmount.
+			WithMessage("amount 必须是规范十进制字符串（如 \"80\"、\"80.00\"、\"-3.5\"）：拒绝正号、前导零、裸小数点、科学计数法")
+	}
+	m, err := Parse(amount, currency)
+	if err != nil {
+		return Money{}, err
+	}
+	if m.IsZero() && strings.HasPrefix(amount, "-") {
+		return Money{}, errInvalidAmount.
+			WithMessage("amount 不接受负零（\"0\"/\"0.00\" 已是零的规范形态）")
+	}
+	return m, nil
 }
 
 // validAmount 校验数额在金额域内。New 与 Parse 共用，保证任何已构造的

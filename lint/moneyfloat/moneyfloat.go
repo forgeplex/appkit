@@ -6,6 +6,8 @@
 // 本检查器故意不区分"金额"与"合法的数学计算"——time 换算等场景里的 float
 // 同样会被报告。用 -scope 正则把检查圈定在业务包（如 internal/ledger），
 // 而不是给检查器加豁免启发式。
+//
+// 默认只查生产代码（_test.go 不查），-tests=true 连测试一起查。
 package moneyfloat
 
 import (
@@ -17,23 +19,26 @@ import (
 	"regexp"
 
 	"golang.org/x/tools/go/analysis"
-	"golang.org/x/tools/go/analysis/passes/inspect"
-	"golang.org/x/tools/go/ast/inspector"
+
+	"github.com/forgeplex/appkit/lint/internal/prodfiles"
 )
 
 // Analyzer 是 moneyfloat 检查器。
 var Analyzer = &analysis.Analyzer{
-	Name:     "moneyfloat",
-	Doc:      "禁止 float32/float64 出现在 struct 字段、变量/常量声明、函数参数与返回值、显式类型转换中；金额与业务数值改用 money.Money 或 decimal",
-	Requires: []*analysis.Analyzer{inspect.Analyzer},
-	Run:      run,
+	Name: "moneyfloat",
+	Doc:  "禁止 float32/float64 出现在 struct 字段、变量/常量声明、函数参数与返回值、显式类型转换中；金额与业务数值改用 money.Money 或 decimal",
+	Run:  run,
 }
 
 // scope 是 -scope flag：正则匹配包 import path 才检查；空 = 检查全部包。
 var scope = &regexFlag{}
 
+// tests 是 -tests flag：是否连 _test.go 一起检查（默认只查生产代码）。
+var tests bool
+
 func init() {
 	Analyzer.Flags.Var(scope, "scope", "正则表达式，仅检查 import path 匹配的包；为空则检查全部包")
+	Analyzer.Flags.BoolVar(&tests, "tests", false, "是否检查 _test.go（默认只查生产代码）")
 }
 
 // regexFlag 在 flag 解析期即校验正则，非法值直接报错而不是运行期崩溃。
@@ -74,7 +79,6 @@ func run(pass *analysis.Pass) (any, error) {
 	if scope.re != nil && !scope.re.MatchString(pass.Pkg.Path()) {
 		return nil, nil
 	}
-	ins := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	// 同一 ident 可能被多个语法上下文覆盖（如 struct 字段是函数类型），按位置去重。
 	reported := map[token.Pos]bool{}
@@ -88,13 +92,7 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 	}
 
-	filter := []ast.Node{
-		(*ast.StructType)(nil),
-		(*ast.ValueSpec)(nil),
-		(*ast.FuncType)(nil),
-		(*ast.CallExpr)(nil),
-	}
-	ins.Preorder(filter, func(n ast.Node) {
+	filter := func(n ast.Node) bool {
 		switch n := n.(type) {
 		case *ast.StructType:
 			for _, f := range n.Fields.List {
@@ -121,7 +119,11 @@ func run(pass *analysis.Pass) (any, error) {
 				report("类型转换", n.Fun)
 			}
 		}
-	})
+		return true
+	}
+	for _, f := range prodfiles.Files(pass.Fset, pass.Files, !tests) {
+		ast.Inspect(f, filter)
+	}
 	return nil, nil
 }
 

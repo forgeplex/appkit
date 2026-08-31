@@ -674,12 +674,14 @@ go-arch-lint** → `go mod tidy` 漂移检查。
 不会出现"本地绿、CI 红"。升级 appkit 后 `appkit sync` 刷新配置，
 `make lint` 自然跟着换版本。
 
-自研 analyzer（金额禁浮点、ctx 禁存 struct）**尚未接进域仓库 CI**（`lint/` 是独立
-嵌套 module，接入方式见 lint/README.md「里程碑 4」）。现在只能手动跑：
+自研 analyzer（金额禁浮点、ctx 禁存 struct、decimal 不上 JSON 面）**已接进域仓库
+CI**：`domain-ci.yml` 里有一步 appkit-lint，版本随域仓库 go.mod 钉的 appkit 走
+（规则与依赖同版本升级）；域仓库 `make lint` 用同一套取法，本地与 CI 跑的是
+同一个二进制。默认只查生产代码，`-<name>.tests=true` 连测试一起查。需要单独
+手跑时：
 
 ```sh
-go install github.com/forgeplex/appkit/lint/cmd/appkit-lint@latest
-go vet -vettool=$(which appkit-lint) -moneyfloat.scope 'internal/(identity|authn)' ./...
+go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@v0.4.0 -moneyfloat.scope 'internal/(identity|authn)' ./...
 ```
 
 ## 10. 规则速查
@@ -691,7 +693,7 @@ go vet -vettool=$(which appkit-lint) -moneyfloat.scope 'internal/(identity|authn
 | 发领域事件 | 用例事务内 `pub.Publish` | 事务外发（守卫拒绝）；直连 broker（业务包 import 不到） |
 | 处理外域事件 | `reg.Consumer` + `outbox.Inbox` 包裹 | 裸 handler（重复投递=重复执行） |
 | 写 SQL | `db/queries/*.sql` + sqlc | handler/service 里拼 SQL（depguard 拦 pgx import） |
-| 表示金额 | `decimal.Decimal`（存储/运算，sqlc 全局 override NUMERIC）+ `money.Money`（需币种绑定时，领域层）+ JSON 边界字符串 | float64（appkit-lint 能报，但它还没进 CI——这条目前靠自觉） |
+| 表示金额 | `decimal.Decimal`（存储/运算，sqlc 全局 override NUMERIC）+ `money.Money`（需币种绑定时，领域层）+ JSON 边界字符串（入站用 `money.ParseCanonical`） | float64、裸 decimal 上 JSON 面（都在 appkit-lint 里，make lint 与 CI 都跑） |
 | 返回错误 | 合约错误码（`apperr.Is(err, identityv1.CodeXxx)` 单体/微服务行为一致） | 字符串比对、裸 errors.New 跨层 |
 | 跑后台任务 | `reg.Worker(name, run)` | 自己 `go func()`（关停不等它、崩了没人管） |
 | 跑周期任务 | `reg.Worker(name, job.Every(pool, ...))` | 裸 `time.Ticker`（多副本每轮重复执行） |

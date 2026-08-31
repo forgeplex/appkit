@@ -7,6 +7,7 @@ import (
 	"golang.org/x/tools/go/analysis/multichecker"
 
 	"github.com/forgeplex/appkit/lint/ctxstruct"
+	"github.com/forgeplex/appkit/lint/decjson"
 	"github.com/forgeplex/appkit/lint/moneyfloat"
 )
 
@@ -14,5 +15,6 @@ func main() {
 	multichecker.Main(
 		moneyfloat.Analyzer,
 		ctxstruct.Analyzer,
+		decjson.Analyzer,
 	)
 }
