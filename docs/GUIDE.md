@@ -199,7 +199,13 @@ func (s *Service) CreateUser(ctx context.Context, in CreateUser) (User, error) {
 
 事务提交后，模块自带的 outbox relay（骨架已装配，`Options.Bus` 注入时启动）
 自动把事件投递给订阅方——你不需要也**不能**"手动发消息"（事务外发布会被
-运行时守卫拒绝，忘发事件则根本写不出来）。
+运行时守卫拒绝，忘发事件则根本写不出来）。消费方持续失败到重试上限的事件进
+死信（不再占用投递热路径），修好消费方后一条命令放回重投：
+
+```sh
+appkit outbox -schema <域> -dsn <...>          # 列出死信：ID、失败原因、失败时间
+appkit outbox -schema <域> -dsn <...> <ID>…    # 按事件 ID 放回（-all 全放）
+```
 
 **③ Store 实现**（`internal/postgres/`）：从 ctx 取事务（`pgtx.From`），调 sqlc 生成代码。
 
@@ -623,7 +629,7 @@ reg.Worker("cleanup", job.Every(m.opts.Pool, job.Task{
 |---|---|---|
 | `appkit.contract.call.duration` | system, method, outcome, error_code | 跨模块调用的 RED——进程内与远程同口径 |
 | `appkit.outbox.delivery.duration` | topic, outcome | 投递速率与失败率 |
-| `appkit.outbox.dead` | topic | 进死信的事件数，非零就该有人看 |
+| `appkit.outbox.dead` | topic | 进死信的事件数，非零就该有人看：`appkit outbox` 列出失败原因，修好后按 ID 放回 |
 | `appkit.outbox.pending` / `.oldest_pending.age` | schema | **告警看年龄不看条数**：积压 1000 条 200ms 清掉是正常的，积压 3 条最老的躺了 20 分钟说明投递停了 |
 | `appkit.job.run.duration` | job, outcome（ok/error/skipped） | 任务悄悄停了（曲线归零）比任务报错更难发现 |
 | `appkit.db.query.duration` | db.operation, outcome | 最常见的故障源，也最常没埋点 |

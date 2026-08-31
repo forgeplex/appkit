@@ -381,6 +381,9 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   hold-and-wait 连接池死锁）；至少一次投递 + inbox 按 (consumer, event_id) 去重；
   失败指数退避、超过重试上限进死信（failed_at），毒消息不阻塞后续事件；
   批内保序尽力而为，跨批/退避后不保证全局序。
+  死信有恢复通道：`outbox.DeadLetters`（`appkit outbox` 子命令即其运维面）
+  列出失败原因、修好后按事件 ID 放回——attempts 归零、立即到期、按完整
+  重试预算重走；放回只动死信态的行，未死或已发布的事件不受影响。
 - **幂等 claim 带 fencing token**：TTL 接管后旧持有者的 Complete/Release 必然失败，
   不存在双写窗口；TTL 必须大于 handler 最长执行时间。
 - **幂等指纹与键作用域可注入**（`idem.WithCanonicalizer` / `idem.WithKeyScope`，
