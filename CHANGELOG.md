@@ -2,6 +2,24 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.5.1（2026-08-31）
+
+v0.5.1: 三个安静的注入口——池选项透传、死信放回、测试样板收敛
+
+- bootstrap：Options.PoolOptions 透传给生产连接池。域要给池装 otelpgx
+  tracer 或会话级 GUC（statement_timeout 等）时，此前只能整个自建池
+  绕开 bootstrap——迁移/outbox/幂等装配全部重写一遍；现在
+  pgtx.PoolOption 直接挂在 Options 上，例外路径消失。
+- outbox：死信有了恢复通道。relay 重试达上限（failed_at 置位）的事件
+  原先没有任何出路，只能手写 SQL 改表；outbox.DeadLetters 与
+  `appkit outbox` 子命令补上「列出失败原因 → 修好消费方 → 按事件 ID
+  （或 -all）放回」，attempts 归零、立即到期，bug 没修好则按完整
+  重试预算再次死信，放回只动死信态的行。
+- 测试：「env 守卫 + 随机 schema + DROP CASCADE」七处样板收进
+  internal/dbtest，标识符转义统一 pgx.Identifier。
+
+零默认行为变更，纯加法与内部收敛，故 patch（分寸见 AGENTS.md 发版节）。
+
 ## v0.5.0（2026-08-31）
 
 v0.5.0: 金额边界焊死——decimal 持久化、decjson 机检、幂等指纹可注入
