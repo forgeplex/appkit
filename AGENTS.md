@@ -64,5 +64,9 @@ gh release create vX.Y.Z --verify-tag \
 git push origin main vX.Y.Z
 ```
 
-版本号走 SemVer：新增能力 minor，纯修 bug patch；apidiff 门禁保证向后
-兼容，正常不会出现需要 major 的破坏性变更。
+版本号走 SemVer，但 0.x 期间号是节拍不是承诺：**minor 留给改默认行为/
+语义、或值得每个升级者读一遍说明的节点**（v0.5.0 焊金额边界是例），
+纯加法的可选注入口（新 Option 字段、新运维命令）、内部重构与修 bug
+一律 patch——每个小注入口都 minor 会让号虚涨，读者看到 minor 该期待
+实质节点。apidiff 门禁保证向后兼容，正常不会出现需要 major 的破坏性
+变更。
