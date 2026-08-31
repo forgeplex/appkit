@@ -101,6 +101,12 @@ type Options struct {
 	AppOptions func(Deps) []appkit.Option
 	// NewBus 覆盖默认事件总线（默认 outbox.NewDirectBus()）。
 	NewBus func() EventBus
+	// PoolOptions 追加连接池配置，随 bootstrap 建的生产池生效：
+	// pgtx.WithAfterConnect 装 per-connection 钩子（otelpgx tracer、
+	// 会话级 GUC），pgtx.WithMaxConns 调容量。留空即框架默认。
+	// 此前域要给池加钩子只能整个自建池绕开 bootstrap——迁移/outbox/
+	// 幂等装配全部重写一遍，正是这条例外最不该存在的地方。
+	PoolOptions []pgtx.PoolOption
 }
 
 // RunOptions 是运行期参数，对应 Main 解析出的命令行 flag。
@@ -199,7 +205,7 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 			return fmt.Errorf("%s: 装配最小模式模块: %w", o.Service, err)
 		}
 	} else {
-		pool, perr := pgtx.NewPool(ctx, base.Database.URL)
+		pool, perr := pgtx.NewPool(ctx, base.Database.URL, o.PoolOptions...)
 		if perr != nil {
 			return fmt.Errorf("%s: 连接数据库（本地开发可先 make dev-db）: %w", o.Service, perr)
 		}

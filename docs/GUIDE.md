@@ -572,6 +572,18 @@ AppOptions: func(bootstrap.Deps) []appkit.Option {
 },
 ```
 
+连接池要装 per-connection 钩子或调容量时，**不要自建池绕开 bootstrap**——那会把
+迁移/outbox/幂等的装配全部重写一遍。`PoolOptions` 直接透传给生产池：
+
+```go
+PoolOptions: []pgtx.PoolOption{
+    pgtx.WithAfterConnect(func(ctx context.Context, c *pgx.Conn) error {
+        _, err := c.Exec(ctx, "SET statement_timeout = '5s'") // 会话级 GUC
+        return err
+    }),
+},
+```
+
 **已应用的迁移不可再改**：历史表记着每个文件的 sha256，改动已应用的文件会让服务
 以 `MIGRATION_DRIFT` 拒绝启动，错误里带修复方法。要改结构就新增一个迁移文件——
 改老文件不会让库跟着变，只会让库和代码静默分叉，通常到生产才暴露。
