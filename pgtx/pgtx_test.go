@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/forgeplex/appkit/internal/dbtest"
 	"github.com/forgeplex/appkit/pgtx"
 	"github.com/forgeplex/appkit/tx"
 )
@@ -109,20 +110,6 @@ func TestDoForeignHandleErrors(t *testing.T) {
 
 // ---- 需要 Postgres 的测试（TEST_DATABASE_URL）----
 
-func testPool(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL 未设置，跳过需要 Postgres 的测试")
-	}
-	pool, err := pgtx.NewPool(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("NewPool: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
-}
-
 var tableSeq atomic.Int64
 
 func testTable(t *testing.T, pool *pgxpool.Pool) string {
@@ -177,7 +164,7 @@ func TestNewPoolOptions(t *testing.T) {
 }
 
 func TestDoCommitRollback(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	tr := pgtx.New(pool)
 	errBoom := errors.New("boom")
 
@@ -209,7 +196,7 @@ func TestDoCommitRollback(t *testing.T) {
 }
 
 func TestDoNestedSavepoint(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	tr := pgtx.New(pool)
 	errInner := errors.New("inner")
 	errOuter := errors.New("outer")
@@ -258,7 +245,7 @@ func TestDoNestedSavepoint(t *testing.T) {
 }
 
 func TestDoPanicRollsBackAndRethrows(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	tr := pgtx.New(pool)
 	table := testTable(t, pool)
 
@@ -282,7 +269,7 @@ func TestDoPanicRollsBackAndRethrows(t *testing.T) {
 }
 
 func TestFromInsideAndOutsideTx(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	tr := pgtx.New(pool)
 	table := testTable(t, pool)
 

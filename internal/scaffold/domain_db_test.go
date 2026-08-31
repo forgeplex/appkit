@@ -2,15 +2,13 @@ package scaffold
 
 import (
 	"context"
-	"fmt"
-	"math/rand/v2"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
+
+	"github.com/forgeplex/appkit/internal/dbtest"
 )
 
 // 脚手架声明的 sqlc NUMERIC override 必须真能过 pgx。
@@ -22,14 +20,10 @@ import (
 // 所以机检落在真库读写上：把渲染后 sqlc.yaml 里声明的类型原样
 // 写进 NUMERIC、读出来，标度都不能丢。
 //
-// 无 TEST_DATABASE_URL 时 skip（与 idem/audit 的集成测试同门槛，
-// `make test-db` 才会跑到）。
+// 无 TEST_DATABASE_URL 时在 roundTripDecimal 里经 dbtest.Pool skip
+// （与 idem/audit 的集成测试同门槛，`make test-db` 才会跑到）；
+// 生成仓库与读 yaml 不需要库，skip 前照常执行。
 func TestDomainNumericOverrideRoundTrips(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("未设置 TEST_DATABASE_URL")
-	}
-
 	dir := filepath.Join(t.TempDir(), "ledger")
 	if err := Domain(Options{Name: "ledger", Dir: dir}, nil); err != nil {
 		t.Fatalf("Domain: %v", err)
@@ -41,7 +35,7 @@ func TestDomainNumericOverrideRoundTrips(t *testing.T) {
 	// 等于把「编译得过」又当成了「跑得起」。
 	switch goType {
 	case "github.com/shopspring/decimal.Decimal":
-		roundTripDecimal(t, dsn)
+		roundTripDecimal(t)
 	default:
 		t.Fatalf("sqlc.yaml 把 NUMERIC override 指向 %s，未登记进本测试的类型表。\n"+
 			"新金额类型必须先在这里过真库读写（money.Money 就是栽在这：\n"+
@@ -71,24 +65,13 @@ func numericOverrideGoType(t *testing.T, yml string) string {
 }
 
 // roundTripDecimal 用超过任何 float 精度的标度往返一次：值与标度都得原样回来。
-func roundTripDecimal(t *testing.T, dsn string) {
+func roundTripDecimal(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-
-	schema := fmt.Sprintf("scaffold_t%08x", rand.Uint32())
-	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _, _ = pool.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE") })
-	if _, err := pool.Exec(ctx,
-		`CREATE TABLE "`+schema+`".t (amount numeric NOT NULL, maybe numeric)`); err != nil {
-		t.Fatal(err)
-	}
+	pool := dbtest.Pool(t)
+	schema := dbtest.Schema(t, pool, "scaffold_t", func(schema string) string {
+		return `CREATE TABLE "` + schema + `".t (amount numeric NOT NULL, maybe numeric)`
+	})
 
 	// 27 位小数：float64 只有 ~15-17 位有效数字，等价性即证明没走过 float。
 	in := decimal.RequireFromString("12.345678901234567890123456789")

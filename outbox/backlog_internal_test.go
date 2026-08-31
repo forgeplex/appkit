@@ -3,13 +3,13 @@ package outbox
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/forgeplex/appkit/internal/dbtest"
 )
 
 // TestBacklogSQLMatchesPartialIndex 是无需数据库的漂移守卫：积压查询的
@@ -30,33 +30,11 @@ func TestBacklogSQLMatchesPartialIndex(t *testing.T) {
 	}
 }
 
-var backlogSchemaSeq atomic.Int64
-
 // backlogTestSchema 建随机 schema 并应用 MigrationSQL，结束后整体 DROP CASCADE。
 func backlogTestSchema(t *testing.T) (*pgxpool.Pool, string) {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL 未设置，跳过需要 Postgres 的测试")
-	}
-	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("建池: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	name := fmt.Sprintf("outbox_backlog_test_%d_%d", time.Now().UnixNano(), backlogSchemaSeq.Add(1))
-	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+name); err != nil {
-		t.Fatalf("建 schema: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+name+" CASCADE")
-	})
-	if _, err := pool.Exec(ctx, MigrationSQL(name)); err != nil {
-		t.Fatalf("应用 MigrationSQL: %v", err)
-	}
-	return pool, name
+	pool := dbtest.Pool(t)
+	return pool, dbtest.Schema(t, pool, "outbox_backlog_test", MigrationSQL)
 }
 
 // insertAged 直插一条事件并指定"多少秒前创建"，用来构造确定的积压年龄。

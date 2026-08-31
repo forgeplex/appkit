@@ -18,45 +18,13 @@ import (
 
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/internal/dbtest"
 	"github.com/forgeplex/appkit/outbox"
 	"github.com/forgeplex/appkit/pgtx"
 	"github.com/forgeplex/appkit/tx"
 )
 
 // ---- 需要 Postgres 的集成测试（TEST_DATABASE_URL）----
-
-func testPool(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL 未设置，跳过需要 Postgres 的测试")
-	}
-	pool, err := pgtx.NewPool(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("NewPool: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
-}
-
-var schemaSeq atomic.Int64
-
-// testSchema 建随机 schema 并应用 MigrationSQL，测试结束整体 DROP CASCADE。
-func testSchema(t *testing.T, pool *pgxpool.Pool) string {
-	t.Helper()
-	name := fmt.Sprintf("outbox_test_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
-	ctx := context.Background()
-	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+name); err != nil {
-		t.Fatalf("建 schema: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+name+" CASCADE")
-	})
-	if _, err := pool.Exec(ctx, outbox.MigrationSQL(name)); err != nil {
-		t.Fatalf("应用 MigrationSQL: %v", err)
-	}
-	return name
-}
 
 func countRows(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) int {
 	t.Helper()
@@ -92,7 +60,7 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 }
 
 func TestPublishIntegration(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	tr := pgtx.New(pool)
 	errBoom := errors.New("boom")
 
@@ -126,7 +94,7 @@ func TestPublishIntegration(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			schema := testSchema(t, pool)
+			schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
 			err := tr.Do(context.Background(), func(ctx context.Context) error {
 				if err := outbox.Publish(ctx, pgtx.From(ctx, pool), schema, tc.evt); err != nil {
 					return err
@@ -187,7 +155,7 @@ func startRelay(t *testing.T, relay *outbox.Relay) {
 }
 
 func TestRelayIntegration(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	tr := pgtx.New(pool)
 
 	tests := []struct {
@@ -200,7 +168,7 @@ func TestRelayIntegration(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			schema := testSchema(t, pool)
+			schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
 			const topic = "ledger.entry_posted"
 
 			wantPayload := map[string]map[string]any{}
@@ -286,7 +254,7 @@ func TestRelayIntegration(t *testing.T) {
 }
 
 func TestInboxIntegration(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	errBoom := errors.New("boom")
 
 	tests := []struct {
@@ -299,7 +267,7 @@ func TestInboxIntegration(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			schema := testSchema(t, pool)
+			schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
 			ctx := context.Background()
 			// 业务侧表：验证 next 的写与 inbox 记录同事务提交/回滚。
 			if _, err := pool.Exec(ctx, `CREATE TABLE `+schema+`.side (v text NOT NULL)`); err != nil {
@@ -359,9 +327,9 @@ func TestInboxIntegration(t *testing.T) {
 
 // 端到端：事务发布 → relay → DirectBus → Inbox 去重消费。
 func TestOutboxEndToEnd(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	tr := pgtx.New(pool)
-	schema := testSchema(t, pool)
+	schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
 	const topic = "ledger.entry_posted"
 
 	var calls atomic.Int64
@@ -403,7 +371,7 @@ func TestRelaySingleConnPoolNoDeadlock(t *testing.T) {
 		t.Fatalf("NewPool: %v", err)
 	}
 	t.Cleanup(pool.Close)
-	schema := testSchema(t, pool)
+	schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
 	const topic = "ledger.entry_posted"
 
 	var calls atomic.Int64
@@ -430,8 +398,8 @@ func TestRelaySingleConnPoolNoDeadlock(t *testing.T) {
 // 队头毒消息：持续失败的事件按退避让位、attempts 递增、达上限进死信，
 // 不阻塞后续事件，死信之后 relay 继续正常工作。
 func TestRelayPoisonMessageBackoffAndDeadLetter(t *testing.T) {
-	pool := testPool(t)
-	schema := testSchema(t, pool)
+	pool := dbtest.Pool(t)
+	schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
 	const topic = "ledger.entry_posted"
 
 	poison := appkit.Event{ID: uuid.NewString(), Topic: topic, Payload: []byte(`{"poison":true}`)}
@@ -507,8 +475,8 @@ func TestRelayPoisonMessageBackoffAndDeadLetter(t *testing.T) {
 // 崩溃重启后按序重取同一事件只会形成崩溃循环。startRelay 的 Cleanup 断言
 // Run 正常返回，证明 relay 未被 panic 打死。
 func TestRelayHandlerPanicRecovered(t *testing.T) {
-	pool := testPool(t)
-	schema := testSchema(t, pool)
+	pool := dbtest.Pool(t)
+	schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
 	const topic = "ledger.entry_posted"
 
 	var calls atomic.Int64
@@ -552,8 +520,8 @@ func TestRelayHandlerPanicRecovered(t *testing.T) {
 // 去重键是 (consumer, event_id)：同 topic 的两个消费者各自处理一次；
 // 旧架构（event_id 单键）第二个消费者会被静默跳过。重复投递时各自去重。
 func TestInboxMultiConsumers(t *testing.T) {
-	pool := testPool(t)
-	schema := testSchema(t, pool)
+	pool := dbtest.Pool(t)
+	schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
 	const topic = "ledger.entry_posted"
 
 	var emailCalls, auditCalls atomic.Int64
@@ -591,8 +559,8 @@ func TestInboxMultiConsumers(t *testing.T) {
 // 模拟「claim 后崩溃」：relay1 的 handler 卡死（事件被 claim、永远不会收尾），
 // 短租约到期后 relay2 必须接管重投；且接管不得早于租约到期。
 func TestRelayLeaseTakeover(t *testing.T) {
-	pool := testPool(t)
-	schema := testSchema(t, pool)
+	pool := dbtest.Pool(t)
+	schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
 	const topic = "ledger.entry_posted"
 
 	block := make(chan struct{})
@@ -652,9 +620,9 @@ func TestRelayLeaseTakeover(t *testing.T) {
 // Publisher：业务层只依赖单方法接口即可发事件；事务外被守卫拦下，
 // 事务内随业务事务一起提交/回滚。
 func TestPublisherIntegration(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	tr := pgtx.New(pool)
-	schema := testSchema(t, pool)
+	schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
 	pub := outbox.NewPublisher(pool, schema)
 	errBoom := errors.New("boom")
 

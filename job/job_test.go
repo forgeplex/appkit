@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/forgeplex/appkit/internal/dbtest"
 )
 
 // ---- 不需要 Postgres 的单测 ----
@@ -136,20 +137,6 @@ func noop(context.Context) error { return nil }
 
 // ---- 需要 Postgres 的测试（TEST_DATABASE_URL）----
 
-func testPool(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL 未设置，跳过需要 Postgres 的测试")
-	}
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("连接池: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	return pool
-}
-
 // lockName 让并发跑的用例之间不互相抢锁。
 func lockName(t *testing.T) string {
 	t.Helper()
@@ -159,7 +146,7 @@ func lockName(t *testing.T) string {
 // TestWithLockExcludesConcurrent 是本包存在的理由：两个副本同时抢，
 // 只有一个跑得起来，另一个立刻拿到 ErrLocked 而不是排队等着。
 func TestWithLockExcludesConcurrent(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	name := lockName(t)
 	ctx := context.Background()
 
@@ -214,7 +201,7 @@ func TestWithLockExcludesConcurrent(t *testing.T) {
 
 // TestWithLockDifferentNames 验证不同任务互不干扰（键推导没把它们撞一起）。
 func TestWithLockDifferentNames(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	ctx := context.Background()
 	a, b := lockName(t)+".a", lockName(t)+".b"
 
@@ -245,7 +232,7 @@ func TestWithLockDifferentNames(t *testing.T) {
 // TestWithLockReleasesOnError 验证任务体报错也放锁——
 // 否则一次失败就把这个任务永久锁死到进程重启。
 func TestWithLockReleasesOnError(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	name := lockName(t)
 	ctx := context.Background()
 
@@ -264,7 +251,7 @@ func TestWithLockReleasesOnError(t *testing.T) {
 // TestWithLockReleasesOnPanic 验证 panic 同样放锁（defer 保证），
 // 且 panic 不被吞掉。
 func TestWithLockReleasesOnPanic(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	name := lockName(t)
 	ctx := context.Background()
 
@@ -287,7 +274,7 @@ func TestWithLockReleasesOnPanic(t *testing.T) {
 // TestEveryRunsExclusively 端到端验证：两个"副本"跑同一个任务，
 // 任一时刻只有一个在执行任务体。
 func TestEveryRunsExclusively(t *testing.T) {
-	pool := testPool(t)
+	pool := dbtest.Pool(t)
 	name := lockName(t)
 
 	var mu sync.Mutex

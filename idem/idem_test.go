@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -22,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/internal/dbtest"
 	"github.com/forgeplex/appkit/money"
 )
 
@@ -273,31 +273,10 @@ func TestInjectedErrorRejectsBeforeClaim(t *testing.T) {
 
 // ---- 需要 Postgres 的测试（TEST_DATABASE_URL）----
 
-var schemaSeq atomic.Int64
-
 func testStore(t *testing.T) (*pgxpool.Pool, *Store) {
 	t.Helper()
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("TEST_DATABASE_URL 未设置，跳过需要 Postgres 的测试")
-	}
-	pool, err := pgxpool.New(context.Background(), dsn)
-	if err != nil {
-		t.Fatalf("连接池: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	schema := fmt.Sprintf("idem_test_%d_%d", time.Now().UnixNano(), schemaSeq.Add(1))
-	ctx := context.Background()
-	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+pgx.Identifier{schema}.Sanitize()); err != nil {
-		t.Fatalf("建 schema: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), "DROP SCHEMA "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
-	})
-	if _, err := pool.Exec(ctx, MigrationSQL(schema)); err != nil {
-		t.Fatalf("迁移: %v", err)
-	}
+	pool := dbtest.Pool(t)
+	schema := dbtest.Schema(t, pool, "idem_test", MigrationSQL)
 	return pool, NewStore(pool, schema)
 }
 

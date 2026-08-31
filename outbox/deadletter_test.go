@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/internal/dbtest"
 	"github.com/forgeplex/appkit/outbox"
 )
 
@@ -18,8 +19,8 @@ import (
 // 它 → 修好 bug 后 Retry 放回 → 正常投递成功。此前 failed_at 置位后事件
 // 没有任何恢复路径，只能手写 SQL 改表——这个测试锁住运维闭环不再退化。
 func TestDeadLetterRetry(t *testing.T) {
-	pool := testPool(t)
-	schema := testSchema(t, pool)
+	pool := dbtest.Pool(t)
+	schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
 	ctx := context.Background()
 	id := uuid.NewString()
 	publishOne(t, pool, schema, appkit.Event{ID: id, Topic: "t.dead", Payload: []byte(`{"k":1}`)})

@@ -3,8 +3,6 @@ package audit_test
 import (
 	"context"
 	"fmt"
-	"math/rand/v2"
-	"os"
 	"strings"
 	"testing"
 
@@ -12,6 +10,7 @@ import (
 
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/audit"
+	"github.com/forgeplex/appkit/internal/dbtest"
 	"github.com/forgeplex/appkit/pgtx"
 	"github.com/forgeplex/appkit/tx"
 )
@@ -60,31 +59,15 @@ func TestRecordValidation(t *testing.T) {
 }
 
 func TestRecordIntegration(t *testing.T) {
-	dsn := os.Getenv("TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("未设置 TEST_DATABASE_URL")
-	}
 	ctx := context.Background()
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
-
-	schema := fmt.Sprintf("audit_t%08x", rand.Uint32())
-	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _, _ = pool.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE") })
-	if _, err := pool.Exec(ctx, audit.MigrationSQL(schema)); err != nil {
-		t.Fatal(err)
-	}
+	pool := dbtest.Pool(t)
+	schema := dbtest.Schema(t, pool, "audit_t", audit.MigrationSQL)
 
 	rec := audit.NewRecorder(pool, schema)
 	transactor := pgtx.New(pool)
 
 	// 提交路径：审计随事务可见。
-	err = transactor.Do(ctx, func(ctx context.Context) error {
+	err := transactor.Do(ctx, func(ctx context.Context) error {
 		return rec.Record(ctx, audit.Entry{
 			Actor: "user-1", Action: "entry.post", Entity: "ledger_entry", EntityID: "e-1",
 			Before: nil, After: map[string]any{"amount": "10.50"}, Meta: map[string]string{"ip": "127.0.0.1"},
