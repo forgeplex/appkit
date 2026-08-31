@@ -86,6 +86,9 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
   **禁止 require 其他业务域仓库**（appkit check 会拦）；事务内跨域调用
   会得到 TX_BOUNDARY 错误——一致性走事件，不走共享事务；
 - **写接口幂等**：套 `idem.Middleware`，客户端带 `Idempotency-Key` 头；
+  金额入站走 `money.ParseCanonical` 的域，把同款规范化口径接进
+  `idem.WithCanonicalizer`（否则 "80"/"80.00" 的重试撞 422）；多租户/多账本
+  用 `idem.WithKeyScope` 隔离键空间，别手拼前缀；
 - **后台任务**：`reg.Worker(name, run)`，**禁止自己 `go func()`**——框架负责
   起协程、关停等待、异常退出上报，手写的那三件事每次都会漏一件；
 - **周期任务**：`reg.Worker(name, job.Every(pool, job.Task{Name: "{{.Name}}.xxx",

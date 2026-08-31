@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/money"
 )
 
 // ---- 不需要 Postgres 的单测 ----
@@ -206,6 +207,67 @@ func TestOversizeRequestBodyReturns413(t *testing.T) {
 	}
 	if runs.Load() != 0 {
 		t.Fatalf("超限请求不应执行 handler，执行次数 = %d", runs.Load())
+	}
+}
+
+// TestInjectedErrorRejectsBeforeClaim 验证注入函数（规范化/作用域）报错时
+// 请求在 claim 之前被拒：*apperr.Error 原样透传，裸错误包成 400。
+// pool 为 nil，若中间件碰数据库即 panic 失败，证明没有留下任何 claim。
+func TestInjectedErrorRejectsBeforeClaim(t *testing.T) {
+	t.Parallel()
+	apperrErr := apperr.New(apperr.CodeInvalidArgument, http.StatusUnprocessableEntity, "amount 不是规范形态")
+	tests := []struct {
+		name       string
+		mw         func(http.Handler) http.Handler
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name: "规范化apperr透传",
+			mw: Middleware(NewStore(nil, "s"), slog.New(slog.DiscardHandler),
+				WithCanonicalizer(func(_ *http.Request, _ []byte) ([]byte, error) {
+					return nil, apperrErr
+				})),
+			wantStatus: http.StatusUnprocessableEntity,
+			wantCode:   apperr.CodeInvalidArgument,
+		},
+		{
+			name: "规范化裸错误包400",
+			mw: Middleware(NewStore(nil, "s"), slog.New(slog.DiscardHandler),
+				WithCanonicalizer(func(_ *http.Request, _ []byte) ([]byte, error) {
+					return nil, errors.New("boom")
+				})),
+			wantStatus: http.StatusBadRequest,
+			wantCode:   apperr.CodeInvalidArgument,
+		},
+		{
+			name: "作用域裸错误包400",
+			mw: Middleware(NewStore(nil, "s"), slog.New(slog.DiscardHandler),
+				WithKeyScope(func(_ *http.Request, _ string) (string, error) {
+					return "", errors.New("no tenant")
+				})),
+			wantStatus: http.StatusBadRequest,
+			wantCode:   apperr.CodeInvalidArgument,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var runs atomic.Int32
+			h := tc.mw(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+				runs.Add(1)
+			}))
+			rec := doReq(t, h, http.MethodPost, "/pay", "k", `{"amount":1}`)
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.wantStatus)
+			}
+			if p := decodeProblem(t, rec.Body); p.Code != tc.wantCode {
+				t.Fatalf("problem code = %q, want %q", p.Code, tc.wantCode)
+			}
+			if runs.Load() != 0 {
+				t.Fatalf("注入函数报错不应执行 handler，执行次数 = %d", runs.Load())
+			}
+		})
 	}
 }
 
@@ -679,5 +741,147 @@ func TestReplayRestoresFullHeaders(t *testing.T) {
 	}
 	if replay.Body.String() != first.Body.String() {
 		t.Fatalf("回放 body = %q, want %q", replay.Body.String(), first.Body.String())
+	}
+}
+
+// TestCanonicalizerEquiformReplay 是注入规范化口径的主断言：默认指纹对原始
+// 字节敏感（"80" 与 "80.00" 是两个 hash，重试 422）；领域把 ParseCanonical
+// 的口径接进 WithCanonicalizer 后，等值形态的重试走回放，异值仍 422，
+// 非规范形态在 claim 之前被拒。
+func TestCanonicalizerEquiformReplay(t *testing.T) {
+	_, store := testStore(t)
+	canonicalAmount := func(_ *http.Request, body []byte) ([]byte, error) {
+		var req struct {
+			Amount string `json:"amount"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			return nil, apperr.New(apperr.CodeInvalidArgument, http.StatusBadRequest,
+				"body 不是 JSON").WithCause(err)
+		}
+		m, err := money.ParseCanonical(req.Amount, "USD")
+		if err != nil {
+			return nil, err
+		}
+		// decimal.String() 去尾零：等值只有一种字节形态（"80"/"80.00" → "80"）。
+		return []byte(m.Amount().String()), nil
+	}
+	var runs atomic.Int32
+	h := Middleware(store, slog.New(slog.DiscardHandler), WithCanonicalizer(canonicalAmount))(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			runs.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte("paid"))
+		}))
+
+	first := doReq(t, h, http.MethodPost, "/pay", "pay-1", `{"amount":"80"}`)
+	if first.Code != http.StatusCreated || first.Header().Get(HeaderReplayed) != "" {
+		t.Fatalf("首次执行 = %d replayed=%q, want 201 且非回放",
+			first.Code, first.Header().Get(HeaderReplayed))
+	}
+
+	// 同键重试：等值形态 + 空白差异 → 回放，不再执行。
+	for i, body := range []string{`{"amount":"80.00"}`, "{ \"amount\": \"80\" }"} {
+		replay := doReq(t, h, http.MethodPost, "/pay", "pay-1", body)
+		if runs.Load() != 1 {
+			t.Fatalf("第 %d 次等值重试不应再执行 handler，执行次数 = %d", i+2, runs.Load())
+		}
+		if replay.Code != http.StatusCreated || replay.Body.String() != "paid" ||
+			replay.Header().Get(HeaderReplayed) != "true" {
+			t.Fatalf("第 %d 次等值重试 = %d %q replayed=%q, want 201 paid replayed=true",
+				i+2, replay.Code, replay.Body.String(), replay.Header().Get(HeaderReplayed))
+		}
+	}
+
+	// 同键异值仍是 422：规范化统一的是形态，不是值。
+	if rec := doReq(t, h, http.MethodPost, "/pay", "pay-1", `{"amount":"81"}`); rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("异值重试 status = %d, want 422", rec.Code)
+	}
+
+	// 非规范形态在 claim 之前被拒（ParseCanonical 的 apperr 原样透传），
+	// 不影响已完成的记录，也不留新 claim。
+	rec := doReq(t, h, http.MethodPost, "/pay", "pay-1", `{"amount":"+80"}`)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("非规范金额 status = %d, want 422", rec.Code)
+	}
+	if p := decodeProblem(t, rec.Body); p.Code != money.CodeInvalidAmount {
+		t.Fatalf("problem code = %q, want %q", p.Code, money.CodeInvalidAmount)
+	}
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("全程只应执行一次 handler，执行次数 = %d", got)
+	}
+}
+
+// TestKeyScopeIsolatesKeySpace 验证作用域键的三个关键行为：跨作用域同名键
+// 互不冲突也不可探测（各自真实执行）、同作用域正常回放、空作用域退化为裸键。
+func TestKeyScopeIsolatesKeySpace(t *testing.T) {
+	_, store := testStore(t)
+	var runs atomic.Int32
+	h := Middleware(store, slog.New(slog.DiscardHandler),
+		WithKeyScope(func(r *http.Request, _ string) (string, error) {
+			return r.Header.Get("X-Tenant"), nil
+		}))(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			runs.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte("ok"))
+		}))
+
+	do := func(tenant string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/pay", strings.NewReader(`{"amount":1}`))
+		req.Header.Set(HeaderKey, "shared-key")
+		if tenant != "" {
+			req.Header.Set("X-Tenant", tenant)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if a := do("acme"); a.Code != http.StatusCreated || a.Header().Get(HeaderReplayed) != "" {
+		t.Fatalf("acme 首次 = %d replayed=%q, want 201 非回放", a.Code, a.Header().Get(HeaderReplayed))
+	}
+	// beta 用同名键：不是 409/422，是真实执行——作用域隔离了键空间。
+	if b := do("beta"); b.Code != http.StatusCreated || b.Header().Get(HeaderReplayed) != "" {
+		t.Fatalf("beta 同名键 = %d replayed=%q, want 201 非回放（跨作用域不冲突）",
+			b.Code, b.Header().Get(HeaderReplayed))
+	}
+	if got := runs.Load(); got != 2 {
+		t.Fatalf("跨作用域应各执行一次，执行次数 = %d", got)
+	}
+	// acme 再来：同作用域正常回放。
+	if a := do("acme"); a.Code != http.StatusCreated || a.Header().Get(HeaderReplayed) != "true" {
+		t.Fatalf("acme 重试 = %d replayed=%q, want 201 回放", a.Code, a.Header().Get(HeaderReplayed))
+	}
+	if got := runs.Load(); got != 2 {
+		t.Fatalf("同作用域重试不应再执行，执行次数 = %d", got)
+	}
+
+	// 存储键形如 scope\x1fkey，裸键不出现；空作用域退化为裸键。
+	if _, found := rowState(t, store, "acme"+keyScopeSep+"shared-key"); !found {
+		t.Fatalf("acme 的记录应存于作用域键 acme%sshared-key", keyScopeSep)
+	}
+	if _, found := rowState(t, store, "shared-key"); found {
+		t.Fatal("裸键不应有记录（有作用域的请求都应带作用域存储）")
+	}
+	if c := do(""); c.Code != http.StatusCreated || c.Header().Get(HeaderReplayed) != "" {
+		t.Fatalf("空作用域 = %d replayed=%q, want 201 非回放（退化为裸键）",
+			c.Code, c.Header().Get(HeaderReplayed))
+	}
+	if state, found := rowState(t, store, "shared-key"); !found || state != StateCompleted {
+		t.Fatalf("空作用域记录 = %q（found=%v）, want completed", state, found)
+	}
+
+	// 键里夹控制字节：作用域模式下直接拒绝——那是分隔符不可伪造的前提，
+	// 也是 Postgres text 安全区的一部分。
+	ctrlReq := httptest.NewRequest(http.MethodPost, "/pay", strings.NewReader(`{}`))
+	ctrlReq.Header.Set(HeaderKey, "bad\x01key")
+	ctrlReq.Header.Set("X-Tenant", "acme")
+	ctrlRec := httptest.NewRecorder()
+	h.ServeHTTP(ctrlRec, ctrlReq)
+	if ctrlRec.Code != http.StatusBadRequest {
+		t.Fatalf("含控制字节的键 status = %d, want 400", ctrlRec.Code)
+	}
+	if p := decodeProblem(t, ctrlRec.Body); p.Code != apperr.CodeInvalidArgument {
+		t.Fatalf("problem code = %q, want %q", p.Code, apperr.CodeInvalidArgument)
 	}
 }

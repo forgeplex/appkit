@@ -6,6 +6,9 @@
 // 留下的 in_progress 记录超过 TTL 后允许被接管重试；接管会更换记录的 owner_token
 // 作 fencing——原持有者迟到的 Complete/Release 会被拒绝，不会覆盖接管者。
 // 业务表的 UNIQUE 约束是最后一道兜底（见 docs/DESIGN.md §6）。
+//
+// 默认指纹绑定原始字节；领域有规范化口径时经 WithCanonicalizer 注入，多租户/
+// 多账本的键空间隔离经 WithKeyScope 注入——都是加法，默认行为不变。
 package idem
 
 import (
@@ -233,18 +236,104 @@ var (
 		"同一 Idempotency-Key 的请求正在处理中")
 	errBodyTooLarge = apperr.New(apperr.CodeInvalidArgument, http.StatusRequestEntityTooLarge,
 		"请求体超过幂等中间件允许的上限")
+	errKeyPartInvalid = apperr.New(apperr.CodeInvalidArgument, http.StatusBadRequest,
+		"幂等键或作用域含控制字符（HTTP 头值不允许，RFC 7230）")
 )
 
 // Option 调整 Middleware 的行为。
 type Option func(*mwConfig)
 
+// mwConfig 经导出的 Option 签名泄漏进 API 面，字段类型受 apidiff 约束：
+// 函数不可比较，平铺进来会把整个结构变成不可比较类型（相对存量 tag 即
+// incompatible），所以注入函数收在指针后面的 injectedOptions 里。
 type mwConfig struct {
 	maxRequestBytes int64
+	injected        *injectedOptions
+}
+
+type injectedOptions struct {
+	canonicalizer Canonicalizer
+	keyScope      KeyScope
 }
 
 // WithMaxRequestBytes 调整带幂等键请求的请求体上限（默认 DefaultMaxRequestBytes）。
 func WithMaxRequestBytes(n int64) Option {
 	return func(c *mwConfig) { c.maxRequestBytes = n }
+}
+
+// Canonicalizer 把请求体规范化为幂等指纹的输入材料。默认恒等（原始字节），
+// 因而对字节敏感：客户端重试时重新序列化（金额 "80" 变 "80.00"、字段顺序或
+// 空白变化），同键会被判为异 payload 而 422。领域已有规范化口径时（入站 DTO
+// 走 money.ParseCanonical）把它接到这里，等值形态的重试即可拿到回放。
+//
+// 返回值由中间件与 method、path 一起过 sha256（分隔符防歧义拼接，见
+// payloadHash），实现方不必自己造哈希纪律，只须保证：等值请求得到相同字节。
+// 返回错误即在 claim 之前拒绝请求（*apperr.Error 原样透传，其余按 400 包装），
+// 不留悬挂的 in_progress 记录。求值时 r.Body 已回填为完整请求体，可再读。
+type Canonicalizer func(r *http.Request, body []byte) ([]byte, error)
+
+// WithCanonicalizer 替换指纹的规范化口径（默认恒等）。
+//
+// 换口径是单向门：存量记录的 payload_hash 全部失配，而 completed 记录不过期，
+// 旧键会持续 422 直到客户端换键。只在接入时选一次，别来回换。
+func WithCanonicalizer(fn Canonicalizer) Option {
+	return func(c *mwConfig) { c.inject().canonicalizer = fn }
+}
+
+// KeyScope 从请求解析幂等键的作用域（租户、账本、机构……），返回 "" 表示
+// 本请求不设作用域、键原样使用。在 body 读取之前求值——fn 里读 r.Body 是
+// 错的（那时还没读）。返回错误即在 claim 之前拒绝请求（透传规则同
+// Canonicalizer）。
+type KeyScope func(r *http.Request, key string) (string, error)
+
+// keyScopeSep 是作用域与键的分隔符：ASCII unit separator（0x1f）。
+// 不用 ":"——键来自请求头、作用域常来自路径或业务标识，两边都可能含 ":"；
+// 不用 NUL——Postgres 的 text 类型容不下 0x00。0x1f 在 RFC 7230 的头值里
+// 非法，配置了作用域的中间件会拒绝含控制字节的键与作用域（见 validKeyPart），
+// 于是两边谁都拼不出这个分隔符，跨作用域碰撞不存在。
+const keyScopeSep = "\x1f"
+
+// WithKeyScope 给幂等键加作用域：实际存储键为 scope + 0x1f + 原键。
+// 作用域之间键空间互不可见——不同租户的同名键不再是假冲突，也不能靠
+// 回放/409 的响应差异探测别的作用域是否用过某键。比手拼 "{tenant}:"
+// 前缀多出的这点确定性（前缀可拼造碰撞），就是这个选项存在的理由。
+func WithKeyScope(fn KeyScope) Option {
+	return func(c *mwConfig) { c.inject().keyScope = fn }
+}
+
+// inject 惰性建 injectedOptions，让 Option 不依赖构造顺序。
+func (c *mwConfig) inject() *injectedOptions {
+	if c.injected == nil {
+		c.injected = &injectedOptions{}
+	}
+	return c.injected
+}
+
+// validKeyPart 报告键或作用域可安全参与拼接：不含控制字节与 DEL。
+// 这是作用域分隔符不可伪造性的来源，也是 Postgres text 的安全区。
+func validKeyPart(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// identityCanonicalizer 是默认口径：原始字节，不加不减。
+var identityCanonicalizer Canonicalizer = func(_ *http.Request, body []byte) ([]byte, error) {
+	return body, nil
+}
+
+// rejectInjectedErr 把注入函数（规范化/作用域）的错误写为 problem 响应：
+// *apperr.Error 原样透传（实现方可自定状态码），其余按 400 包一层。
+func rejectInjectedErr(w http.ResponseWriter, err error, message string) {
+	if ae, ok := errors.AsType[*apperr.Error](err); ok {
+		apperr.WriteProblem(w, ae)
+		return
+	}
+	apperr.WriteProblem(w, apperr.New(apperr.CodeInvalidArgument,
+		http.StatusBadRequest, message).WithCause(err))
 }
 
 // nonReplayableHeader 报告响应头是否不落库回放：hop-by-hop 头随连接而非
@@ -264,7 +353,10 @@ var nonReplayableHeader = map[string]bool{
 // Middleware 返回幂等中间件，置于 Recover 之内、业务 handler 之外
 // （DESIGN §6 的链位）。无 Idempotency-Key 头的请求直接放行。
 func Middleware(store *Store, log *slog.Logger, opts ...Option) func(http.Handler) http.Handler {
-	cfg := mwConfig{maxRequestBytes: DefaultMaxRequestBytes}
+	cfg := mwConfig{
+		maxRequestBytes: DefaultMaxRequestBytes,
+		injected:        &injectedOptions{canonicalizer: identityCanonicalizer},
+	}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -274,6 +366,27 @@ func Middleware(store *Store, log *slog.Logger, opts ...Option) func(http.Handle
 			if key == "" {
 				next.ServeHTTP(w, r)
 				return
+			}
+
+			// 作用域在 body 读取之前求值（见 KeyScope）。键与作用域先过
+			// 控制字节校验（分隔符不可伪造的前提），错误在 claim 之前拒绝。
+			if inj := cfg.injected; inj != nil && inj.keyScope != nil {
+				if !validKeyPart(key) {
+					apperr.WriteProblem(w, errKeyPartInvalid)
+					return
+				}
+				scope, err := inj.keyScope(r, key)
+				if err != nil {
+					rejectInjectedErr(w, err, "幂等键作用域解析失败")
+					return
+				}
+				if scope != "" {
+					if !validKeyPart(scope) {
+						apperr.WriteProblem(w, errKeyPartInvalid)
+						return
+					}
+					key = scope + keyScopeSep + key
+				}
 			}
 
 			// 指纹计算必须整读 body，上限防止恶意大 body 耗尽内存。
@@ -290,7 +403,12 @@ func Middleware(store *Store, log *slog.Logger, opts ...Option) func(http.Handle
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
-			hash := payloadHash(r.Method, r.URL.Path, body)
+			canonical, err := cfg.injected.canonicalizer(r, body)
+			if err != nil {
+				rejectInjectedErr(w, err, "请求体规范化失败")
+				return
+			}
+			hash := payloadHash(r.Method, r.URL.Path, canonical)
 
 			claimed, token, existing, err := store.Claim(r.Context(), key, hash)
 			if err != nil {

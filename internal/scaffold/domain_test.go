@@ -170,6 +170,9 @@ func TestDomainScaffold(t *testing.T) {
 			// db/schema/，代理就会继续在脑子里重放整条迁移历史（并且重放错）。
 			"db/schema/", "make schema", "COMMENT ON TABLE",
 			"MIGRATION_DRIFT", "make migrate", "apptest.Conform",
+			// 幂等的两个注入口：不写进规程，代理就只会裸套中间件，
+			// "80"/"80.00" 的重试撞 422、多租户手拼前缀这些问题一个都躲不掉。
+			"idem.WithCanonicalizer", "idem.WithKeyScope",
 			"make lint")
 		// 规程里不许出现假的强制力：appkit-lint 已接进 make lint 与 CI，
 		// 规程就不许再说"没有机检"（反向同样成立——哪天机检撤了，这句

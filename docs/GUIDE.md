@@ -214,6 +214,40 @@ idemMW := idem.Middleware(idem.NewStore(m.opts.Pool, Schema), m.opts.Log)
 reg.Mount("POST /identity/users", idemMW(usersHandler))
 ```
 
+默认指纹绑定原始字节：客户端重试时若重新序列化（金额 "80" 变 "80.00"、字段
+顺序或空白变化），同键会被判为异 payload 而 422。入站 DTO 已走
+`money.ParseCanonical` 的域，把同款口径接进中间件层，等值形态的重试就能拿到
+回放；多租户/多账本再用作用域键隔离键空间（别手拼 `{tenant}:` 前缀——前缀
+是可拼造出碰撞的）：
+
+```go
+idemMW := idem.Middleware(idem.NewStore(m.opts.Pool, Schema), m.opts.Log,
+	idem.WithCanonicalizer(func(r *http.Request, body []byte) ([]byte, error) {
+		var req struct {
+			Amount string `json:"amount"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			return nil, apperr.New(apperr.CodeInvalidArgument, http.StatusBadRequest,
+				"body 不是 JSON").WithCause(err)
+		}
+		m, err := money.ParseCanonical(req.Amount, "USD")
+		if err != nil {
+			return nil, err // 非规范金额在 claim 之前拒绝，不留悬挂的 in_progress
+		}
+		return []byte(m.Amount().String()), nil // "80"/"80.00" 都是 "80"
+	}),
+	idem.WithKeyScope(func(r *http.Request, _ string) (string, error) {
+		return tenantFromRequest(r), nil // 从鉴权材料取，别信请求头自报的租户
+	}),
+)
+```
+
+哈希纪律（method/path 绑定、分隔符防歧义拼接）留在框架里，实现方只须保证
+「等值请求 → 相同字节」。换规范化口径是单向门：存量记录的 payload_hash 全部
+失配、completed 又不过期，旧键会持续 422 到客户端换键为止——接入时选一次，
+别来回换。作用域模式下键与作用域含控制字节会被 400 拒绝（RFC 7230 头值
+本就不允许），这是分隔符不可伪造的前提。
+
 敏感变更再加 `audit.Recorder`（与业务写同事务）；金额存储/运算用
 `decimal.Decimal`（sqlc 脚手架已全局 override NUMERIC），需要"币种+金额"
 绑定时用领域层的 `money.Money`（不落库，币种另列存），JSON 边界一律字符串。

@@ -383,6 +383,14 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   批内保序尽力而为，跨批/退避后不保证全局序。
 - **幂等 claim 带 fencing token**：TTL 接管后旧持有者的 Complete/Release 必然失败，
   不存在双写窗口；TTL 必须大于 handler 最长执行时间。
+- **幂等指纹与键作用域可注入**（`idem.WithCanonicalizer` / `idem.WithKeyScope`，
+  纯新增选项，默认行为不变）：默认指纹绑定原始字节，金额 "80" 与 "80.00"
+  的重试会被判异 payload 而 422——入站 DTO 走 `money.ParseCanonical` 的域把
+  同款口径接进中间件后，等值形态重试即回放，中间件层与业务层两套指纹不再
+  各算各的。多租户/多账本用作用域键隔离键空间：存储键 = scope + 0x1f + key，
+  键与作用域先过控制字节校验，跨作用域碰撞不可拼造（手拼 `{tenant}:` 前缀
+  做不到这点）。换规范化口径是单向门：存量 payload_hash 全部失配而 completed
+  记录不过期，旧键持续 422 到客户端换键为止。
 - **Bus 可插拔**：单体单库用 directbus（relay 直投各域 inbox，无 broker）；
   拆分部署切 NATS/Kafka——同一 Bus 接口，部署形态切换不改业务代码。
   模块经 `reg.Consumer(topic, handler)` 声明消费（handler 用 outbox.Inbox 包去重），
