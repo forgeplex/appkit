@@ -3,7 +3,7 @@
 
 GO ?= go
 
-.PHONY: check fmt vet build test test-db test-lint test-rules all
+.PHONY: check fmt vet build test test-db test-lint test-rules changelog all
 
 # 完成的定义（AGENTS.md）：这条全绿，且动了公开 API 时 apidiff 相对最新 tag 零 incompatible。
 check: fmt vet build test
@@ -42,5 +42,17 @@ test-lint:
 # 慢（要拉两个检查器）且需要网络，故 opt-in；CI 每次都跑。
 test-rules:
 	APPKIT_RULES_E2E=1 $(GO) test -count=1 -v -run TestMaterializedRules ./internal/scaffold/
+
+# 重生成 CHANGELOG.md：内容 = 各版本 annotated tag message 的镜像，按版本倒序。
+# tag 是事实源，本文件禁手改——发版三件套之一（顺序见 AGENTS.md「发版」：
+# 打 tag → make changelog 并提交 → gh release create）。
+changelog:
+	@{ echo '# Changelog'; echo; \
+	   echo '按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。'; echo; \
+	   for t in $$(git tag --sort=-v:refname); do \
+	     echo "## $$t（$$(git log -1 --format=%cs $$t^{})）"; echo; \
+	     git cat-file tag $$t | sed '1,/^$$/d'; echo; \
+	   done; \
+	 } > CHANGELOG.md
 
 all: check test-lint test-rules

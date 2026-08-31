@@ -50,3 +50,19 @@ go run ./cmd/appkit new domain t -dir /tmp/t   # 改脚手架后：生成物可�
 ```
 
 完成的定义：上述全绿 + 若动了公开 API，apidiff 相对最新 tag 零 incompatible。
+
+## 发版
+
+版本更新说明的事实源是 **annotated tag message**——正文要写清这一版干了
+什么、为什么；CHANGELOG.md 与 GitHub Releases 都是它的镜像。三件套顺序固定：
+
+```sh
+git tag -a vX.Y.Z -F /tmp/msg            # 1. tag：正文即事实源
+make changelog && git add CHANGELOG.md   # 2. 重生成镜像（禁手改）并提交
+gh release create vX.Y.Z --verify-tag \
+  --title vX.Y.Z --notes-file /tmp/msg   # 3. Release 正文 = tag message
+git push origin main vX.Y.Z
+```
+
+版本号走 SemVer：新增能力 minor，纯修 bug patch；apidiff 门禁保证向后
+兼容，正常不会出现需要 major 的破坏性变更。

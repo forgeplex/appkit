@@ -748,7 +748,9 @@ go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@v0.4.0 -moneyfloat.scope
 本地联调用 go.work（不提交）；跨仓库正式依赖靠 tag：改了合约仓库 → 打 tag →
 域仓库升 require → 域仓库打 tag → 组合仓库升 require。appkit 自 v0.1.0 起
 按 SemVer 发版（CI 有 apidiff 门禁保证向后兼容），域仓库直接 require 版本即可；
-`appkit dev` 只在联调本地未发布改动时需要。
+`appkit dev` 只在联调本地未发布改动时需要。每个版本的更新说明见
+[../CHANGELOG.md](../CHANGELOG.md) 与
+[GitHub Releases](https://github.com/forgeplex/appkit/releases)。
 
 **Q：想让 AI agent 参与开发？**
 `appkit new` 生成的每个仓库自带 `AGENTS.md`（+`CLAUDE.md` 引用）：仓库地图、
