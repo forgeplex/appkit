@@ -69,6 +69,7 @@ var rePath = regexp.MustCompile(`^/[a-zA-Z0-9/_-]*[a-zA-Z0-9_-]$`)
 //	wrap.gen.go     进程内 wrapper（复用 Wrap 链路，扫刚写出的 service.gen.go）
 //	client.gen.go   远程 client：同一接口，contract.Call + 幂等有界重试
 //	server.gen.go   HTTP 暴露：与 client 互为镜像的编解码
+//	openapi.yaml    派生导出（文档 / oasdiff 门禁；非事实源）
 //
 // 方法 HTTP 形态唯一：POST + JSON body，错误一律 problem+json——
 // 契约调用是 RPC 语义，client/server 两侧的编解码因此只有一份约定。
@@ -95,6 +96,9 @@ func Contract(inPath, outDir string) error {
 	}
 	if err := writeGo(filepath.Join(outDir, "server.gen.go"), renderServer(doc)); err != nil {
 		return err
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "openapi.yaml"), renderOpenAPI(doc), 0o644); err != nil {
+		return fmt.Errorf("写出 openapi.yaml: %w", err)
 	}
 	return nil
 }

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	yaml "go.yaml.in/yaml/v3"
 )
 
 // genContract 把 yaml 写进临时目录并跑 Contract 生成器，返回错误。
@@ -103,6 +105,54 @@ func TestContractGeneratedShape(t *testing.T) {
 	} {
 		if !strings.Contains(string(got), want) {
 			t.Errorf("service.gen.go 缺少 %q", want)
+		}
+	}
+}
+
+// TestContractOpenAPIValid 派生的 openapi.yaml 必须是合法 yaml，
+// 且每个方法在 paths 与 components 里都齐（oasdiff 门禁的输入不能是残的）。
+func TestContractOpenAPIValid(t *testing.T) {
+	dir := t.TempDir()
+	if err := Contract("testdata/contract.yaml", dir); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "openapi.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		OpenAPI string `yaml:"openapi"`
+		Paths   map[string]struct {
+			Post struct {
+				OperationID string `yaml:"operationId"`
+				XIdempotent bool   `yaml:"x-idempotent"`
+			} `yaml:"post"`
+		} `yaml:"paths"`
+		Components struct {
+			Schemas map[string]any `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("openapi.yaml 不是合法 yaml: %v", err)
+	}
+	if doc.OpenAPI != "3.1.0" {
+		t.Errorf("openapi = %q", doc.OpenAPI)
+	}
+	for path, want := range map[string]string{"/greet": "Greet", "/stats": "Stats", "/reset": "Reset", "/ping": "Ping", "/search": "Search"} {
+		got, ok := doc.Paths[path]
+		if !ok || got.Post.OperationID != want {
+			t.Errorf("paths[%q].post.operationId = %q，期望 %q", path, got.Post.OperationID, want)
+		}
+	}
+	if !doc.Paths["/greet"].Post.XIdempotent {
+		t.Error("/greet 缺 x-idempotent")
+	}
+	if doc.Paths["/reset"].Post.XIdempotent {
+		t.Error("/reset 不应标 x-idempotent")
+	}
+	for _, schema := range []string{"Entry", "GreetRequest", "GreetReply", "StatsReply", "ResetRequest", "SearchRequest", "SearchReply", "Problem"} {
+		if _, ok := doc.Components.Schemas[schema]; !ok {
+			t.Errorf("components.schemas 缺 %s", schema)
 		}
 	}
 }
