@@ -2,6 +2,28 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.5.5（2026-09-02）
+
+分区域域 CI 解锁
+
+为什么：rbac 是第一个分区域域（partitioned: true），它的 CI 首跑暴露了
+共享 workflow（domain-ci.yml，经 @main 被全部域仓复用）里的两个死锁——
+单 schema 域从未踩到，分区域域踩上就是永红，且域仓库侧无解。
+
+这一版修了什么：
+
+- `appkit schema -check` 对分区域域改为 ::notice 后退出 0。schema 文档
+  对分区域域是「永远不可能启用」（没有单一 schema 可画），共享 CI 步骤
+  对它硬失败等于让所有分区域域 CI 永红；与「未启用」同等处理。非 -check
+  路径行为不变：明确拒绝并指向 introspect。
+- domain-ci.yml 统一解析 APPKIT_TOOL（域仓 go.mod 钉的 appkit 版本，
+  go.work 联调退 @main），四处 go run appkit 工具（check / sync --check /
+  schema -check / appkit-lint）全部钉 @版本。不带版本会用域仓的 go.sum
+  编译 appkit cmd，而 go mod tidy 会剥掉域仓 import 图之外的 sums——
+  「appkit check 能跑」与「go.mod 整洁检查」两头必红一头。
+
+影响面：分区域域 CI 从永红变可绿；单 schema 域行为不变。
+
 ## v0.5.4（2026-09-02）
 
 真实客户端 IP 边缘解析 + MIT License
