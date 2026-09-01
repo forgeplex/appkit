@@ -770,6 +770,43 @@ apptest.Conform(t,
 它是 struct 的具名字段而不是 map，所以业务代码没法自己往里塞东西（那等于把防火墙拆了）。
 要读当前值：`callctx.From(ctx)`。
 
+### 附：取真实客户端 IP
+
+限流、风控、审计、GeoIP 都要「真实客户端 IP」，而它是个安全问题而不只是
+方便问题：转发头（`X-Forwarded-For` 等）是调用方可以随便写的，只有请求
+确实来自你信任的代理时才可信。所以解析必须集中做一次，不能每个模块
+各自看头。组合根在 `Base` 链后追加 `httpserver.ClientIP`，声明可信代理网段：
+
+```go
+appkit.New(modules,
+    // ...其余 Option
+    appkit.Middleware(append(httpserver.Base(log),
+        httpserver.ClientIP(trusted...))...),
+)
+```
+
+`trusted` 是 `[]netip.Prefix`（如 `10.0.0.0/8`，负载均衡与内部服务网段），
+由组合根从配置解析——框架不暗读配置。解析规则：
+
+- 对端**不在**可信网段：直接用 TCP 对端地址，一切转发头不信；
+- 对端**在**可信网段：依次信 `X-Client-IP`（可信代理或内部跳写入的原始
+  IP）、`X-Forwarded-For` 从右往左第一个不可信地址——伪造的注入永远在最左，
+  走不到答案；
+- 零个可信网段 = 永远用对端地址（安全默认，直连部署直接可用）。
+
+模块内任意深度读取：
+
+```go
+if ip := callctx.ClientIP(ctx); ip.IsValid() {
+    // ip 是 netip.Addr
+}
+```
+
+它与 `callctx.Meta` 是两套存储：client IP 刻意**不进跨边界白名单**——防火墙
+会剥掉它。下游域看到的「对端 IP」是上一跳的地址，语义与「原始客户端 IP」
+不同；真有跨边界需求（审计要把起点 IP 带进异步事件）时，业务自行写入
+`Event.Meta` 即可。
+
 ## 9. 第八步：CI 与约束收口
 
 每个域仓库的 `.github/workflows/ci.yml`（`appkit sync` 生成）只有一行引用：

@@ -7,7 +7,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -186,6 +188,103 @@ func OTel() func(http.Handler) http.Handler {
 				}
 			}))
 	}
+}
+
+// ClientIP 在链上解析一次真实客户端 IP 存进 ctx（callctx.ClientIP 读取），
+// 之后模块任意深度可取、不可重算——信任决策只发生在这里。
+//
+// trusted 是可信代理网段（如负载均衡、内部服务网段）：
+//   - 对端不在可信网段：直接用 TCP 对端地址，请求头一律不信——
+//     转发头是调用方可以随便写的，信了等于把限流、风控、审计的
+//     IP 全部交给伪造方；
+//   - 对端在可信网段：依次信 X-Client-IP（可信代理或内部跳写入的
+//     原始客户端 IP）、X-Forwarded-For 从右往左第一个不可信地址
+//     （可信代理逐跳追加，最右是最近的跳；伪造的注入永远在最左，
+//     走不到答案）；全链可信时取最左（起点本身是可信代理）。
+//
+// 零个可信网段 = 永远用 TCP 对端地址，是安全默认：直连部署直接可用，
+// 前面有代理时组合根把网段配上（配置解析与校验留在组合根，启动期失败）。
+//
+// 建议放在 Base 链之后挂（appkit.Middleware 里追加），任何需要 IP 的
+// 中间件与 handler 之前。
+func ClientIP(trusted ...netip.Prefix) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if ip, ok := resolveClientIP(r, trusted); ok {
+				r = r.WithContext(callctx.WithClientIP(r.Context(), ip))
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// headerClientIP 是可信代理/内部跳写入原始客户端 IP 的约定头。框架自身
+// 不产生它；多进程部署的组合根可用自己的出站中间件设置，让下游进程的
+// 本中间件接力。
+const headerClientIP = "X-Client-IP"
+
+func resolveClientIP(r *http.Request, trusted []netip.Prefix) (netip.Addr, bool) {
+	peer, ok := peerAddr(r.RemoteAddr)
+	if !ok {
+		return netip.Addr{}, false
+	}
+	if !containsAddr(trusted, peer) {
+		return peer, true
+	}
+	if h := r.Header.Get(headerClientIP); h != "" {
+		if ip, err := netip.ParseAddr(strings.TrimSpace(h)); err == nil {
+			return ip, true
+		}
+	}
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if ip, ok := xffClient(xff, trusted); ok {
+			return ip, true
+		}
+	}
+	// 可信代理本机发起、或没带可解析的转发头：对端就是它自己。
+	return peer, true
+}
+
+// xffClient 从右往左走 X-Forwarded-For：第一个不可信地址即客户端。
+// 途中遇到不可解析的条目即停——它右侧都是可信代理追加的，继续往左
+// 只会走进可被注入的区段。结果回退链：全链可信取最左（起点是可信
+// 代理）；一个都解析不出由调用方兜底。
+func xffClient(xff string, trusted []netip.Prefix) (netip.Addr, bool) {
+	parts := strings.Split(xff, ",")
+	leftmost := netip.Addr{}
+	for i := len(parts) - 1; i >= 0; i-- {
+		ip, err := netip.ParseAddr(strings.TrimSpace(parts[i]))
+		if err != nil {
+			break
+		}
+		leftmost = ip
+		if !containsAddr(trusted, ip) {
+			return ip, true
+		}
+	}
+	return leftmost, leftmost.IsValid()
+}
+
+// peerAddr 解析 RemoteAddr（host:port 形态，IPv6 带方括号）。
+func peerAddr(remote string) (netip.Addr, bool) {
+	host := remote
+	if h, _, err := net.SplitHostPort(remote); err == nil {
+		host = h
+	}
+	ip, err := netip.ParseAddr(strings.TrimSpace(host))
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return ip, true
+}
+
+func containsAddr(prefixes []netip.Prefix, ip netip.Addr) bool {
+	for _, p := range prefixes {
+		if p.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // WriteError 是服务端错误响应的统一出口：规范化为 apperr 后写 RFC 9457

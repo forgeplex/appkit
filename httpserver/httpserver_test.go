@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
 	"testing"
@@ -543,4 +544,128 @@ func TestBaseChain(t *testing.T) {
 			t.Fatalf("healthz 不应有访问日志, got %d 条", n)
 		}
 	})
+}
+
+// mustPrefix 解析 CIDR，测试数据写错当场炸。
+func mustPrefix(t *testing.T, cidr string) netip.Prefix {
+	t.Helper()
+	p, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		t.Fatalf("ParsePrefix(%q): %v", cidr, err)
+	}
+	return p
+}
+
+// TestClientIPMiddleware 锁住信任模型：只有对端本身在可信网段内才信
+// 转发头；伪造头永远拿不到答案。
+func TestClientIPMiddleware(t *testing.T) {
+	lb := mustPrefix(t, "10.0.0.0/8") // 负载均衡网段
+	mw := ClientIP(lb)
+
+	tests := []struct {
+		name    string
+		remote  string            // TCP 对端
+		headers map[string]string // 请求头
+		want    string            // 期望解析出的客户端 IP；空 = 零值
+	}{
+		{
+			name:   "直连不可信：忽略一切头用对端",
+			remote: "203.0.113.9:44444",
+			headers: map[string]string{
+				"X-Forwarded-For": "1.2.3.4",
+				"X-Client-IP":     "1.2.3.4",
+			},
+			want: "203.0.113.9",
+		},
+		{
+			name:   "可信代理后的 XFF 链",
+			remote: "10.0.0.5:39999",
+			headers: map[string]string{
+				// 客户端注入的伪造在最左，真实链在右：walk 从右到左，
+				// 第一个不可信地址是真实客户端。
+				"X-Forwarded-For": "6.6.6.6, 198.51.100.23, 10.0.0.9",
+			},
+			want: "198.51.100.23",
+		},
+		{
+			name:   "XFF 全链可信取最左",
+			remote: "10.0.0.5:39999",
+			headers: map[string]string{
+				"X-Forwarded-For": "10.0.0.20, 10.0.0.10",
+			},
+			want: "10.0.0.20",
+		},
+		{
+			name:   "X-Client-IP 优先于 XFF",
+			remote: "10.0.0.5:39999",
+			headers: map[string]string{
+				"X-Client-IP":     "198.51.100.77",
+				"X-Forwarded-For": "198.51.100.23",
+			},
+			want: "198.51.100.77",
+		},
+		{
+			name:   "可信代理没带有效头：用对端",
+			remote: "10.0.0.5:39999",
+			want:   "10.0.0.5",
+		},
+		{
+			name:   "XFF 最右不可解析：不往左走，用对端兜底",
+			remote: "10.0.0.5:39999",
+			headers: map[string]string{
+				"X-Forwarded-For": "1.2.3.4, not-an-ip",
+			},
+			want: "10.0.0.5",
+		},
+		{
+			name:   "IPv6 对端带方括号",
+			remote: "[2001:db8::1]:51234",
+			want:   "2001:db8::1",
+		},
+		{
+			name:   "RemoteAddr 解析不出：存零值",
+			remote: "",
+			want:   "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got netip.Addr
+			h := mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = callctx.ClientIP(r.Context())
+			}))
+			req := httptest.NewRequest(http.MethodGet, "/x", nil)
+			req.RemoteAddr = tt.remote
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+			h.ServeHTTP(httptest.NewRecorder(), req)
+
+			if tt.want == "" {
+				if got.IsValid() {
+					t.Fatalf("应存零值，得到 %v", got)
+				}
+				return
+			}
+			want := netip.MustParseAddr(tt.want)
+			if got != want {
+				t.Fatalf("got %v, want %v", got, want)
+			}
+		})
+	}
+}
+
+// TestClientIPDefaultTrustsPeer 零个可信网段的安全默认：永远用 TCP 对端。
+func TestClientIPDefaultTrustsPeer(t *testing.T) {
+	var got netip.Addr
+	h := ClientIP()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = callctx.ClientIP(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.RemoteAddr = "198.51.100.23:1000"
+	req.Header.Set("X-Forwarded-For", "6.6.6.6")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if want := netip.MustParseAddr("198.51.100.23"); got != want {
+		t.Fatalf("got %v, want %v", got, want)
+	}
 }
