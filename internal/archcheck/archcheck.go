@@ -34,6 +34,10 @@ type Config struct {
 	Module        string   `yaml:"module"`
 	Contracts     string   `yaml:"contracts"`
 	AllowRequires []string `yaml:"allowRequires"`
+	// Partitioned 标记分区域域（appkit new domain -partitioned）：一套代码、
+	// N 份数据分区，schema 由调用方经事务级 search_path 路由确定。该形态下
+	// SQL 的前缀规则翻转（见 CheckSQL），schema 文档暂不支持（appkit schema 明确报错）。
+	Partitioned bool `yaml:"partitioned"`
 }
 
 // Violation 是一条违规。File 为相对仓库根目录的斜杠路径；

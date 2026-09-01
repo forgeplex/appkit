@@ -2,11 +2,19 @@
 // pgx / sqlc 的包（DESIGN §4 约束 2）；业务决策不进本包。
 //
 // sqlc 工作流：
-//  1. 查询写进 db/queries/*.sql（表名带 "{{.Name}}." schema 前缀，
-//     跨 schema 引用会被 appkit check 拒绝）；
+//  1. 查询写进 db/queries/*.sql（{{- if .Partitioned}}表名不带 schema 前缀——
+//     落位由事务级 search_path 路由到当前分区；带前缀会被 appkit check
+//     拒绝，也会让 sqlc 编译失败{{else}}表名带 "{{.Name}}." schema 前缀，
+//     跨 schema 引用会被 appkit check 拒绝{{end}}）；
 //  2. make gen 生成 internal/postgres/sqlc（生成物禁手改，CI drift check）；
 //  3. 本包用 sqlc Querier 实现 Store，DBTX 经 pgtx.From(ctx, pool) 取——
 //     tx.Do 之内自动落在当前事务上，之外落在连接池上。
+{{- if .Partitioned}}
+//
+// ⚠ 分区域域的查询必须在事务内：事务外落在默认 search_path 上，无前缀表
+// 不存在即报错（失败响亮，不会静默读写错误分区）。业务包用例的 tx.Do 已
+// 包好这条纪律——别在本包直接调 pool。
+{{- end}}
 package postgres
 
 import (

@@ -62,6 +62,17 @@ const (
 // （DESIGN §8：outbox/inbox/幂等/审计表每 schema 一套）。schema 需已存在。
 func MigrationSQL(schema string) string {
 	tbl := pgx.Identifier{schema, "idempotency_keys"}.Sanitize()
+	return migrationSQLFor(tbl)
+}
+
+// MigrationSQLBare 返回无 schema 前缀的幂等表 DDL，供分区域域
+// （appkit new domain -partitioned）的迁移使用：目标 schema 由 pgmigrate
+// 在应用时经 SET LOCAL search_path 落位。两版的列定义必须保持一致。
+func MigrationSQLBare() string {
+	return migrationSQLFor("idempotency_keys")
+}
+
+func migrationSQLFor(tbl string) string {
 	return `CREATE TABLE IF NOT EXISTS ` + tbl + ` (
     key          text PRIMARY KEY,
     payload_hash bytea NOT NULL,

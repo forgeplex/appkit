@@ -36,6 +36,11 @@ func runSchema(args []string) error {
 		// 组合仓库没有自己的迁移，schema 归各域仓库自己维护。
 		return errors.New("组合仓库没有 db/migrations，schema 文档由各域仓库自己生成")
 	}
+	if cfg.Partitioned {
+		// 分区域域一份无前缀迁移落到 N 个分区 schema，没有单一 schema 可画——
+		// 支持它需要先想清楚「文档按分区画还是按逻辑模型画」，首版明确拒绝。
+		return errors.New("schema 文档暂不支持分区域域（partitioned: true）——分区映射由组合根注入，本仓库无从枚举；要看分区 schema 的结构，直接对一个分区库跑 introspect")
+	}
 	// 启用门先问、DSN 后要：未启用的仓库不该为了被告知「未启用」而先准备一个数据库。
 	if *check {
 		on, err := schemadoc.Adopted(*dir)

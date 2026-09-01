@@ -6,6 +6,10 @@
 // 持有 pg_advisory_xact_lock(hashtext(schema)) 的事务内进行，同 schema 串行、
 // 异 schema 互不阻塞。
 //
+// 迁移文件有两种形态：带 schema 限定名（单 schema 域），或全无前缀（分区域域，
+// appkit new domain -partitioned）。无前缀文件在应用前 SET LOCAL search_path
+// 到 set.Schema 落位——同一份文件可注册到多个分区 schema，见 applyFile。
+//
 // 已应用的迁移是不可变的：历史表记录内容的 sha256，启动时逐个比对，
 // 改动已应用的文件会以 MIGRATION_DRIFT 拒绝启动（见 verifyChecksum）。
 package pgmigrate
@@ -146,6 +150,12 @@ func applyFile(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS, schema, name
 		case errors.Is(err, pgx.ErrNoRows): // 未应用，往下执行
 		default:
 			return fmt.Errorf("查询已应用版本: %w", err)
+		}
+		// 无前缀迁移（分区域域）经 search_path 落到本 set 的 schema；带前缀的
+		// 存量迁移不受影响——显式限定名不参与 search_path 解析。SET LOCAL
+		// 事务结束即还原，连接归还池时不带走这个设置。
+		if _, err := ptx.Exec(ctx, "SET LOCAL search_path TO "+pgx.Identifier{schema}.Sanitize()); err != nil {
+			return fmt.Errorf("设置 search_path: %w", err)
 		}
 		// 无参 Exec 走 simple protocol，迁移文件可含多条语句。
 		if _, err := ptx.Exec(ctx, string(body)); err != nil {

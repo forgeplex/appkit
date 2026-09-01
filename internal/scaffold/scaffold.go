@@ -36,6 +36,10 @@ type Options struct {
 	// "(devel)" 表示源码构建：go.mod 不 require appkit（对不存在版本的
 	// require 会让 go 命令去代理拉取而失败），改由 appkit dev 的 go.work 提供。
 	AppkitVersion string
+	// Partitioned 生成「分区域域」形态（仅 domain）：一套代码、N 份数据分区，
+	// 迁移与查询全部无 schema 前缀，落位由组合根注入的分区映射（租户 → schema）
+	// 经事务级 search_path 路由确定。分区映射的定义放组合根自己的配置文件。
+	Partitioned bool
 }
 
 // nameRe 与 DESIGN 的域名约束一致：业务包名 = Postgres schema。
@@ -78,6 +82,7 @@ type tmplData struct {
 	Module        string // github.com/forgeplex/ledger
 	AppkitVersion string // v1.2.3；Devel 时模板不引用
 	Devel         bool   // appkit 无发布版本（源码构建）：go.mod 不 require appkit
+	Partitioned   bool   // 分区域域：迁移/查询无前缀，落位经 search_path 路由
 	EnvPrefix     string // 环境变量前缀（LEDGERD / PSP）
 	PgxVersion    string // 生成 go.mod 里 pgx 的版本（跟随 appkit 自身依赖）
 	// lint 工具链版本取自 ruleset：Makefile 与 domain-ci.yml 必须同版本。
@@ -93,6 +98,7 @@ func newData(o Options, envPrefix string) tmplData {
 		AppkitVersion: o.AppkitVersion,
 		EnvPrefix:     envPrefix,
 		PgxVersion:    pgxVersion(),
+		Partitioned:   o.Partitioned,
 
 		GolangciVersion: ruleset.GolangciLintVersion,
 		ArchLintVersion: ruleset.ArchLintVersion,

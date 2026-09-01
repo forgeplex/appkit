@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -314,5 +315,148 @@ func TestFromInsideAndOutsideTx(t *testing.T) {
 	}
 	if !visible(t, pool, table, "a") {
 		t.Fatal("提交后应可见")
+	}
+}
+
+// ---- 分区域 Transactor（NewRouted）----
+
+func TestNewRoutedNilRoutePanics(t *testing.T) {
+	t.Parallel()
+	defer func() {
+		if recover() == nil {
+			t.Fatal("NewRouted(pool, nil) 应当 panic")
+		}
+	}()
+	pgtx.NewRouted(nil, nil)
+}
+
+// routedSchemas 建两个随机 schema，各建一张同名表 routed_v。建表用显式
+// 限定名的 DDL——绕开被测的路由逻辑本身，让落位断言有独立的锚点。
+func routedSchemas(t *testing.T, pool *pgxpool.Pool) (string, string) {
+	t.Helper()
+	a := dbtest.Schema(t, pool, "pgtx_route_a", nil)
+	b := dbtest.Schema(t, pool, "pgtx_route_b", nil)
+	for _, s := range []string{a, b} {
+		tbl := pgx.Identifier{s, "routed_v"}.Sanitize()
+		if _, err := pool.Exec(context.Background(), "CREATE TABLE "+tbl+" (v text NOT NULL)"); err != nil {
+			t.Fatalf("建 %s: %v", tbl, err)
+		}
+	}
+	return a, b
+}
+
+func routedCount(t *testing.T, pool *pgxpool.Pool, schema, v string) int {
+	t.Helper()
+	var n int
+	tbl := pgx.Identifier{schema, "routed_v"}.Sanitize()
+	if err := pool.QueryRow(context.Background(),
+		"SELECT count(*) FROM "+tbl+" WHERE v = $1", v).Scan(&n); err != nil {
+		t.Fatalf("查询 %s: %v", tbl, err)
+	}
+	return n
+}
+
+func TestRoutedPlacement(t *testing.T) {
+	pool := dbtest.Pool(t)
+	a, b := routedSchemas(t, pool)
+
+	// 分区身份经闭包变量模拟：真实形态是 route 从 callctx 的租户身份查
+	// 组合根注入的映射，对 Transactor 只是 (ctx) -> schema 的纯函数。
+	which := ""
+	tr := pgtx.NewRouted(pool, func(context.Context) (string, error) { return which, nil })
+
+	for _, tc := range []struct{ tenant, schema string }{
+		{tenant: "merchant", schema: a},
+		{tenant: "agent", schema: b},
+	} {
+		which = tc.schema
+		err := tr.Do(context.Background(), func(ctx context.Context) error {
+			_, err := pgtx.From(ctx, pool).Exec(ctx, "INSERT INTO routed_v (v) VALUES ($1)", tc.tenant)
+			return err
+		})
+		if err != nil {
+			t.Fatalf("路由 %s: %v", tc.tenant, err)
+		}
+	}
+
+	// 同一份无前缀 SQL，落位只由 route 决定：两分区各只有自己的行。
+	if got := routedCount(t, pool, a, "merchant"); got != 1 {
+		t.Errorf("a 分区 merchant 行数 = %d, want 1", got)
+	}
+	if got := routedCount(t, pool, b, "merchant"); got != 0 {
+		t.Errorf("b 分区 merchant 行数 = %d, want 0——串分区了", got)
+	}
+	if got := routedCount(t, pool, b, "agent"); got != 1 {
+		t.Errorf("b 分区 agent 行数 = %d, want 1", got)
+	}
+
+	// 默认 search_path 上无前缀表不存在：From 直查（事务外）报错而非读错
+	// 分区——失败响亮，这是分区域域「查询必须经 Do」纪律的安全网。
+	var n int
+	if err := pool.QueryRow(context.Background(), "SELECT count(*) FROM routed_v").Scan(&n); err == nil {
+		t.Fatal("默认 search_path 上应查不到 routed_v——分区域域的池直查必须失败")
+	}
+}
+
+func TestRoutedNestedDo(t *testing.T) {
+	pool := dbtest.Pool(t)
+	a, _ := routedSchemas(t, pool)
+
+	tr := pgtx.NewRouted(pool, func(context.Context) (string, error) { return a, nil })
+	err := tr.Do(context.Background(), func(ctx context.Context) error {
+		if _, err := pgtx.From(ctx, pool).Exec(ctx, "INSERT INTO routed_v (v) VALUES ('outer')"); err != nil {
+			return err
+		}
+		// 嵌套 Do 是 savepoint：同一 ctx 再解析一次、再 SET 一遍同值，应幂等。
+		return tr.Do(ctx, func(ctx context.Context) error {
+			_, err := pgtx.From(ctx, pool).Exec(ctx, "INSERT INTO routed_v (v) VALUES ('inner')")
+			return err
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"outer", "inner"} {
+		if got := routedCount(t, pool, a, v); got != 1 {
+			t.Errorf("嵌套写入 %q 行数 = %d, want 1", v, got)
+		}
+	}
+}
+
+func TestRoutedRouteFailure(t *testing.T) {
+	pool := dbtest.Pool(t)
+	errBoom := errors.New("route boom")
+
+	tests := []struct {
+		name     string
+		route    func(context.Context) (string, error)
+		isErr    error  // errors.Is 断言（可空）
+		contains string // 错误文本包含断言（可空）
+	}{
+		{name: "route 报错", route: func(context.Context) (string, error) { return "", errBoom }, isErr: errBoom},
+		{name: "空 schema", route: func(context.Context) (string, error) { return "", nil }, contains: "不合法"},
+		{name: "非法 schema 名", route: func(context.Context) (string, error) { return "Bad; DROP SCHEMA", nil }, contains: "不合法"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := pgtx.NewRouted(pool, tc.route)
+			ran := false
+			err := tr.Do(context.Background(), func(context.Context) error {
+				ran = true
+				return nil
+			})
+			if err == nil {
+				t.Fatal("路由失败时 Do 应当报错")
+			}
+			if ran {
+				t.Error("路由失败时 fn 不应执行")
+			}
+			if tc.isErr != nil && !errors.Is(err, tc.isErr) {
+				t.Errorf("Do = %v, want %v", err, tc.isErr)
+			}
+			if tc.contains != "" && !strings.Contains(err.Error(), tc.contains) {
+				t.Errorf("错误 = %q, 应包含 %q", err.Error(), tc.contains)
+			}
+		})
 	}
 }

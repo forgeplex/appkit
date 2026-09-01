@@ -358,6 +358,9 @@ contract.yaml 生成同一接口的进程内 wrapper 与 HTTP client，方法体
 | 启动装配改不坏 | `bootstrap.Main` 收走 main() 的固定装配，代码在 module cache（0444 只读）；用户仓库的 main 只声明模块清单 | ▲ 物理级：改不动，但可绕开自己写 main（骨架默认不绕） |
 | 规则集不被改松 | `appkit check` 内联 `ruleset.Check`（配置缺失同样算漂移），不再只靠 CI 那一步 | ▲ 本地+CI 级 |
 | 已应用的迁移不可变 | 历史表存内容 sha256，启动期逐个比对，不符即 `MIGRATION_DRIFT` 拒绝启动；`.gitattributes` 钉 `*.sql eol=lf` 消除跨平台误报 | ★ 运行时级，启动即暴露 |
+| 分区域域的 schema 由调用方确定 | 迁移/查询无前缀 + 事务级 `SET LOCAL search_path`（`pgtx.NewRouted` 按 `callctx.Meta.TenantID` 查组合根注入的映射）；查询必须经 `tx.Do`，事务外落默认 search_path 即「表不存在」报错 | ★ 运行时级：路由失败（查无分区）即回滚 422，无法静默落到错误分区 |
+| 分区域域的 SQL 无前缀纪律 | `partitioned: true` 时 archcheck 前缀规则翻转（任何 schema 前缀违规，无 DB 即拦）；sqlc 编译器兜底——带前缀与无前缀两个世界各自封闭，混写双向都是编译错误 | ▲ CI 级 + ★ 编译器级 |
+| schema 文档支持分区域域 | 暂无：`appkit schema` 对 `partitioned: true` 明确报错（分区映射由组合根注入，域仓库无从枚举；先想清楚「按分区画还是按逻辑模型画」再补） | ✗ 尚未落地（写在这里是为了不假装它已生效） |
 | 没人跑迁移不可能 | 登记了迁移却既无 `Migrator` 又无 `SkipMigrations()` → 启动报错；`-migrate` 无 `database.url` 亦报错 | ★ 装配级 fail-fast |
 | schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`，产出因此是迁移的纯函数；CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（分区、生成列、RLS、继承…）点名报错而非静默输出残缺 DDL | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行——`domain-ci.yml` 经 `@main` 被全部存量域仓库共享，硬加检查会让它们在合并那一刻集体变红。代价是从不启用的仓库永远不被检查；跑过一次 `make schema` 就永久转严 |
 | 表有说明（`COMMENT ON TABLE`） | 缺的表在 `db/SCHEMA.md` 表清单里标 ⚠ 缺说明并给出该补的那一句；`appkit schema -check` 在 CI 里逐表打 `::warning` 注解 | ▲ 软约束：不阻断 CI（刻意的，存量仓库不会突然红），且 `db/SCHEMA.md` 带 `linguist-generated` 在 PR diff 里默认折叠——⚠ 没人主动打开就看不见，::warning 注解是让它浮出水面的那一半 |
@@ -376,8 +379,25 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
 
 ## 8. 数据与运维约定
 
-- **每域独占 Postgres schema**（单体单库多 schema；拆分后可平移为多库），独立迁移历史表；
-  连接池按数据库共享而非按模块独占（防连接数爆炸）。
+- **每域一或多个 Postgres schema**（单体单库多 schema；拆分后可平移为多库），独立迁移历史表；
+  连接池按数据库共享而非按模块独占（防连接数爆炸）。默认形态是每域恰好一个
+  （schema 名 = 域名）；「多个」只以分区域域这一种受控形态出现，见下条。
+- **分区域域（`appkit new domain <name> -partitioned`）**：一套代码、N 份数据分区，
+  schema 由调用方确定。场景是 psp 的商户/运营/代理商三套独立用户体系共用一份
+  rbac 域代码但数据要强隔离——体系 A 的查询根本看不到体系 B 的表，漏过滤的失败
+  形态是「表不存在」而不是「数据泄露」。机制三件套：① 分区映射（租户身份 →
+  schema）**定义在组合根自己的配置文件**（koanf 原生支持 `map[string]string`），
+  由组合根读取后经 `module.Options.Schemas` 注入——框架不暗读全局配置；②
+  `pgtx.NewRouted` 每次 `Do` 开启事务后按 `callctx.Meta.TenantID` 解析分区并
+  `SET LOCAL search_path`（事务结束自动还原，连接归还池时不带走）；③ 迁移与
+  查询全部无 schema 前缀，同一份无前缀 FS 经 `reg.Migrations` 注册到每个分区，
+  pgmigrate 应用前同样 `SET LOCAL` 并自动建 schema——**新分区 = 组合根映射加一条
+  + 重启，零代码零手写 SQL**。硬纪律：分区域的查询必须经 `tx.Do`——事务外
+  `pgtx.From` 落在默认 search_path 上，无前缀表不存在即报错（失败响亮，绝不
+  静默读写错误分区）。带前缀世界与无前缀世界各自封闭：混写形态在 sqlc 编译
+  与 `appkit check` 双向都是硬错误，跨域访问的静态保证从 archcheck 前缀扫描
+  **转移**为 sqlc 编译解析，强度不降级。已知的洞：`appkit schema` 暂不支持
+  该形态（明确报错而非产出误导内容，见 §7）。
 - **迁移的施加时机是部署决策**：默认随进程启动（多副本经 advisory lock 串行，安全但
   N 个副本同时改 schema）；规模上来后改为 initContainer/Job 里跑 `<svc> -migrate`
   （只应用迁移即退出，不监听端口），服务副本再以 `appkit.SkipMigrations()` 起来。

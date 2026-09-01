@@ -23,6 +23,9 @@ type AppConfig struct {
 	Module        string   `yaml:"module"`
 	Contracts     string   `yaml:"contracts"`
 	AllowRequires []string `yaml:"allowRequires"`
+	// Partitioned 是「分区域域」标记（appkit new domain -partitioned 写入）。
+	// ruleset 不消费它，这里收下只为与 archcheck.Config 共用一份配置文件。
+	Partitioned bool `yaml:"partitioned"`
 }
 
 // LoadAppConfig 读取并校验 dir 下的 .appkit.yml。

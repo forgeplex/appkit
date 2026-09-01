@@ -3,6 +3,11 @@ version: 1
 kind: domain
 domain: {{.Name}}
 module: {{.Module}}
+{{- if .Partitioned}}
+# 分区域域：一套代码、N 份数据分区（schema 由调用方经租户身份路由）。
+# 分区映射由组合根注入（不在本文件）；appkit schema 暂不支持该形态。
+partitioned: true
+{{- end}}
 # 合约 module（如 github.com/forgeplex/psp-contracts/go），可空。
 contracts: ""
 # 额外放行的 forgeplex module（域 repo 之间禁止互相 require，DESIGN §1）。

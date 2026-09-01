@@ -1,5 +1,10 @@
 # sqlc 配置：make gen 生成 internal/postgres/sqlc（生成物禁手改，CI drift check）。
+{{- if .Partitioned}}
+# 分区域域：迁移与查询全无前缀，sqlc 在「无前缀世界」里静态自洽；
+# 落位发生在运行期（事务级 search_path 路由），sqlc 不参与。
+{{- else}}
 # 本域独占 schema "{{.Name}}"：查询与迁移只允许操作该 schema（appkit check 扫描）。
+{{- end}}
 version: "2"
 sql:
   - engine: "postgresql"

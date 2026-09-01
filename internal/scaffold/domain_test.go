@@ -223,3 +223,87 @@ func TestDomainCompiles(t *testing.T) {
 	}
 	buildGenerated(t, dir)
 }
+
+// TestDomainPartitionedScaffold 断言 -partitioned 形态：无前缀迁移、路由装配
+// （NewRouted + Schemas 注入 + 每分区 relay），且单形态的痕迹（CREATE SCHEMA、
+// const Schema、带前缀规则）不出现。
+func TestDomainPartitionedScaffold(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "rbac")
+	if err := Domain(Options{Name: "rbac", Dir: dir, AppkitVersion: "(devel)", Partitioned: true}, nil); err != nil {
+		t.Fatalf("Domain: %v", err)
+	}
+
+	assertRendered(t, dir)
+	assertGoParses(t, dir)
+	assertGofmt(t, dir)
+
+	t.Run("基础迁移无前缀", func(t *testing.T) {
+		sql := readFile(t, dir, "db/migrations/0001_appkit_base.sql")
+		mustContain(t, "0001_appkit_base.sql", sql,
+			`CREATE TABLE IF NOT EXISTS outbox`,
+			`CREATE TABLE IF NOT EXISTS inbox`,
+			`CREATE TABLE IF NOT EXISTS idempotency_keys`,
+			`CREATE TABLE IF NOT EXISTS audit_log`,
+			`COMMENT ON TABLE outbox IS '`,
+		)
+		// 分区域域不能写死 schema：CREATE SCHEMA 与任何 "rbac". 前缀都不许出现
+		// （schema 名是组合根注入的分区映射的知识，迁移文件里无从得知）。
+		if strings.Contains(sql, "CREATE SCHEMA") || strings.Contains(sql, `"rbac".`) {
+			t.Errorf("分区域域的基础迁移不得出现定死的 schema：\n%s", sql)
+		}
+	})
+
+	t.Run("路由装配", func(t *testing.T) {
+		mod := readFile(t, dir, "internal/module/module.go")
+		mustContain(t, "module.go", mod,
+			"Schemas map[string]string",
+			"pgtx.NewRouted(",
+			"callctx.From(ctx).TenantID",
+			"routePartition(",
+			`apperr.InvalidArgument(`,
+			"outbox.Publish(ctx, pgtx.From(ctx, p.pool), schema, evt)",
+			`reg.Worker("outbox-relay/"+tenant`,
+		)
+		// 单形态的痕迹不得出现。
+		for _, gone := range []string{`Schema = "rbac"`, "pgtx.New(m.opts.Pool)", "outbox.NewPublisher("} {
+			if strings.Contains(mod, gone) {
+				t.Errorf("分区域域的 module.go 不应出现 %q", gone)
+			}
+		}
+	})
+
+	t.Run("main 注入演示分区映射", func(t *testing.T) {
+		mustContain(t, "main.go", readFile(t, dir, "cmd/rbacd/main.go"),
+			`Schemas: map[string]string{"tenant": "rbac_tenant"}`)
+	})
+
+	t.Run("SQL 前缀规则翻转", func(t *testing.T) {
+		mustContain(t, ".appkit.yml", readFile(t, dir, ".appkit.yml"), "partitioned: true")
+		mustContain(t, "example.sql", readFile(t, dir, "db/queries/example.sql"), "不带 schema 前缀")
+		mustContain(t, "sqlc.yaml", readFile(t, dir, "sqlc.yaml"), "无前缀")
+		mustContain(t, "store.go", readFile(t, dir, "internal/postgres/store.go"),
+			"必须在事务内", "search_path")
+	})
+
+	t.Run("AGENTS 与 README 翻转", func(t *testing.T) {
+		agents := readFile(t, dir, "AGENTS.md")
+		mustContain(t, "AGENTS.md", agents,
+			"分区域域", "SET LOCAL search_path", "不带 schema 前缀",
+			// 命令清单里不许列出 make schema；提它的地方只能是「不适用」的说明。
+			"make schema` 不适用本形态")
+		mustContain(t, "README.md", readFile(t, dir, "README.md"),
+			"-partitioned", "分区域域")
+	})
+}
+
+// TestDomainPartitionedCompiles 编译分区域域生成仓库（同 TestDomainCompiles）。
+func TestDomainPartitionedCompiles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short 模式跳过编译")
+	}
+	dir := filepath.Join(t.TempDir(), "rbac")
+	if err := Domain(Options{Name: "rbac", Dir: dir, Partitioned: true}, nil); err != nil {
+		t.Fatalf("Domain: %v", err)
+	}
+	buildGenerated(t, dir)
+}

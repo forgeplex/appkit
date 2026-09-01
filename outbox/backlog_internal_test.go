@@ -18,7 +18,7 @@ import (
 // 而且是随历史增长越来越慢的那种，没人会立刻发现。
 func TestBacklogSQLMatchesPartialIndex(t *testing.T) {
 	t.Parallel()
-	_, idxWhere, ok := strings.Cut(migrationTemplate, "ON %[1]s.outbox (created_at) WHERE ")
+	_, idxWhere, ok := strings.Cut(migrationTemplate, "ON %[1]soutbox (created_at) WHERE ")
 	if !ok {
 		t.Fatal("migrationTemplate 里找不到 outbox_unpublished_idx 的部分索引条件")
 	}

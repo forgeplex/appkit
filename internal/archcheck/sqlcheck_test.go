@@ -120,4 +120,48 @@ UPDATE outbox SET status = 'sent' WHERE id = $1;
 		}
 		assertViolations(t, got, []wantV{{File: "db/migrations/0001_init.sql", Line: 1, Msg: "跨 schema 引用 auth"}})
 	})
+
+	// 分区域域的规则翻转：任何 schema 前缀（包括等于域名的）都违规——
+	// 落位由事务级 search_path 路由，混写前缀形态是 sqlc 编译错误，
+	// make check 在无 DB 时先拦一次。系统 schema 引用仍放行。
+	t.Run("分区域域任何前缀都违规", func(t *testing.T) {
+		pcfg := &archcheck.Config{Version: 1, Kind: archcheck.KindDomain,
+			Domain: "rbac", Module: "github.com/forgeplex/rbac", Partitioned: true}
+		tests := []struct {
+			name string
+			sql  string
+			want []wantV
+		}{
+			{
+				name: "无前缀形态放行",
+				sql:  "CREATE TABLE roles (id uuid PRIMARY KEY);\nSELECT id FROM roles;\n",
+				want: nil,
+			},
+			{
+				name: "连本域名前缀也不许",
+				sql:  "CREATE TABLE rbac.roles (id uuid);\n",
+				want: []wantV{{File: "db/queries/q.sql", Line: 1, Msg: "不得带 schema 前缀"}},
+			},
+			{
+				name: "他域前缀同样拦",
+				sql:  "SELECT * FROM auth.users;\n",
+				want: []wantV{{File: "db/queries/q.sql", Line: 1, Msg: "不得带 schema 前缀"}},
+			},
+			{
+				name: "系统 schema 仍放行",
+				sql:  "SELECT * FROM information_schema.columns;\n",
+				want: nil,
+			},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				dir := writeRepo(t, map[string]string{"db/queries/q.sql": tt.sql})
+				got, err := archcheck.CheckSQL(dir, pcfg)
+				if err != nil {
+					t.Fatalf("CheckSQL: %v", err)
+				}
+				assertViolations(t, got, tt.want)
+			})
+		}
+	})
 }

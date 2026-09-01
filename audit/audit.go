@@ -24,9 +24,19 @@ func MigrationSQL(schema string) string {
 	if !validSchema.MatchString(schema) {
 		panic(fmt.Sprintf("audit: 非法 schema 名 %q", schema))
 	}
-	q := `"` + schema + `"`
+	return migrationSQLFor(`"` + schema + `".`)
+}
+
+// MigrationSQLBare 返回无 schema 前缀的审计表 DDL，供分区域域
+// （appkit new domain -partitioned）的迁移使用：目标 schema 由 pgmigrate
+// 在应用时经 SET LOCAL search_path 落位。两版的列定义必须保持一致。
+func MigrationSQLBare() string {
+	return migrationSQLFor("")
+}
+
+func migrationSQLFor(prefix string) string {
 	return `
-CREATE TABLE IF NOT EXISTS ` + q + `.audit_log (
+CREATE TABLE IF NOT EXISTS ` + prefix + `audit_log (
     id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     at        timestamptz NOT NULL DEFAULT now(),
     actor     text        NOT NULL,
@@ -38,9 +48,9 @@ CREATE TABLE IF NOT EXISTS ` + q + `.audit_log (
     meta      jsonb
 );
 CREATE INDEX IF NOT EXISTS audit_log_entity_idx
-    ON ` + q + `.audit_log (entity, entity_id, at);
+    ON ` + prefix + `audit_log (entity, entity_id, at);
 
-COMMENT ON TABLE ` + q + `.audit_log IS '审计流水：与业务写同事务落库，记录 actor/action/before/after。';
+COMMENT ON TABLE ` + prefix + `audit_log IS '审计流水：与业务写同事务落库，记录 actor/action/before/after。';
 `
 }
 

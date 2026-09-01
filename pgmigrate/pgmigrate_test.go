@@ -233,6 +233,50 @@ func TestRunnerPostgres(t *testing.T) {
 	}
 }
 
+// 无前缀迁移（分区域域）：applyFile 先 SET LOCAL search_path 到 set.Schema，
+// DDL 落到本分区。关键性质：同一份无前缀 FS 应用到两个 schema，各得一套
+// 表、互不影响，且不污染默认 search_path 上的 public。
+func TestRunnerPrefixlessMigrations(t *testing.T) {
+	pool := testPool(t)
+	schemaA := testSchema(t, pool)
+	schemaB := testSchema(t, pool)
+
+	// 文件内容不含任何 {schema} 占位替换：无前缀形态原样应用。
+	fsys := fstest.MapFS{
+		"001_init.sql": &fstest.MapFile{Data: []byte("CREATE TABLE items (v text NOT NULL);")},
+		"002_seed.sql": &fstest.MapFile{Data: []byte("INSERT INTO items (v) VALUES ('seed');")},
+	}
+	run := pgmigrate.Runner(pool)
+	sets := []appkit.MigrationSet{
+		{Schema: schemaA, FS: fsys, Module: "rbac"},
+		{Schema: schemaB, FS: fsys, Module: "rbac"},
+	}
+	for i := range 2 { // 第二遍：已应用检查按分区生效，零重复应用
+		if err := run(context.Background(), sets); err != nil {
+			t.Fatalf("无前缀迁移第 %d 遍: %v", i+1, err)
+		}
+	}
+	for _, s := range []string{schemaA, schemaB} {
+		if !tableExists(t, pool, s, "items") {
+			t.Errorf("%s 里应有 items——无前缀 DDL 未落位到分区", s)
+		}
+		if n := countRows(t, pool, s, "items"); n != 1 {
+			t.Errorf("%s.items 行数 = %d, want 1", s, n)
+		}
+		if got := appliedVersions(t, pool, s); fmt.Sprint(got) != fmt.Sprint([]string{"001_init.sql", "002_seed.sql"}) {
+			t.Errorf("%s 已应用版本 = %v", s, got)
+		}
+	}
+	var leak bool
+	if err := pool.QueryRow(context.Background(),
+		"SELECT to_regclass('public.items') IS NOT NULL").Scan(&leak); err != nil {
+		t.Fatalf("检查 public 泄漏: %v", err)
+	}
+	if leak {
+		t.Error("无前缀表不得落入 public——search_path 必须精确落位到 set.Schema")
+	}
+}
+
 // 复现评审场景：保留字 schema 名（如 order）必须整流程可用——建 schema、
 // 建历史表、已应用检查、记录版本四处拼接都要带引号，否则启动即失败。
 func TestRunnerReservedWordSchema(t *testing.T) {

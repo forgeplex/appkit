@@ -1,0 +1,153 @@
+// Package module 是装配层：把业务包、postgres、http、inbox 装进
+// appkit.Registry。这是本仓库唯一的 wiring 落点——驱动类型（连接池）
+// 从组合根注入，到此为止，不再向业务包扩散。
+//
+// 分区域域（partitioned）：一套代码、N 份数据分区，schema 由调用方确定
+// （DESIGN §8）。落位三件套——组合根注入 Schemas 映射（租户 → schema），
+// 每次 tx.Do 开启事务后 SET LOCAL search_path 到该分区，无前缀查询与迁移
+// 据此解析。
+package module
+
+import (
+	"context"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net/http"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
+	"github.com/forgeplex/appkit/health"
+	"github.com/forgeplex/appkit/outbox"
+	"github.com/forgeplex/appkit/pgtx"
+
+	"{{.Module}}/internal/{{.Name}}"
+	{{.Name}}http "{{.Module}}/internal/http"
+	"{{.Module}}/internal/postgres"
+)
+
+// Options 是装配期依赖，由组合根注入（连接池按数据库共享，DESIGN §8）。
+type Options struct {
+	Log  *slog.Logger
+	Pool *pgxpool.Pool
+	// Bus 是事件总线（单体单库用 outbox.NewDirectBus()，拆分部署换 NATS/Kafka
+	// 实现）。非 nil 时每个分区一个 outbox relay：本域事件自动外发。
+	// 组合根应把同一个实例传给全部模块并注入 appkit.Bus(bus)。
+	Bus outbox.Bus
+	// Schemas 是分区映射：租户身份（callctx.Meta.TenantID，经 X-Tenant-Id 头
+	// 与事件 meta 传播）到本域的数据分区 schema。定义放组合根自己的配置文件
+	// （koanf 原生支持 map[string]string），由组合根读取后注入——本仓库不
+	// 暗读全局配置。三体系形态示例：
+	//   {"merchant": "rbac_merchant", "ops": "rbac_ops", "agent": "rbac_agent"}
+	// 新分区 = 映射加一条 + 重启：迁移自动建出 schema 并应用同一份无前缀 DDL，
+	// 零手写 SQL。
+	Schemas map[string]string
+}
+
+// New 构造模块。migrations 是 db/migrations 的 embed FS（由根包注入）。
+func New(opts Options, migrations fs.FS) appkit.Module {
+	return &mod{opts: opts, migrations: migrations}
+}
+
+type mod struct {
+	opts       Options
+	migrations fs.FS
+	// handler 在 Setup 阶段装配（依赖解析之后）；Mount 必须发生在 Register
+	// 阶段，因此路由经一层间接引用——Setup 先于 HTTP 监听，不会打到 nil。
+	handler http.Handler
+}
+
+func (m *mod) Name() string { return "{{.Name}}" }
+
+// routePartition 从调用的租户身份解析本次落位的分区 schema。查无分区必须
+// 响亮失败（422）：静默落到默认 search_path 上只会让最里面那条查询报
+// 「表不存在」，错误原因离真正的错处隔了三层。
+func routePartition(ctx context.Context, schemas map[string]string) (string, error) {
+	tenant := callctx.From(ctx).TenantID
+	schema, ok := schemas[tenant]
+	if !ok {
+		return "", apperr.InvalidArgument(
+			"未知分区 %q——请求未携带 X-Tenant-Id，或组合根未注入该分区映射", tenant)
+	}
+	return schema, nil
+}
+
+// routedPublisher 按当前调用的分区落表：事件与业务写同事务、同分区，
+// relay 再按分区外发。业务包依赖的单方法接口形态不变。
+type routedPublisher struct {
+	pool    *pgxpool.Pool
+	schemas map[string]string
+}
+
+func (p *routedPublisher) Publish(ctx context.Context, evt appkit.Event) error {
+	schema, err := routePartition(ctx, p.schemas)
+	if err != nil {
+		return err
+	}
+	return outbox.Publish(ctx, pgtx.From(ctx, p.pool), schema, evt)
+}
+
+// Register 只做声明：Provide 服务、登记迁移 / 路由 / 健康检查（DESIGN §5.1）。
+func (m *mod) Register(reg *appkit.Registry) error {
+	if len(m.opts.Schemas) == 0 {
+		return fmt.Errorf("{{.Name}}: Options.Schemas 为空——分区域域必须由组合根注入分区映射（租户 → schema）")
+	}
+	// 路由 Transactor：每次 Do 在开启事务后 SET LOCAL search_path 到当前
+	// 分区（事务结束自动还原，连接归还池时不带走这个设置）。分区域的查询
+	// 必须经 Do——事务外 pgtx.From 落在默认 search_path 上，无前缀表不存在
+	// 即报错：失败响亮，不会静默读写错误分区。
+	txr := pgtx.NewRouted(m.opts.Pool, func(ctx context.Context) (string, error) {
+		return routePartition(ctx, m.opts.Schemas)
+	})
+	appkit.Provide(reg, func(*appkit.Registry) (*{{.Name}}.Service, error) {
+		return {{.Name}}.NewService(
+			postgres.NewStore(m.opts.Pool),
+			txr,
+			&routedPublisher{pool: m.opts.Pool, schemas: m.opts.Schemas},
+		), nil
+	})
+	// 对外契约（psp-contracts 生成后）改用 appkit.ProvideContract +
+	// 生成的 wrapper 注册：每次跨模块调用都经 contract.Call（DESIGN §5.3）。
+
+	// 迁移：同一份无前缀 FS 应用到每个分区；schema 不存在时 pgmigrate 自动
+	// 创建——新分区零手写 SQL。
+	for _, schema := range m.opts.Schemas {
+		reg.Migrations(schema, m.migrations)
+	}
+
+	reg.Setup(func(context.Context) error {
+		svc := appkit.MustResolve[*{{.Name}}.Service](reg)
+		m.handler = {{.Name}}http.NewPingHandler(m.opts.Log, svc)
+		// 消费外域事件样例（声明后组合根必须以 appkit.Bus 注入总线）。
+		// 分区域域的 dedup 表（inbox）随分区一套：消费者按「这个 topic 的事件
+		// 落在哪个分区」登记，handler 内按事件 meta 的租户身份路由（callctx
+		// 已沿事件传播）：
+		// reg.Consumer("other.something.v1",
+		//     outbox.Inbox(m.opts.Pool, m.opts.Schemas["tenant"], inbox.Consumer, inbox.NewHandler(svc)))
+		return nil
+	})
+	reg.Mount({{.Name}}http.PingPattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.handler.ServeHTTP(w, r)
+	}))
+
+	reg.Health("postgres", health.CheckFunc(func(ctx context.Context) error {
+		return m.opts.Pool.Ping(ctx)
+	}))
+
+	// outbox relay 每分区一个：轮询该分区的 outbox 表并经 Bus 外发
+	// （退避/死信见 outbox 包文档）。reg.Worker 管住 goroutine 的三件事——
+	// 关停等它退出、超预算不吊死、崩了掀翻进程而不是让探针继续绿着——
+	// 都在框架里，这里只交一个函数。
+	if m.opts.Bus != nil {
+		for tenant, schema := range m.opts.Schemas {
+			relay := outbox.NewRelay(m.opts.Pool, schema, m.opts.Bus)
+			reg.Worker("outbox-relay/"+tenant, relay.Run)
+		}
+	} else {
+		m.opts.Log.Warn("{{.Name}}: 未注入 Bus，outbox relay 未启动——本域事件只落表不外发")
+	}
+	return nil
+}

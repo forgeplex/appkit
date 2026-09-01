@@ -144,6 +144,46 @@ make check && make lint && make test   # = CI 跑的那几条
 
 违规不是靠自觉发现的：`appkit check` 和物化的 lint 在本地与 CI 都会拦下来。
 
+### 3.1 变体：分区域域（一套代码、N 份数据分区）
+
+当**同一套域代码要服务几套互相独立的用户体系**时（psp 的商户/运营/代理商共用
+一份 rbac 域代码就是原型），用 `-partitioned` 生成分区域域：
+
+```sh
+appkit new domain rbac -partitioned -dir rbac
+```
+
+与普通域的三点不同：
+
+1. **schema 由调用方确定**。迁移与查询全部**不带 schema 前缀**；每次 `tx.Do`
+   开启事务后按调用方的租户身份（`X-Tenant-Id` 头 → `callctx.Meta.TenantID`）
+   `SET LOCAL search_path` 路由到对应分区。漏过滤的失败形态是「表不存在」，
+   而不是「看到了别家的数据」。
+2. **分区映射由组合根注入**，定义放组合根自己的配置文件：
+
+   ```yaml
+   # psp 的 config/dev.yaml（koanf 原生支持 map[string]string）
+   rbac:
+     schemas: { merchant: rbac_merchant, ops: rbac_ops, agent: rbac_agent }
+   ```
+
+   ```go
+   cfg, err := config.Load[pspConfig](d.Config)   // psp 组合根
+   rbac.Module(rbac.Options{Log: d.Log, Pool: d.Pool, Bus: d.Bus,
+       Schemas: cfg.Rbac.Schemas})
+   ```
+
+   **新分区 = 映射加一条 + 重启**：迁移自动建出新 schema 并应用同一份无前缀
+   DDL，零代码零手写 SQL。
+3. **查询必须经 `tx.Do`**（业务包用例的标准形态本来就是）——事务外 `pgtx.From`
+   落在默认 search_path 上，无前缀表不存在即报错。这是响亮失败的安全网，
+   但纪律本身不例外。
+
+已知的洞：`make schema`（schema 文档）暂不支持该形态，`appkit schema` 会明确
+报错；`COMMENT ON TABLE` 写进迁移就是当前的自描述手段。跨域调用的静态保证
+不降级：带前缀与无前缀两个世界各自封闭，混写在 sqlc 编译与 `appkit check`
+双向都是硬错误（DESIGN §8）。
+
 ## 4. 第三步：写第一个用例（identity 的"创建用户"）
 
 **① 迁移与查询**（只允许操作 `identity` schema，跨 schema 引用会被 `appkit check` 拒绝）：

@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -97,6 +98,15 @@ func (queryTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data pgx.Trac
 // Transactor 实现 tx.Transactor。
 type Transactor struct {
 	pool *pgxpool.Pool
+	// route 收在指针后面：函数不可比较，平铺进结构体会把 Transactor 变成
+	// 不可比较类型（相对存量 tag 的 apidiff incompatible）。idem.mwConfig
+	// 的 injectedOptions 是同款取舍。
+	route *router
+}
+
+// router 包一层路由函数以保持 Transactor 可比较（见 Transactor.route）。
+type router struct {
+	fn func(ctx context.Context) (string, error)
 }
 
 var _ tx.Transactor = (*Transactor)(nil)
@@ -105,6 +115,42 @@ var _ tx.Transactor = (*Transactor)(nil)
 func New(pool *pgxpool.Pool) *Transactor {
 	return &Transactor{pool: pool}
 }
+
+// NewRouted 构造分区域 Transactor：每次 Do 在开启事务后调用 route 解析本次
+// 落在哪个 schema，并 SET LOCAL search_path（事务结束自动还原，连接归还池
+// 时是干净的）。route 通常从 callctx 的租户身份查组合根注入的分区映射。
+//
+// 返回错误即本次 Do 失败（事务回滚）——「查无分区」要让调用响亮地失败，
+// 而不是静默落到默认 search_path 上把表不存在的错误甩给最里面那条查询。
+// 返回空 schema 同样报错：想表达「不路由」就别用 NewRouted。
+func NewRouted(pool *pgxpool.Pool, route func(ctx context.Context) (string, error)) *Transactor {
+	if route == nil {
+		panic("pgtx: NewRouted 的 route 为 nil——不需要路由时用 New")
+	}
+	return &Transactor{pool: pool, route: &router{fn: route}}
+}
+
+// routeSchema 在事务开启后落位 search_path。嵌套 Do（savepoint）会再次走到
+// 这里：ctx 相同、route 纯函数（只读 ctx）时解析出同一 schema，重复 SET 无害。
+func (t *Transactor) routeSchema(ctx context.Context, ptx pgx.Tx) error {
+	if t.route == nil {
+		return nil
+	}
+	schema, err := t.route.fn(ctx)
+	if err != nil {
+		return err
+	}
+	if !schemaRe.MatchString(schema) {
+		return fmt.Errorf("pgtx: 路由返回的 schema 名 %q 不合法（须匹配 %s）", schema, schemaRe)
+	}
+	if _, err := ptx.Exec(ctx, "SET LOCAL search_path TO "+pgx.Identifier{schema}.Sanitize()); err != nil {
+		return fmt.Errorf("pgtx: 设置 search_path: %w", err)
+	}
+	return nil
+}
+
+// schemaRe 与 pgmigrate/outbox 的约束一致：schema 名会拼进 SQL，白名单防注入。
+var schemaRe = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
 
 // beginner 抽象 pool 与 pgx.Tx 共同的 Begin：后者的 Begin 即 savepoint，
 // 嵌套 Do 因此天然获得部分回滚语义。
@@ -135,6 +181,13 @@ func (t *Transactor) Do(ctx context.Context, fn func(ctx context.Context) error)
 			panic(p)
 		}
 	}()
+
+	if err := t.routeSchema(ctx, ptx); err != nil {
+		if rbErr := ptx.Rollback(rollbackCtx(ctx)); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			return errors.Join(err, fmt.Errorf("pgtx: 回滚: %w", rbErr))
+		}
+		return err
+	}
 
 	if err := fn(tx.With(ctx, ptx)); err != nil {
 		if rbErr := ptx.Rollback(rollbackCtx(ctx)); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
@@ -170,6 +223,10 @@ var (
 // From 返回当前应使用的 DBTX：ctx 携带事务句柄（Do 之内）返回该 pgx.Tx，
 // 否则返回 pool。句柄不是 pgx.Tx 时 panic 而非静默落回 pool——静默落回会把
 // 本应在事务内的写悄悄漏出事务边界。
+//
+// 分区域域（NewRouted）的查询必须经 Do：search_path 是事务级的，From 直查
+// 落在池连接的默认 search_path 上，表不存在即报错——失败响亮，不会静默
+// 读写错误的分区，但分区域的业务查询一律包进事务是硬纪律。
 func From(ctx context.Context, pool *pgxpool.Pool) DB {
 	if h := tx.Value(ctx); h != nil {
 		ptx, ok := h.(pgx.Tx)

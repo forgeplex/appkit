@@ -1,5 +1,10 @@
 -- 查询写在本目录，经 `make gen`（sqlc）生成到 internal/postgres/sqlc。
+{{- if .Partitioned}}
+-- 分区域域：表名不带 schema 前缀——落位由事务级 search_path 路由到当前
+-- 分区（pgtx.NewRouted）。带前缀会被 appkit check 拒绝，也会让 sqlc 编译失败。
+{{- else}}
 -- 表名必须带 "{{.Name}}." schema 前缀；跨 schema 引用会被 appkit check 拒绝。
+{{- end}}
 
 -- name: Now :one
 SELECT now();

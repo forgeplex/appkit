@@ -53,7 +53,7 @@ func mustSchema(schema string) {
 // ident 给已通过校验的 schema 加双引号，避免与 SQL 保留字冲突。
 func ident(schema string) string { return `"` + schema + `"` }
 
-const migrationTemplate = `CREATE TABLE IF NOT EXISTS %[1]s.outbox (
+const migrationTemplate = `CREATE TABLE IF NOT EXISTS %[1]soutbox (
     id              uuid        PRIMARY KEY,
     topic           text        NOT NULL,
     payload         jsonb       NOT NULL,
@@ -68,9 +68,9 @@ const migrationTemplate = `CREATE TABLE IF NOT EXISTS %[1]s.outbox (
 );
 
 CREATE INDEX IF NOT EXISTS outbox_unpublished_idx
-    ON %[1]s.outbox (created_at) WHERE published_at IS NULL AND failed_at IS NULL;
+    ON %[1]soutbox (created_at) WHERE published_at IS NULL AND failed_at IS NULL;
 
-CREATE TABLE IF NOT EXISTS %[1]s.inbox (
+CREATE TABLE IF NOT EXISTS %[1]sinbox (
     consumer     text        NOT NULL,
     event_id     uuid        NOT NULL,
     topic        text        NOT NULL,
@@ -78,10 +78,10 @@ CREATE TABLE IF NOT EXISTS %[1]s.inbox (
     PRIMARY KEY (consumer, event_id)
 );
 
-COMMENT ON TABLE %[1]s.outbox IS '事务性事件外发：业务写与事件落表同事务提交，relay 轮询后投递。';
-COMMENT ON COLUMN %[1]s.outbox.meta IS 'callctx 白名单快照——事件是异步的，投递时原请求的 ctx 早已消失。';
-COMMENT ON COLUMN %[1]s.outbox.claimed_until IS 'relay 的领取租约到期时刻，过期后其它副本可重新领取。';
-COMMENT ON TABLE %[1]s.inbox IS '事件消费去重：主键 (consumer, event_id)，同一事件每个消费者各消费一次。';
+COMMENT ON TABLE %[1]soutbox IS '事务性事件外发：业务写与事件落表同事务提交，relay 轮询后投递。';
+COMMENT ON COLUMN %[1]soutbox.meta IS 'callctx 白名单快照——事件是异步的，投递时原请求的 ctx 早已消失。';
+COMMENT ON COLUMN %[1]soutbox.claimed_until IS 'relay 的领取租约到期时刻，过期后其它副本可重新领取。';
+COMMENT ON TABLE %[1]sinbox IS '事件消费去重：主键 (consumer, event_id)，同一事件每个消费者各消费一次。';
 `
 
 // MigrationSQL 返回 outbox/inbox 两张表的 DDL，域 repo 把它写进自己 schema
@@ -91,7 +91,15 @@ COMMENT ON TABLE %[1]s.inbox IS '事件消费去重：主键 (consumer, event_id
 // 各自消费一次。schema 不合法时 panic。
 func MigrationSQL(schema string) string {
 	mustSchema(schema)
-	return fmt.Sprintf(migrationTemplate, ident(schema))
+	return fmt.Sprintf(migrationTemplate, ident(schema)+".")
+}
+
+// MigrationSQLBare 返回无 schema 前缀的 outbox/inbox DDL，供分区域域
+// （appkit new domain -partitioned）的迁移使用：目标 schema 由 pgmigrate
+// 在应用时经 SET LOCAL search_path 落位（见 pgmigrate包文档）。带前缀版
+// 是单 schema 域的事实源；两版的列定义必须保持一致。
+func MigrationSQLBare() string {
+	return fmt.Sprintf(migrationTemplate, "")
 }
 
 // errNoTx：Publish 的运行时守卫。与 contract 的「事务内禁跨模块调用」互为镜像：
