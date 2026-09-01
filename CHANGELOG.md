@@ -2,6 +2,33 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.5.4（2026-09-02）
+
+真实客户端 IP 边缘解析 + MIT License
+
+为什么：取真实客户端 IP 是限流、风控、审计的普遍前置需求。让各模块
+各自解析 X-Forwarded-For，等于把信任决策（哪些代理网段可信）散落到
+业务代码里——伪造头一路通行。信任决策必须在 HTTP 边缘做一次，
+模块经 ctx 只读，不可能重算、也不可能被伪造头骗到。
+
+这一版加了什么：
+
+- `httpserver.ClientIP(trusted ...netip.Prefix)`：根中间件，在链上
+  解析一次真实客户端 IP 存进 ctx。对端不在可信网段：直接用 TCP 对端
+  地址，请求头一律不信；对端在可信网段：依次信 X-Client-IP、
+  X-Forwarded-For 从右往左第一个不可信地址（可信代理逐跳追加，
+  伪造注入永远在最左，走不到答案）；全链可信时取最左。零个可信
+  网段 = 永远用对端，是安全默认：直连部署直接可用，前面有代理时
+  组合根把网段配上。
+- `callctx.WithClientIP` / `callctx.ClientIP`：ctx 内存取。刻意不进
+  Meta 白名单——防火墙剥掉它是有意为之：下游域看到的「对端 IP」
+  是上一跳地址，与「原始客户端 IP」语义不同；真有跨边界需求
+  （审计链路把起点 IP 带进异步事件）时业务可自行写入 Event.Meta。
+- MIT License：repo 已从 private 翻为 public，公开前先定授权——
+  无 license 的公开代码在法律上不可被使用。
+
+纯加法，apidiff 相对 v0.5.3 零 incompatible。
+
 ## v0.5.3（2026-09-01）
 
 分区域域（partitioned domain）：一套代码、N 份数据分区，schema 由调用方确定
