@@ -57,12 +57,18 @@ go run ./cmd/appkit new domain t -dir /tmp/t   # 改脚手架后：生成物可�
 什么、为什么；CHANGELOG.md 与 GitHub Releases 都是它的镜像。三件套顺序固定：
 
 ```sh
-git tag -a vX.Y.Z -F /tmp/msg            # 1. tag：正文即事实源
+make tag VERSION=vX.Y.Z MSG=/tmp/msg     # 1. tag：annotated 主 tag 正文即事实源；
+                                         #    lint/vX.Y.Z 一并打（lint/ 是嵌套 module，
+                                         #    Go 要这个前缀 tag 才能按版本解析 appkit-lint）
 make changelog && git add CHANGELOG.md   # 2. 重生成镜像（禁手改）并提交
-git push origin main vX.Y.Z              # 3. 先推——gh 的 --verify-tag 只认远端 tag
+git push origin main vX.Y.Z lint/vX.Y.Z  # 3. 先推——gh 的 --verify-tag 只认远端 tag
 gh release create vX.Y.Z --verify-tag \
   --title vX.Y.Z --notes-file /tmp/msg   # 4. Release 正文 = tag message
 ```
+
+lint tag 与主 tag 锁步、指同一 commit（即使 lint/ 该版没动）：域仓库 CI
+按 go.mod 钉的 appkit 版本号装 appkit-lint，缺这个 tag 就是 unknown revision。
+`make tag` 把两个 tag 绑成一个动作，不允许单独打主 tag。
 
 版本号走 SemVer，但 0.x 期间号是节拍不是承诺：**minor 留给改默认行为/
 语义、或值得每个升级者读一遍说明的节点**（v0.5.0 焊金额边界是例），

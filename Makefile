@@ -3,7 +3,7 @@
 
 GO ?= go
 
-.PHONY: check fmt vet build test test-db test-lint test-rules changelog all
+.PHONY: check fmt vet build test test-db test-lint test-rules changelog tag all
 
 # 完成的定义（AGENTS.md）：这条全绿，且动了公开 API 时 apidiff 相对最新 tag 零 incompatible。
 check: fmt vet build test
@@ -43,13 +43,31 @@ test-lint:
 test-rules:
 	APPKIT_RULES_E2E=1 $(GO) test -count=1 -v -run TestMaterializedRules ./internal/scaffold/
 
+# 发版三件套第 1 步：打 tag。主 tag 是 annotated，正文即事实源；
+# lint/ 是嵌套 module，Go 要求 lint/vX.Y.Z 前缀 tag 才能被 @version 解析
+# （缺了它，域仓库 CI 按主版本号装 appkit-lint 会报 unknown revision）——
+# 两个 tag 绑在同一目标里，物理上杜绝漏打。lint tag 是轻量 tag：
+# 事实源仍是主 tag 的 message，它只是给 Go 模块解析器的路标。
+# 用法：make tag VERSION=vX.Y.Z MSG=/tmp/msg
+tag:
+	@test -n "$(VERSION)" || { echo "用法：make tag VERSION=vX.Y.Z MSG=/tmp/msg"; exit 1; }
+	@test -n "$(MSG)" || { echo "用法：make tag VERSION=vX.Y.Z MSG=/tmp/msg"; exit 1; }
+	@case "$(VERSION)" in v[0-9]*.[0-9]*.[0-9]*) ;; *) echo "VERSION 必须形如 vX.Y.Z"; exit 1 ;; esac
+	@! git rev-parse -q --verify "refs/tags/$(VERSION)" >/dev/null || { echo "tag $(VERSION) 已存在"; exit 1; }
+	@! git rev-parse -q --verify "refs/tags/lint/$(VERSION)" >/dev/null || { echo "tag lint/$(VERSION) 已存在"; exit 1; }
+	git tag -a $(VERSION) -F '$(MSG)'
+	git tag "lint/$(VERSION)"
+	@echo "已打 $(VERSION) + lint/$(VERSION)；推送：git push origin main $(VERSION) lint/$(VERSION)"
+
 # 重生成 CHANGELOG.md：内容 = 各版本 annotated tag message 的镜像，按版本倒序。
 # tag 是事实源，本文件禁手改——发版三件套之一（顺序见 AGENTS.md「发版」：
 # 打 tag → make changelog 并提交 → gh release create）。
+# --list 'v[0-9]*' 排除 lint/vX.Y.Z 路标 tag——它们不是版本叙事，且是轻量 tag，
+# git cat-file tag 读不出 message。
 changelog:
 	@{ echo '# Changelog'; echo; \
 	   echo '按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。'; echo; \
-	   for t in $$(git tag --sort=-v:refname); do \
+	   for t in $$(git tag --list 'v[0-9]*' --sort=-v:refname); do \
 	     echo "## $$t（$$(git log -1 --format=%cs $$t^{})）"; echo; \
 	     git cat-file tag $$t | sed '1,/^$$/d'; echo; \
 	   done; \
