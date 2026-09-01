@@ -67,7 +67,8 @@ func TestSystemScaffold(t *testing.T) {
 
 	t.Run("配置与部署说明", func(t *testing.T) {
 		mustContain(t, "config/dev.yaml", readFile(t, dir, "config/dev.yaml"), "env: dev")
-		mustContain(t, "config/prod.yaml", readFile(t, dir, "config/prod.yaml"), "env: prod")
+		mustContain(t, "config/prod.yaml", readFile(t, dir, "config/prod.yaml"),
+			"env: prod", "pprof: false")
 		mustContain(t, "deploy/README.md", readFile(t, dir, "deploy/README.md"),
 			"-target=all", "-target=relay",
 			// 迁移与告警是部署时才想起来的两件事，写在这里而不是散在别处。

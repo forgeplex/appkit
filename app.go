@@ -32,6 +32,7 @@ type appConfig struct {
 	skipMigrations  bool
 	bus             Subscriber
 	httpServerOpts  []func(*http.Server)
+	pprof           bool
 }
 
 // Option 配置 App。
@@ -51,6 +52,17 @@ func HTTPAddr(addr string) Option {
 // Middleware 设置根 HTTP 中间件链（外层在前）。通常传 httpserver.Base(...)。
 func Middleware(mw ...func(http.Handler) http.Handler) Option {
 	return func(c *appConfig) { c.middleware = append(c.middleware, mw...) }
+}
+
+// Pprof 在主端口挂载 /debug/pprof/* 排障端点（goroutine/heap/profile/
+// cmdline/symbol/trace 等）。默认关闭：这些端点暴露进程内部信息
+// （goroutine 栈、堆采样可能含敏感数据），开启是显式的排障决策——
+// 先确认服务端口不暴露公网，或网络策略已挡好。
+//
+// 开关走配置而不是代码（bootstrap 的 debug.pprof）：线上排障改
+// configmap 重启即生效，不必发版。
+func Pprof() Option {
+	return func(c *appConfig) { c.pprof = true }
 }
 
 // Logger 设置框架日志器，默认 slog.Default()。

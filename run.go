@@ -7,6 +7,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"sort"
@@ -169,6 +170,9 @@ func (a *App) buildMux() (mux *http.ServeMux, err error) {
 	mux = http.NewServeMux()
 	mux.Handle("/healthz", a.reg.health.LiveHandler())
 	mux.Handle("/readyz", a.reg.health.ReadyHandler())
+	if a.cfg.pprof {
+		mountPprof(mux)
+	}
 	defer func() {
 		if p := recover(); p != nil {
 			err = fmt.Errorf("appkit: 路由挂载失败: %v", p)
@@ -178,6 +182,19 @@ func (a *App) buildMux() (mux *http.ServeMux, err error) {
 		mux.Handle(m.pattern, m.handler)
 	}
 	return mux, nil
+}
+
+// mountPprof 挂标准 pprof 端点集。显式列举而非 import 副作用挂
+// DefaultServeMux：路由必须落在应用自己的 mux 上，与探针同级。
+func mountPprof(mux *http.ServeMux) {
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+	for _, name := range []string{"goroutine", "heap", "allocs", "block", "mutex", "threadcreate"} {
+		mux.Handle("GET /debug/pprof/"+name, pprof.Handler(name))
+	}
 }
 
 // buildServer 构造 http.Server：安全默认超时（防慢客户端占死连接），

@@ -10,3 +10,6 @@ database:
 log:
   level: debug
   format: text
+debug:
+  # pprof 排障端点默认关闭。本地开发打开无妨；生产开启前先确认端口不暴露公网。
+  pprof: false

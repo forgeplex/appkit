@@ -3,6 +3,7 @@ package appkit
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -233,6 +234,45 @@ func TestRunLifecycleOrder(t *testing.T) {
 	for i := range want {
 		if order[i] != want[i] {
 			t.Fatalf("第 %d 步应为 %s，实际 %v", i, want[i], order)
+		}
+	}
+}
+
+// TestPprofGatedByOption 锁住排障端点的开关语义：默认关（404 而不是
+// 「挂着但没人知道」——危险默认不能靠文档提醒），声明 Pprof() 后
+// 索引页与具名 profile 都可用。
+func TestPprofGatedByOption(t *testing.T) {
+	mux, err := New(nil).buildMux()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("默认不应挂 pprof: /debug/pprof/ = %d, want 404", rec.Code)
+	}
+
+	mux, err = New(nil, Pprof()).buildMux()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	for _, path := range []string{
+		"/debug/pprof/", "/debug/pprof/cmdline",
+		"/debug/pprof/goroutine?debug=1", "/debug/pprof/heap?debug=1",
+	} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s = %d, want 200（%s）", path, resp.StatusCode, body)
+		}
+		if path == "/debug/pprof/" && !strings.Contains(string(body), "goroutine") {
+			t.Error("pprof 索引页未列出 goroutine profile")
 		}
 	}
 }

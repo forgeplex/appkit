@@ -56,6 +56,15 @@ type Log struct {
 	Format string `koanf:"format" validate:"omitempty,oneof=json text"`
 }
 
+// Debug 是排障端点配置。全部默认关闭：pprof 暴露进程内部信息
+// （goroutine 栈、堆采样可能含敏感数据），开启前先确认服务端口
+// 不暴露公网或网络策略已挡好。
+// 放配置而不是代码开关：线上排障改 configmap 重启即生效，不必发版。
+type Debug struct {
+	// Pprof 为 true 时挂 /debug/pprof/*（语义见 appkit.Pprof）。
+	Pprof bool `koanf:"pprof"`
+}
+
 // Base 是每个域服务共有的配置项。需要额外配置项时，用 Deps.Config
 // 再 config.Load 一次自己的结构——同一份文件与环境变量，不必重复声明这些。
 type Base struct {
@@ -63,6 +72,7 @@ type Base struct {
 	Env      string   `koanf:"env" validate:"omitempty,oneof=dev staging prod"`
 	Database Database `koanf:"database"`
 	Log      Log      `koanf:"log"`
+	Debug    Debug    `koanf:"debug"`
 }
 
 // Deps 是框架已备好的依赖，传给 Options 的各回调。
@@ -185,6 +195,9 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 		appkit.HTTPAddr(base.Addr),
 		appkit.Logger(d.Log),
 		appkit.Middleware(httpserver.Base(d.Log)...),
+	}
+	if base.Debug.Pprof {
+		opts = append(opts, appkit.Pprof())
 	}
 
 	var modules []appkit.Module

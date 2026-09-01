@@ -7,3 +7,7 @@ database:
 log:
   level: info
   format: json
+debug:
+  # pprof 排障端点默认关闭。生产开启（排障时改配置重启即可，不必发版）前
+  # 先确认服务端口不暴露公网：/debug/pprof/* 泄露 goroutine 栈与堆内容。
+  pprof: false

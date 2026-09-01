@@ -643,6 +643,26 @@ HTTP 入站不在此列：`otelhttp` 已经产出 `http.server.request.duration`
 
 需要自己加指标时用 `otel.Meter("你的域名")` 自建，别往框架标签上挂维度。
 
+### ⑤ 线上排障：pprof 端点
+
+性能问题（CPU 尖刺、goroutine 泄漏、锁竞争）光靠指标看不出所以然，
+需要 profile。框架把标准 pprof 端点收进配置开关：
+
+```yaml
+debug:
+  pprof: true    # 主端口挂 /debug/pprof/*（goroutine/heap/profile/trace…）
+```
+
+**默认关闭**——pprof 暴露进程内部信息（goroutine 栈、堆采样可能含
+敏感数据），开启前先确认服务端口不暴露公网。开关走配置而不是代码：
+线上排障改 configmap 重启即生效，不必发版。
+
+```sh
+kubectl port-forward deploy/ledger 8080 &
+go tool pprof -http=:6060 http://127.0.0.1:8080/debug/pprof/heap
+go tool pprof -http=:6060 "http://127.0.0.1:8080/debug/pprof/profile?seconds=30"
+```
+
 ### 附：跨服务的 request id 是怎么串起来的
 
 `contract` 的 ctx 防火墙会剥掉 ctx 里的一切值（进程内调用不该比跨网络调用能多传

@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/config"
 	"github.com/forgeplex/appkit/pgtx"
 )
 
@@ -17,6 +18,20 @@ type noopModule struct{}
 
 func (noopModule) Name() string                      { return "noop" }
 func (noopModule) Register(_ *appkit.Registry) error { return nil }
+
+// TestDebugPprofConfigMapping 锁住配置到框架开关的映射：BPTEST_DEBUG__PPROF=true
+// 必须落到 Base.Debug.Pprof。koanf 标签写错这类事编译器看不见，端点会
+// 「配了但没挂上」地静默失效——这正是「配了个摆设」那类坑。
+func TestDebugPprofConfigMapping(t *testing.T) {
+	t.Setenv("BPTEST_DEBUG__PPROF", "true")
+	base, err := config.Load[Base](config.Options{EnvPrefix: "BPTEST", Optional: true})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !base.Debug.Pprof {
+		t.Fatal("BPTEST_DEBUG__PPROF=true 未映射到 Base.Debug.Pprof——检查 koanf 标签")
+	}
+}
 
 // TestPoolOptionsReachProductionPool 验证 Options.PoolOptions 真的接到
 // bootstrap 建的生产池上：AfterConnect 钩子在真实路径被调用。域要给池装
