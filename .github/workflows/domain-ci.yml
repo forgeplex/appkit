@@ -44,6 +44,17 @@ jobs:
             exit 1
           fi
 
+      # 域仓库 go.mod 钉的 appkit 版本即工具版本（规则与依赖同版本升级，
+      # 不搞 @main 惊喜）；go.work 联调仓库取不到版本时退 @main。
+      # 所有 go run appkit 工具必须带 @版本：不带会用域仓库的 go.sum 编译
+      # appkit cmd，而 go mod tidy 又把域仓库 import 图之外的 sums 剥掉
+      # ——「appkit check 能跑」与「go.mod 整洁检查」两头必红一头，域侧无解。
+      - name: 解析 appkit 工具版本
+        run: |
+          v=$(go list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $2}')
+          case "$v" in v*) ;; *) v=main ;; esac
+          echo "APPKIT_TOOL=$v" >> "$GITHUB_ENV"
+
       - name: go vet
         run: go vet ./...
 
@@ -54,10 +65,10 @@ jobs:
         run: go test -race -count=1 ./...
 
       - name: appkit check（架构检查）
-        run: go run github.com/forgeplex/appkit/cmd/appkit check
+        run: go run github.com/forgeplex/appkit/cmd/appkit@"$APPKIT_TOOL" check
 
       - name: appkit sync 漂移检查
-        run: go run github.com/forgeplex/appkit/cmd/appkit sync --check
+        run: go run github.com/forgeplex/appkit/cmd/appkit@"$APPKIT_TOOL" sync --check
 
       # schema 文档漂移：改了迁移却没跑 make schema 就会红。
       # 不加 if: 守卫也不加 continue-on-error——跳不跳由命令自己按启用门决定：
@@ -65,7 +76,7 @@ jobs:
       # 任一存在就严格检查。本文件经 @main 被全部存量域仓库共享，
       # 硬加一个新检查会让它们在合并那一刻集体变红。
       - name: appkit schema 漂移检查
-        run: go run github.com/forgeplex/appkit/cmd/appkit schema -check
+        run: go run github.com/forgeplex/appkit/cmd/appkit@"$APPKIT_TOOL" schema -check
 
       # 先验规则集未漂移，再按规则集跑 lint——否则跑的可能是被改松的配置。
       # 版本必须与 ruleset.GolangciLintVersion / ruleset.ArchLintVersion 一致
@@ -77,15 +88,11 @@ jobs:
         run: go run github.com/fe3dback/go-arch-lint@v1.18.0 check
 
       # 自研检查器：金额禁 float / decimal 不上 JSON 面 / ctx 不进 struct。
-      # 版本随域仓库 go.mod 钉的 appkit 走（规则与依赖同版本升级，不搞
-      # @main 惊喜）；go.work 联调仓库取不到版本时退 @main。
+      # 版本取上面解析出的 APPKIT_TOOL。
       # 默认只查生产代码——存量域的测试文件不该被规则升级一夜卡红，
       # 要连测试一起查在本地 make lint 里显式 -xxx.tests=true。
       - name: appkit-lint（moneyfloat / ctxstruct / decjson）
-        run: |
-          v=$(go list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $2}')
-          case "$v" in v*) ;; *) v=main ;; esac
-          go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@"$v" ./...
+        run: go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@"$APPKIT_TOOL" ./...
 
       - name: go.mod 整洁检查
         run: |

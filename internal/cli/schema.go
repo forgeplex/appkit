@@ -39,6 +39,13 @@ func runSchema(args []string) error {
 	if cfg.Partitioned {
 		// 分区域域一份无前缀迁移落到 N 个分区 schema，没有单一 schema 可画——
 		// 支持它需要先想清楚「文档按分区画还是按逻辑模型画」，首版明确拒绝。
+		if *check {
+			// -check 是共享 CI 步骤（domain-ci.yml 经 @main 复用）：分区域域永远
+			// 不可能产出 schema 文档，硬失败等于让所有分区域域 CI 永红——与
+			// 「未启用」同等处理，notice 后退出 0。
+			fmt.Println("::notice title=schema 文档不适用::分区域域（partitioned: true）没有单一 schema 可画，漂移检查跳过。")
+			return nil
+		}
 		return errors.New("schema 文档暂不支持分区域域（partitioned: true）——分区映射由组合根注入，本仓库无从枚举；要看分区 schema 的结构，直接对一个分区库跑 introspect")
 	}
 	// 启用门先问、DSN 后要：未启用的仓库不该为了被告知「未启用」而先准备一个数据库。
