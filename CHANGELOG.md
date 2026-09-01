@@ -2,6 +2,39 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.5.2（2026-09-01）
+
+v0.5.2: 契约流水线落地——contract.yaml 一次生成五件套，零破坏性、零必做动作
+
+这版全是纯加法：apidiff 相对 v0.5.1 零 incompatible，已有代码的默认行为
+一概未动，升级不需要任何动作。
+
+★ appkit gen contract：契约包的创作入口从「接口手写 + gen wrap」换成
+contract.yaml 先行（与 events.yaml 同风格的 yaml 事实源），一次产出
+五份生成物——service.gen.go（Service 接口 + 传值 DTO）、wrap.gen.go
+（进程内 wrapper，复用既有 wrap 链路）、client.gen.go（HTTP client，
+实现同一接口）、server.gen.go（NewHTTPHandler）、openapi.yaml
+（OpenAPI 3.1 派生导出，供文档与 oasdiff 门禁）。DESIGN §3 的方向
+就此反转并记录在案：契约的核心语义（粗粒度方法形态、幂等声明、
+错误身份 = 错误码）在 OpenAPI 里只能靠扩展字段旁挂，所以事实是
+contract.yaml → OpenAPI，不是反过来。
+
+生成 client 焊掉了两种静默失效形态：NewClient 复制传入的
+http.Client 并焊上 callctx.Transport（忘了装 Transport 的形态不
+存在）；标了 idempotent 的方法对可用性故障做有界重试（3 次、
+100ms 起步线性退避，遇 ctx 取消立即收手）。生成 server 的 serve
+兜底把请求头里的 callctx 合并回 ctx——裸挂 handler 不经
+httpserver 中间件也不丢元数据，挂在中间件后面时是幂等重放。
+
+终证在 internal/gen/genfixture：同一份 contract.yaml 的本地
+wrapper 与「生成 client 打生成 server」的真 HTTP 回环，过同一批
+apptest.Conform 用例——「部署形态是启动参数」在生成物上成立。
+examples/greeter 的 greetapi 已改为全生成，是这条链路的最小实例。
+
+另有两件小事：pprof 排障端点收进配置开关（默认关闭，开了才挂
+/debug/pprof）；make tag 现在同时打 lint/vX.Y.Z 路标——lint 是
+嵌套 module，下游以伪版本引用时需要同节拍的路标 tag。
+
 ## v0.5.1（2026-08-31）
 
 v0.5.1: 三个安静的注入口——池选项透传、死信放回、测试样板收敛
