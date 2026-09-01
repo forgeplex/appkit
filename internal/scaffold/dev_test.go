@@ -76,6 +76,76 @@ func TestDev(t *testing.T) {
 	}
 }
 
+// TestWarnAppkitMissing 锁提示的三叉判定：appkit 发版后，工作区没有 appkit
+// 本体是合法形态（go.mod 已 require + GOPRIVATE 覆盖 → 静默），只有
+// 「未 require」与「已 require 但 GOPRIVATE 缺失」两种形态需要说话。
+func TestWarnAppkitMissing(t *testing.T) {
+	root := t.TempDir()
+	work := filepath.Join(root, "psp")
+	writeModule(t, work, "example.com/psp")
+
+	cases := []struct {
+		name      string
+		gomod     string
+		goprivate string
+		wantHint  string // 空串 = 应静默
+	}{
+		{
+			name:     "未require——依赖解析没有来源",
+			gomod:    "module example.com/psp\n\ngo 1.26\n",
+			wantHint: "未 require 发版的 appkit 版本",
+		},
+		{
+			name:      "已require且GOPRIVATE覆盖——静默",
+			gomod:     "module example.com/psp\n\ngo 1.26\n\nrequire github.com/forgeplex/appkit v0.5.2\n",
+			goprivate: "github.com/forgeplex/*",
+		},
+		{
+			name:     "已require但GOPRIVATE未覆盖",
+			gomod:    "module example.com/psp\n\ngo 1.26\n\nrequire (\n\tgithub.com/forgeplex/appkit v0.5.2\n)\n",
+			wantHint: "GOPRIVATE",
+		},
+		{
+			// 占位版本是手工钉向工作区的写法，本身就要靠工作区解析。
+			name:     "占位版本不算已require",
+			gomod:    "module example.com/psp\n\ngo 1.26\n\nrequire github.com/forgeplex/appkit v0.0.0-00010101000000-000000000000\n",
+			wantHint: "未 require 发版的 appkit 版本",
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := os.WriteFile(filepath.Join(work, "go.mod"), []byte(tt.gomod), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			warnAppkitMissing(work, []string{"."}, tt.goprivate, &out)
+			got := out.String()
+			if tt.wantHint == "" {
+				if got != "" {
+					t.Fatalf("应静默，实际输出:\n%s", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tt.wantHint) {
+				t.Fatalf("提示缺 %q:\n%s", tt.wantHint, got)
+			}
+		})
+	}
+
+	// 工作区已含 appkit 本体：无论 require 形态如何都静默。
+	appkitDir := filepath.Join(root, "appkit")
+	writeModule(t, appkitDir, "github.com/forgeplex/appkit")
+	if err := os.WriteFile(filepath.Join(work, "go.mod"),
+		[]byte("module example.com/psp\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	warnAppkitMissing(work, []string{".", appkitDir}, "", &out)
+	if out.Len() != 0 {
+		t.Errorf("工作区含 appkit 本体时不应提示:\n%s", out.String())
+	}
+}
+
 // TestDevNewModuleAppears 断言后加入的模块在下次 dev 时被纳入。
 func TestDevNewModuleAppears(t *testing.T) {
 	root := t.TempDir()

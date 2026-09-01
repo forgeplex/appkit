@@ -179,9 +179,9 @@ func checkGitAuth(o Options) Check {
 	return c
 }
 
-// checkWorkspace 针对"appkit 未发版期"的域/组合仓库：go.mod 里没有对 appkit 的
-// require（devel 骨架刻意不写）时，必须在 go.work 工作区内构建，否则 go 会去
-// 远程解析 appkit 版本。
+// checkWorkspace 检查 appkit 依赖的解析来源：go.mod 未 require appkit（源码
+// 构建的 CLI 生成的骨架形态）时，必须在 go.work 工作区内构建，否则 go 会去
+// 远程解析一个不存在的版本。
 func checkWorkspace(o Options, gowork string) (Check, bool) {
 	data, err := o.ReadFile(filepath.Join(o.Dir, "go.mod"))
 	if err != nil {
@@ -209,7 +209,7 @@ func checkWorkspace(o Options, gowork string) (Check, bool) {
 	}
 	return Check{Name: "工作区", Status: Fail,
 		Detail: "go.mod 未 require " + appkitPath + " 且不在 go.work 工作区内——" +
-			"构建时 go 会去远程解析 appkit（appkit 未打 tag 前必然失败或拉到不可控版本）",
+			"构建时 go 会去远程解析 appkit，而远程没有可解析的版本（私有库另需 GOPRIVATE，见上方检查项）",
 		Fix: "在仓库目录运行 appkit dev（父目录需有 appkit 的 checkout；或 appkit dev -root <多仓根目录>）",
 	}, true
 }

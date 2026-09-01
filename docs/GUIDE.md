@@ -127,9 +127,10 @@ appkit new domain clients  -dir clients
 
 ```sh
 cd identity
-appkit dev       # 生成 go.work。★ appkit 未发版期间，appkit 的 checkout 必须
-                 # 位于同一根目录下才会被纳入（不在则按 dev 的提示手动
-                 # go work use <appkit 路径>），否则依赖解析会走远程
+appkit dev       # 生成 go.work：同根目录下的兄弟仓库全部纳入联调。go.mod 已
+                 # require 发版的 appkit，按发版版本构建不依赖工作区；要吃本地
+                 # 未发布的 appkit 改动，才把 appkit checkout 也 go work use 进来
+                 #（appkit 不在同一根目录下时按 dev 的提示手动 use）
 make run         # 零依赖试跑：最小模式（仅 /healthz /readyz /identity/ping）
 make run-db      # 完整模式：自动起一次性开发 Postgres（docker）并注入 database.url
 make check && make lint && make test   # = CI 跑的那几条

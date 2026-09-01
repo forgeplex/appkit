@@ -60,7 +60,7 @@ func Domain(o Options, out io.Writer) error {
 		return fmt.Errorf("new domain %s: 物化规则集: %w", o.Name, err)
 	}
 	summarize(out, "域仓库", o.Dir, []string{
-		"appkit dev    # 生成 go.work 联调本地 appkit（appkit 未发版时必需）",
+		"appkit dev    # 生成 go.work 联调兄弟仓库；要吃本地未发布的 appkit 改动，把 appkit 也纳入",
 		"make run      # 零依赖试跑（最小模式）；make run-db 进完整模式",
 		"make check && make test",
 	})
