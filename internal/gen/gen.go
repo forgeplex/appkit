@@ -1,4 +1,5 @@
-// Package gen 实现 appkit gen 的三个代码生成器：
+// Package gen 实现 appkit gen 的四个代码生成器：
+// contract（契约五件套：接口/DTO/wrapper/client/server + openapi 派生导出）、
 // events（事件类型）、errors（错误码）、wrap（契约 wrapper，ProvideContract 闭环）。
 //
 // 共同约定：生成物首行是标准 "Code generated" 头；输出前经 go/format 格式化；

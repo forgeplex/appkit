@@ -353,7 +353,7 @@ mkdir sso-contracts && cd sso-contracts && go mod init github.com/forgeplex/sso-
 mkdir identityv1
 ```
 
-**错误码与事件用 yaml 声明、生成代码**（不手写，杜绝双源漂移）：
+**契约、错误码与事件都用 yaml 声明、生成代码**（不手写，杜绝双源漂移）：
 
 ```yaml
 # identityv1/codes.yaml
@@ -381,30 +381,38 @@ appkit gen errors -in identityv1/codes.yaml  -out identityv1/codes.gen.go
 appkit gen events -in identityv1/events.yaml -out identityv1/events.gen.go
 ```
 
-**契约接口手写一次，wrapper 生成**。接口必须是"ctx + 至多一个请求 DTO →
-至多一个响应 + error"的粗粒度形态（`gen wrap` 会拒绝其他签名——这本身是
-框架约束：契约按网络边界设计，DESIGN §5.3）：
+**契约接口同样由 yaml 声明、全量生成**。事实源是 `contract.yaml`（与 events.yaml
+同风格），`appkit gen contract` 一次产出五份文件——`service.gen.go`（Service
+接口 + 传值 DTO）、`wrap.gen.go`（进程内 wrapper）、`client.gen.go`（HTTP
+client，实现同一接口）、`server.gen.go`（`NewHTTPHandler`）、`openapi.yaml`
+（派生导出，供文档与 oasdiff 门禁消费）：
 
-```go
-// identityv1/service.go
-type Service interface {
-    VerifyCredential(ctx context.Context, req VerifyCredentialRequest) (VerifyCredentialReply, error)
-}
-
-// DTO 一律传值、可序列化（按网络边界设计）。
-type VerifyCredentialRequest struct {
-    Email    string `json:"email"`
-    Password string `json:"password"`
-}
-type VerifyCredentialReply struct {
-    UserID string `json:"user_id"`
-    OK     bool   `json:"ok"`
-}
+```yaml
+# identityv1/contract.yaml
+version: 1
+package: identityv1
+system: identity
+methods:
+  - name: VerifyCredential
+    path: /verify-credential
+    doc: 校验用户凭据；凭据错误返回 IDENTITY_INVALID_CREDENTIAL。
+    idempotent: true
+    request:
+      - { name: email,    type: string, required: true }
+      - { name: password, type: string, required: true }
+    response:
+      - { name: user_id, type: string }
+      - { name: ok,      type: bool }
 ```
 
 ```sh
-appkit gen wrap -src identityv1 -iface Service -system identity -out identityv1/service_wrap.gen.go
+appkit gen contract -in identityv1/contract.yaml -dir identityv1
 ```
+
+方法形态被钉死在"ctx + 至多一个请求 DTO → 至多一个响应 + error"的粗粒度上
+（空 request 即无参，空 response 即仅 error）——契约按网络边界设计
+（DESIGN §5.3）。`idempotent: true` 的方法，生成 client 会对可用性故障做
+有界重试；`doc` 必填——契约是给别的团队读的。
 
 然后：
 
@@ -427,8 +435,8 @@ appkit gen wrap -src identityv1 -iface Service -system identity -out identityv1/
 
 ### 给契约加一条一致性测试（`apptest`）
 
-上面那句"进程内和远程语义一致"是框架的承诺，但**承诺归承诺，你的 client 归你的
-client**。json key 两侧对不上、手写 client 漏了 `contract.Call`、领域错误在
+上面那句"进程内和远程语义一致"是框架的承诺，但**承诺归承诺，装配归装配**。
+client 指向了错的环境、实现没走 `ProvideContract` 那条链路、领域错误在
 problem+json 往返后换了码——这些都只在真正拆分部署的那天才炸，而那天你多半正在
 救别的火。`apptest.Conform` 让同一批用例分别跑过两个绑定，当场比对。
 
@@ -437,13 +445,14 @@ problem+json 往返后换了码——这些都只在真正拆分部署的那天�
 
 ```go
 func TestIdentityConformance(t *testing.T) {
-    srv := httptest.NewServer(identityHTTPHandler(newContractImpl(svc)))
+    impl := identityv1.WrapService(newContractImpl(svc), 0)
+    srv := httptest.NewServer(identityv1.NewHTTPHandler(impl))
     t.Cleanup(srv.Close)
 
     apptest.Conform(t,
         []apptest.Binding[identityv1.Service]{
-            {Name: "local", Service: identityv1.WrapService(newContractImpl(svc), 0)},
-            {Name: "remote", Service: identityv1.NewClient(srv.URL)},
+            {Name: "local", Service: impl},
+            {Name: "remote", Service: identityv1.NewClient(srv.URL, "authn", nil)},
         },
         []apptest.Case[identityv1.Service]{
             {Name: "凭据正确", Do: verify("a@b.c", "right"),
@@ -492,11 +501,10 @@ app := appkit.New(
     appkit.Middleware(httpserver.Base(log)...),
     appkit.HTTPAddr(cfg.Addr),
     appkit.Logger(log),
-    // target 之外的域落到远程绑定：注入实现同一契约接口的 HTTP client。
-    // ★ client 目前需手写（对着契约接口实现，错误经 apperr.FromProblem 重建，
-    //   错误码身份跨网络不变）；`appkit gen client` 在路线图上。
+    // target 之外的域落到远程绑定：注入生成的 HTTP client（实现同一契约接口，
+    // 错误经 apperr.FromProblem 重建——错误码身份跨网络不变）。
     // appkit.Remote[identityv1.Service](func(*appkit.Registry) (identityv1.Service, error) {
-    //     return identityclient.New(cfg.Endpoints.Identity), nil
+    //     return identityv1.NewClient(cfg.Endpoints.Identity, "sso", nil), nil
     // }),
 )
 return app.Run(ctx)
@@ -673,21 +681,16 @@ go tool pprof -http=:6060 "http://127.0.0.1:8080/debug/pprof/profile?seconds=30"
 - 契约调用（进程内）：防火墙剥值后把它放回（自动）；
 - 事件：outbox 发布时快照进 `Event.Meta`，relay 投递前还原进 ctx——异步链路上也连得起来（自动）。
 
-**出站 HTTP 是唯一要你自己接的一段**：合约仓库的 client 是手写的（`appkit gen`
-只生成 events/errors/wrap，不生成 client）。装配 client 时接上 `callctx.Transport`：
+出站 HTTP 这一段也由生成物接管：`appkit gen contract` 产出的 client 在
+`NewClient` 里把传入的 `http.Client` 复制一份、焊上
+`callctx.Transport{Caller: caller}` 再发请求——"忘了装 Transport"的静默
+失效形态不存在。`caller` 参数填**自己**的服务名；它的语义是"谁调的我"，
+留空会把上一跳的名字原样透传下去，下游据此做的归因、限流与配额也就跟着错。
+链路起点看 request id，不看 caller。
 
-```go
-client := &http.Client{Transport: callctx.Transport{Caller: "ledger"}}
-```
-
-`Caller` 填**自己**的服务名。它的语义是"谁调的我"，留空会把上一跳的名字原样透传
-下去，下游据此做的归因、限流与配额也就跟着错。链路起点看 request id，不看 caller。
-
-也可以在构造每个请求时手写 `callctx.Inject(callctx.From(ctx), req.Header.Set)`，
-但那把"会不会漏"摊到了每一个调用点上，而 `Transport` 只有装配处一处。
-
-漏了这一段，进程内绑定拿得到 tenant、远程 client 拿不到——"部署形态是启动参数"
-就此失效，且只在真拆分那天暴露。
+裸挂 server handler（不经 `httpserver` 中间件）时元数据也不会丢：生成的
+`serve` 兜底会把请求头里的 callctx 合并回 ctx；正常挂在 `httpserver.Base`
+后面时这步是幂等重放，request id 的生成与回写仍是外层中间件的职责。
 
 **要验它接没接上**，给 `apptest.Conform` 的每个 `Binding` 填上 `SeenMeta`：
 
@@ -698,7 +701,7 @@ seen := func() callctx.Meta { return spy.Last() }
 apptest.Conform(t,
     []apptest.Binding[echov1.Service]{
         {Name: "local", Service: echov1.WrapService(spy, 0), SeenMeta: seen},
-        {Name: "remote", Service: echov1.NewClient(srv.URL), SeenMeta: seen},
+        {Name: "remote", Service: echov1.NewClient(srv.URL, "echo", nil), SeenMeta: seen},
     },
     []apptest.Case[echov1.Service]{
         // 检查跑在这条上：它要额外发一次真实调用，得有 Idempotent 授权。
@@ -772,7 +775,7 @@ go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@v0.4.0 -moneyfloat.scope
 | 改数据库结构 | 新增 `000N_xxx.sql`（建表同一文件里写 `COMMENT ON TABLE`）+ `make schema` | 改已应用的迁移文件（启动报 MIGRATION_DRIFT）；手改 `db/schema/`（CI 报漂移） |
 | 搞清楚现有表长什么样 | 读 `db/SCHEMA.md` / `db/schema/<表>.sql` | 翻整条迁移历史在脑子里重放 |
 | 加业务指标 | `otel.Meter("你的域名")` 自建 | 往框架指标上加标签（基数无界） |
-| 传 request id / 租户 | `callctx.Meta`（入站/契约/事件自动，出站 client 自己 `Inject`） | 自己往 ctx 塞值（跨契约调用会被防火墙剥掉） |
+| 传 request id / 租户 | `callctx.Meta`（入站/契约/事件自动，生成 client 出站自动焊 `Transport`） | 自己往 ctx 塞值（跨契约调用会被防火墙剥掉） |
 | 确认拆分部署不会变行为 | 提供方域仓库里写一条 `apptest.Conform`（local + remote 两个绑定） | 只测本地实现（远程那条路径第一次跑就是在生产） |
 
 ## FAQ

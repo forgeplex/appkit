@@ -38,8 +38,8 @@
 ```
 github.com/forgeplex/
 ├── appkit                # 框架：运行时 + CLI + lint 规则集 + CI 模板
-├── psp-contracts         # ★ 唯一事实源：OpenAPI + 事件 schema + 错误码
-│                         #   发布生成好的 Go module（接口/DTO/client/事件类型/错误码常量）
+├── psp-contracts         # ★ 唯一事实源：contract.yaml + 事件 schema + 错误码
+│                         #   发布生成好的 Go module（接口/DTO/wrapper/client/server/事件类型/错误码常量）
 ├── auth                  # 业务域 repo（appkit new domain 生成）
 ├── ledger                # 业务域 repo
 ├── gateway               # 业务域 repo
@@ -69,7 +69,9 @@ github.com/forgeplex/
    （这消灭了对抗评审发现的两个致命问题：事件类型放各域导致的 tag 发版死锁 / 循环 require；
    以及"import 对方根包就把对方全部实现和依赖图链进自己二进制"的 MVS 污染。）
 2. **契约（接口 + DTO + 事件 + 错误码）只有一个事实源**：psp-contracts。
-   Go 类型全部由 OpenAPI / 事件 schema 生成，杜绝"Go 接口和 OpenAPI 双源真理"漂移。
+   Go 类型全部由 contract.yaml / 事件 schema / 错误码注册表生成（`appkit gen`），
+   杜绝"Go 接口和契约文档双源真理"漂移——OpenAPI 是从 contract.yaml 派生的
+   导出物（文档与 oasdiff 门禁的输入），不是第二份手写事实。
 3. **域 repo 的实现全部在 `internal/`**，对外只暴露一个 `Module()` 入口包，
    且这个入口只被 psp（和本域自己的 cmd/）import。
 
@@ -151,31 +153,36 @@ appkit-lint/                     # ★ 独立 module：自研 go/analysis analyz
 
 ```
 psp-contracts/
-├── openapi/
-│   ├── ledger.yaml              # 每个域一份 OpenAPI（对外 HTTP 契约）
-│   ├── auth.yaml  merchant.yaml  gateway.yaml
-├── events/
-│   ├── ledger.events.yaml       # 事件 schema（topic + payload JSON Schema + 版本）
-│   └── ...
-├── errors/
-│   └── codes.yaml               # 全系统错误码注册表（LEDGER_INSUFFICIENT_FUNDS…）
-├── go/                          # ★ 生成的 Go module：github.com/forgeplex/psp-contracts/go
-│   ├── go.mod                   #   零重依赖（只 stdlib + appkit/apperr 轻依赖）
-│   ├── ledgerv1/
-│   │   ├── service.go           #   type Service interface{...}（跨模块调用的唯一类型）
-│   │   ├── dto.go               #   请求/响应 DTO（传值、可序列化）
-│   │   ├── server.gen.go        #   oapi-codegen server interface（域 repo 实现它）
-│   │   ├── client.gen.go       #   HTTP client（实现同一个 Service 接口）
-│   │   ├── events.gen.go        #   事件类型
-│   │   └── codes.gen.go         #   错误码常量
-│   └── authv1/ merchantv1/ gatewayv1/ ...
-└── .github/workflows/           # 生成 drift check + oasdiff 破坏性变更门禁 + tag 发布
+├── ledgerv1/                    # 每个域一个包：yaml 事实源与生成物同目录
+│   ├── contract.yaml            # ★ 同步契约事实源：system + methods（path/doc/
+│   │                            #   idempotent/request/response）+ 命名 DTO
+│   ├── events.yaml              # 事件 schema（topic + payload 字段）
+│   ├── codes.yaml               # 错误码注册表（LEDGER_INSUFFICIENT_FUNDS…）
+│   ├── service.gen.go           # type Service interface + 传值 DTO
+│   ├── wrap.gen.go              # 进程内 wrapper：方法体经 contract.Call（ProvideContract 闭环）
+│   ├── client.gen.go            # 远程 client：同一接口 + 幂等方法有界重试（CodeUnavailable）
+│   ├── server.gen.go            # HTTP 暴露：与 client 互为镜像的编解码
+│   ├── events.gen.go            # 事件类型
+│   ├── codes.gen.go             # 错误码常量与 sentinel
+│   └── openapi.yaml             # 派生导出：文档 + oasdiff 门禁输入（非事实源，禁手改）
+├── authv1/ merchantv1/ gatewayv1/ ...
+├── go.mod                       # module github.com/forgeplex/psp-contracts
+│                                #   零重依赖（stdlib + appkit 的 contract/apperr/callctx）
+└── .github/workflows/           # 生成 drift check + oasdiff 门禁 + tag 发布
 ```
 
 要点：
 - 域 repo 和消费方 require 的是**生成好的 module**（版本锁定），而不是各自本地 codegen——
   杜绝各 repo 生成器版本不同导致的类型漂移。
-- 契约变更流程：改 yaml → CI 跑 oasdiff（破坏性变更需显式标记 major）→ 生成 → tag。
+- **方向是 contract.yaml → OpenAPI，不是反过来。** 初版设想 OpenAPI 手写为源、
+  oapi-codegen 消费；落地时反转：契约的核心语义（粗粒度方法形态、幂等声明、
+  错误身份 = 错误码）在 OpenAPI 里只能靠扩展字段旁挂，而 contract.yaml 与
+  events/errors 同风格、校验报错带行号。openapi.yaml 退为派生导出——
+  文档与 oasdiff 破坏性变更门禁消费它，但改契约永远从 contract.yaml 入手。
+- 契约变更流程：改 contract.yaml → `appkit gen contract` 重新生成 →
+  CI 跑 oasdiff（对 openapi.yaml 判破坏性）与 drift check（生成物未手改）→ tag。
+- HTTP 形态唯一：全方法 POST + JSON body，错误一律 problem+json。
+  契约调用是 RPC 语义而非 REST 资源语义，client/server 编解码因此只有一份约定。
 
 ## 4. 业务域 repo（以 ledger 为例，`appkit new domain ledger` 生成）
 
@@ -205,8 +212,9 @@ ledger/                          # module github.com/forgeplex/ledger
 │   ├── postgres/                # ★ 全 repo 唯一允许 import pgx/sqlc 的包；实现 ledger 包的接口
 │   │   ├── store.go
 │   │   └── sqlc/                #   sqlc 生成物，禁手改，CI drift check
-│   ├── http/                    # 实现 contracts 生成的 server interface；
-│   │                            #   只做 DTO↔ledger 类型映射；禁业务规则/SQL（机检）
+│   ├── http/                    # 对外 HTTP handler；契约端点直接挂 contracts 生成的
+│   │                            #   NewHTTPHandler(包 WrapService 的实现)；业务路由只做
+│   │                            #   DTO↔ledger 类型映射；禁业务规则/SQL（机检）
 │   ├── inbox/                   # 事件消费者：去重后调 ledger 业务包（处理外域事件）
 │   └── module/                  # Module 实现：Register 里装配路由/迁移/consumer/health
 ├── db/
@@ -293,11 +301,10 @@ app.Run(ctx)
 ### 5.3 进程内调用 ≠ 裸方法调用（ServiceWeaver 的教训，反向落地）
 
 跨模块契约调用（本地或远程）统一经过 `contract.Call`——**与远程语义对齐的拦截器链**。
-拦截器的落点是合约仓库生成的 wrapper/client 的方法体（里程碑 3）：生成的本地 wrapper
-与 HTTP client 实现同一接口、方法体内都调 `contract.Call`；`appkit.ProvideContract`
-在 Provide 处强制应用 wrapper，使裸实现进不了 registry。在合约生成流水线就绪前，
-这条约束靠手写 wrapper 遵守（examples/greeter 演示了标准写法）——诚实地说，
-此时它是"约定 + 运行时守卫"，不是"不可绕过"。拦截器链：
+拦截器的落点是合约仓库生成的 wrapper/client 的方法体：`appkit gen contract` 从
+contract.yaml 生成同一接口的进程内 wrapper 与 HTTP client，方法体内都调
+`contract.Call`；`appkit.ProvideContract` 在 Provide 处强制应用 wrapper，使裸实现
+进不了 registry。examples/greeter 的 greetapi 就是全生成的最小实例。拦截器链：
 
 1. **ctx 防火墙**：剥离事务（pgtx）与请求作用域值，只保留 trace、deadline、白名单元数据。
    —— 修复对抗评审发现的致命问题："ctx 隐式事务在进程内跨模块调用时静默泄漏，
@@ -343,7 +350,7 @@ app.Run(ctx)
 | http 包不写 SQL、业务包零 infra import | depguard + go-arch-lint：配置由 `appkit sync` 物化（同时解决 IDE 集成与 golangci-lint 无配置继承），CI 先验未漂移**再按它跑这两个检查器**，版本与域仓库 `make lint` 同源（`ruleset.GolangciLintVersion` / `ArchLintVersion`） | ▲ CI 级，nolint 需写理由 |
 | 金额禁 float、ctx 不进 struct、decimal 不上 JSON 面 | appkit-lint 自研 analyzer（moneyfloat[-scope 圈定业务包] / ctxstruct / decjson）；domain-ci.yml 与域仓库 `make lint` 都跑它，版本随 go.mod 钉的 appkit 走（规则与依赖同版本升级，不搞 @main 惊喜；go.work 联调仓库退 @main） | ▲ CI 级：默认只查生产代码——测试夹具低一档，且存量域的测试不该被规则升级卡红（`-<name>.tests=true` 可连测试查） |
 | 事务不泄漏到业务代码 | pgtx 回调式 API，业务只见 ctx | ★ API 设计级 |
-| 事务内禁跨模块调用 | contract.Call 运行时守卫（HasTx 检查）；前提是调用经生成 wrapper（ProvideContract 强制包裹；生成流水线就绪前靠约定） | ▲ 运行时级，测试即暴露 |
+| 事务内禁跨模块调用 | contract.Call 运行时守卫（HasTx 检查）；前提是调用经生成 wrapper（ProvideContract 强制包裹；生成物由 `appkit gen contract` 产出） | ▲ 运行时级，测试即暴露 |
 | 忘发事件不可能 | outbox.Publish 是事务 API 的一等公民 | ★ API 设计级 |
 | 生成物禁手改 | CI 重新生成后 `git diff --exit-code` | ▲ CI 级 |
 | appkit/contracts 向后兼容 | apidiff / oasdiff 门禁 | ▲ CI 级 |
@@ -437,11 +444,13 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
    config + httpserver + apperr + telemetry + health + contract 边界。
 2. ✅ **数据面**（2026-08 已实现）：tx/pgtx + money(+pgxmoney) + pgmigrate + outbox + idem。
    示例见 examples/greeter（双模式组合演示）。
-3. ◐ **契约生成（框架侧已完成，2026-08）**：`appkit gen events|errors`（yaml → 事件类型/
-   错误码常量）、`appkit gen wrap`（Go 接口 → contract.Call 拦截 wrapper，粗粒度签名校验
-   即框架约束）+ `ProvideContract` 闭环。剩余部分属于 psp-contracts 仓库自身
-   （markdown 合约翻译为 OpenAPI + 事件 schema、oapi-codegen 流水线、tag 发布），
-   在各业务/合约仓库落地，不在 appkit 内。
+3. ✅ **契约生成（2026-09 补全 client/server/openapi）**：`appkit gen contract`
+   （contract.yaml → service.gen.go 接口与 DTO + wrap.gen.go + client.gen.go
+   远程 client 含幂等有界重试 + server.gen.go + openapi.yaml 派生导出）、
+   `appkit gen events|errors`（yaml → 事件类型/错误码常量）+ `ProvideContract` 闭环。
+   生成物过 apptest.Conform 双绑定的证明常住于 internal/gen/genfixture；
+   examples/greeter/greetapi 是全生成契约包的最小实例。剩余部分属于
+   psp-contracts 仓库自身（建仓、搬入各域合约、oasdiff 门禁、tag 发布）。
 4. ✅ **CLI + ruleset + lint**（2026-08 已实现）：
    - `appkit new domain|system`（域骨架 24 文件，基础迁移由 outbox/idem/audit.MigrationSQL
      运行期拼装——库函数是 DDL 唯一事实源；生成仓库可离线完整编译且通过自身 check/sync）
