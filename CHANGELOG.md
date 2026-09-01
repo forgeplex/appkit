@@ -2,6 +2,48 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.5.3（2026-09-01）
+
+分区域域（partitioned domain）：一套代码、N 份数据分区，schema 由调用方确定
+
+为什么：psp 的商户/运营/代理商是三套独立用户体系，要共用同一份 rbac 域代码，
+但数据要强隔离——体系 A 的查询根本看不到体系 B 的表，漏过滤的失败形态是
+「表不存在」而不是「数据泄露」。此前 schema 名烧死在迁移文件、const Schema、
+sqlc 前缀与 .appkit.yml 四处，运行时无法改。
+
+这一版加了什么：
+
+- `pgtx.NewRouted(pool, route)`：路由 Transactor。每次 Do 开启事务后调用
+  route（通常从 callctx.Meta.TenantID 查组合根注入的分区映射）并
+  SET LOCAL search_path；事务结束自动还原，连接归还池时不带走设置。
+  查无分区即回滚失败，绝不静默落到默认 search_path。
+- `outbox` / `idem` / `audit` 各加 `MigrationSQLBare()`：无 schema 前缀的
+  基础设施表 DDL，供分区域域的迁移使用；带前缀版不变，两版列定义一致。
+- `pgmigrate`：应用每个迁移文件前 SET LOCAL search_path 到该 set 的
+  schema——同一份无前缀 FS 可注册到 N 个分区（reg.Migrations 每分区一次），
+  schema 不存在时自动建。存量带前缀迁移不受影响（显式限定名不参与
+  search_path 解析）。新分区 = 组合根映射加一条 + 重启，零代码零手写 SQL。
+- `appkit new domain <name> -partitioned`：生成无前缀世界骨架——专用 module
+  模板（Options.Schemas 注入、路由 Transactor、routed Publisher、每分区
+  outbox relay）、无前缀基础迁移、`.appkit.yml` 写 `partitioned: true`。
+- 分区映射的定义放组合根自己的配置文件（koanf 支持 map[string]string），
+  经 module.Options.Schemas 注入——框架不暗读全局配置。
+- `archcheck`：partitioned 域的 SQL 前缀规则翻转，任何 schema 前缀都是违规；
+  与 sqlc 编译器的「带前缀/无前缀两个世界各自封闭」互为冗余，跨域访问的
+  静态保证从前缀扫描转移为编译解析，强度不降级。
+- `appkit schema` 对分区域域明确报错暂不支持（分区映射由组合根注入，域仓库
+  无从枚举），已在 DESIGN §7 记 ✗ 待补。
+
+硬纪律：分区域的查询必须经 tx.Do——事务外 pgtx.From 落在默认 search_path
+上，无前缀表不存在即报错（失败响亮，不静默读写错误分区）。
+
+兼容性：公开 API 纯新增（NewRouted、三个 MigrationSQLBare、
+ruleset.AppConfig.Partitioned），apidiff 相对 v0.5.2 零 incompatible；
+Transactor 保持可比较（路由函数收在指针后）。既有单 schema 域零感知，
+不需要任何改动。
+
+详见 docs/DESIGN.md §8「分区域域」与 docs/GUIDE.md §3.1。
+
 ## v0.5.2（2026-09-01）
 
 v0.5.2: 契约流水线落地——contract.yaml 一次生成五件套，零破坏性、零必做动作
