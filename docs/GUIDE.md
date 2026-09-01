@@ -343,6 +343,10 @@ COMMENT ON COLUMN identity.credentials.secret IS '密文，明文永不落库。
 还没启用的仓库（`db/SCHEMA.md` 与 `db/schema/` 都不存在）CI 只打一条提示后放行；
 跑过一次 `make schema` 并提交产出，这个仓库就永久转严。
 
+启用之后，缺 `COMMENT ON TABLE` 的业务表有两处会被点名：生成文档里的 ⚠ 缺说明，
+以及 CI 里 `appkit schema -check` 逐表打的 `::warning` 注解（GitHub 摘要与 PR
+里可见，但不阻断合并）——两处用的是同一条谓词，标了 ⚠ 的就是被注解的。
+
 ## 5. 第四步：契约仓库（域间协作的唯一通道）
 
 域仓库**永不互相 require**（`appkit check` 第一条就查这个）。authn 要校验

@@ -61,7 +61,13 @@ func runSchema(args []string) error {
 	o := schemadoc.Options{Dir: *dir, DSN: *dsn, Schema: cfg.Domain}
 	ctx := context.Background()
 	if *check {
-		if err := schemadoc.Check(ctx, o); err != nil {
+		// 缺 COMMENT 是软约束：打 ::warning 注解（GitHub 摘要与 PR 里可见），
+		// 不让 CI 变红——哪怕有漂移硬失败也先点名，一次把两类问题给全。
+		missing, err := schemadoc.Check(ctx, o)
+		for _, t := range missing {
+			fmt.Printf("::warning title=缺表说明::%s 没有 COMMENT ON TABLE——在建表迁移里补一句，表的用途跟着表一起演进。\n", t)
+		}
+		if err != nil {
 			return err
 		}
 		fmt.Println("schema 文档无漂移")

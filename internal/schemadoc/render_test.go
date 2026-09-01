@@ -161,6 +161,21 @@ func TestRenderMissingCommentMarked(t *testing.T) {
 	}
 }
 
+// TestMissingComments 锁 ::warning 的点名清单与渲染层 ⚠ 标注是同一条谓词——
+// 文档里标了 ⚠ 的表，必须正好是 MissingComments 报出来的表。
+func TestMissingComments(t *testing.T) {
+	got := MissingComments(sampleSchema())
+	want := []string{"ledger.entries"}
+	if len(got) != len(want) {
+		t.Fatalf("MissingComments = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("MissingComments[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestRenderTableMD(t *testing.T) {
 	files, err := Render(sampleSchema())
 	if err != nil {

@@ -169,6 +169,9 @@ func TestDomainScaffold(t *testing.T) {
 			// 迁移是追加日志，一张表的真实形状散在 N 个文件里。规程不指向
 			// db/schema/，代理就会继续在脑子里重放整条迁移历史（并且重放错）。
 			"db/schema/", "make schema", "COMMENT ON TABLE",
+			// 缺 COMMENT 的两处点名（文档 ⚠ 与 CI ::warning）用的是同一条
+			// 谓词——规程只说一处，代理就不知道另一处也是软的、可以补。
+			"::warning",
 			"MIGRATION_DRIFT", "make migrate", "apptest.Conform",
 			// 幂等的两个注入口：不写进规程，代理就只会裸套中间件，
 			// "80"/"80.00" 的重试撞 422、多租户手拼前缀这些问题一个都躲不掉。

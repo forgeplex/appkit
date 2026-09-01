@@ -198,27 +198,43 @@ func Generate(ctx context.Context, o Options) ([]string, error) {
 
 // Check 比对磁盘上的产出与重新生成的内容，漂移时返回错误。
 // 两份产出都不存在（尚未启用）时返回 ErrNotAdopted，由调用方决定如何处理。
-func Check(ctx context.Context, o Options) error {
+//
+// 无论是否漂移，都一并返回缺 COMMENT ON TABLE 的业务表清单——那是软约束
+// （渲染层标 ⚠，CI 打 ::warning），不该让检查变红，但值得被点名。
+func Check(ctx context.Context, o Options) ([]string, error) {
 	on, err := Adopted(o.Dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !on {
-		return ErrNotAdopted
+		return nil, ErrNotAdopted
 	}
 	s, err := Introspect(ctx, o)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	want, err := Render(s)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	got, err := readOnDisk(o.Dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return diff(want, got)
+	return MissingComments(s), diff(want, got)
+}
+
+// MissingComments 返回缺 COMMENT ON TABLE 的业务表（schema.table 形式，有序）。
+// 谓词必须与 render.go 打 ⚠ 的那条保持一致：文档里标了 ⚠ 的表就是这里点名的表。
+// 框架表不算——它的 DDL 归 appkit 库函数维护，域仓库改不动自己那份已应用的 0001。
+func MissingComments(s Schema) []string {
+	var out []string
+	for _, t := range s.Tables {
+		if t.Comment == "" && !t.Framework() {
+			out = append(out, s.Name+"."+t.Name)
+		}
+	}
+	return out
 }
 
 // Adopted 报告仓库是否已启用：任一产出存在即算启用，两者都不在才是未启用。

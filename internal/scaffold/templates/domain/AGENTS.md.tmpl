@@ -38,7 +38,8 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
    一张表的真实形状散在 N 个文件里，别在脑子里重放整条历史。
    建表时在同一个迁移里写 `COMMENT ON TABLE {{.Name}}.users IS '…'`——表的用途
    属于 schema 设计，写在迁移里才会跟着表一起演进，写在外部文档里必腐；缺了会在
-   `db/SCHEMA.md` 里被标 ⚠（不阻断 CI，但 review 时看得见）。
+   `db/SCHEMA.md` 里被标 ⚠，CI 的 `appkit schema -check` 会逐表打 ::warning
+   注解（不阻断合并，但 review 与 PR 里都看得见）。
    写完跑 `make schema` 重新生成 schema 文档，产出一并提交。
 2. **SQL** `db/queries/xxx.sql`：sqlc 注释语法（`-- name: InsertUser :exec`），
    表名带 `{{.Name}}.` 前缀。然后 `make gen`。
