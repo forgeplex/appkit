@@ -15,7 +15,7 @@ var update = flag.Bool("update", false, "重写 genfixture 下的 golden 生成�
 var goldenFiles = map[string][]string{
 	"events":   {"genfixture/events.gen.go"},
 	"errors":   {"genfixture/codes.gen.go"},
-	"contract": {"genfixture/service.gen.go", "genfixture/wrap.gen.go"},
+	"contract": {"genfixture/service.gen.go", "genfixture/wrap.gen.go", "genfixture/client.gen.go", "genfixture/server.gen.go"},
 }
 
 func TestGolden(t *testing.T) {

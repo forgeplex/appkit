@@ -67,9 +67,11 @@ var rePath = regexp.MustCompile(`^/[a-zA-Z0-9/_-]*[a-zA-Z0-9_-]$`)
 //
 //	service.gen.go  Service 接口 + 传值 DTO（本文件渲染）
 //	wrap.gen.go     进程内 wrapper（复用 Wrap 链路，扫刚写出的 service.gen.go）
+//	client.gen.go   远程 client：同一接口，contract.Call + 幂等有界重试
+//	server.gen.go   HTTP 暴露：与 client 互为镜像的编解码
 //
 // 方法 HTTP 形态唯一：POST + JSON body，错误一律 problem+json——
-// 契约调用是 RPC 语义，client/server 两侧的编解码因此只有一份实现。
+// 契约调用是 RPC 语义，client/server 两侧的编解码因此只有一份约定。
 func Contract(inPath, outDir string) error {
 	if inPath == "" || outDir == "" {
 		return fmt.Errorf("gen contract 需要 -in <contract.yaml> 与 -dir <pkgdir>")
@@ -86,6 +88,12 @@ func Contract(inPath, outDir string) error {
 	}
 	// wrap 复用既有链路：扫刚写出的 service.gen.go，wrap.go 自身零改动。
 	if err := Wrap(outDir, "Service", doc.System, filepath.Join(outDir, "wrap.gen.go")); err != nil {
+		return err
+	}
+	if err := writeGo(filepath.Join(outDir, "client.gen.go"), renderClient(doc)); err != nil {
+		return err
+	}
+	if err := writeGo(filepath.Join(outDir, "server.gen.go"), renderServer(doc)); err != nil {
 		return err
 	}
 	return nil

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/tx"
 )
 
@@ -35,30 +36,37 @@ var (
 type stubService struct {
 	calls []string
 	err   error
+	// meta 是最后一次调用看到的元数据（验证白名单穿透边界后剩什么）。
+	meta callctx.Meta
 }
 
-func (s *stubService) Greet(_ context.Context, req GreetRequest) (GreetReply, error) {
+func (s *stubService) Greet(ctx context.Context, req GreetRequest) (GreetReply, error) {
 	s.calls = append(s.calls, "Greet")
+	s.meta = callctx.From(ctx)
 	return GreetReply{Message: "hi " + req.Name}, s.err
 }
 
-func (s *stubService) Stats(context.Context) (StatsReply, error) {
+func (s *stubService) Stats(ctx context.Context) (StatsReply, error) {
 	s.calls = append(s.calls, "Stats")
+	s.meta = callctx.From(ctx)
 	return StatsReply{Served: 7}, s.err
 }
 
-func (s *stubService) Reset(_ context.Context, _ ResetRequest) error {
+func (s *stubService) Reset(ctx context.Context, _ ResetRequest) error {
 	s.calls = append(s.calls, "Reset")
+	s.meta = callctx.From(ctx)
 	return s.err
 }
 
-func (s *stubService) Ping(context.Context) error {
+func (s *stubService) Ping(ctx context.Context) error {
 	s.calls = append(s.calls, "Ping")
+	s.meta = callctx.From(ctx)
 	return s.err
 }
 
-func (s *stubService) Search(_ context.Context, req SearchRequest) (SearchReply, error) {
+func (s *stubService) Search(ctx context.Context, req SearchRequest) (SearchReply, error) {
 	s.calls = append(s.calls, "Search")
+	s.meta = callctx.From(ctx)
 	return SearchReply{Entries: []Entry{{EntryID: "e-1", Amount: "1.00"}}, NextCursor: req.Prefix + "|next"}, s.err
 }
 
