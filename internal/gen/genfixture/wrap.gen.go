@@ -50,3 +50,9 @@ func (w wrappedService) Ping(ctx context.Context) error {
 	})
 	return err
 }
+
+func (w wrappedService) Search(ctx context.Context, req SearchRequest) (SearchReply, error) {
+	return contract.Call(ctx, "greet", "Search", w.timeout, func(ctx context.Context) (SearchReply, error) {
+		return w.inner.Search(ctx, req)
+	})
+}

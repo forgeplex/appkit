@@ -9,15 +9,22 @@ import (
 )
 
 func init() {
-	register(Command{Name: "gen", Summary: "代码生成：gen events|errors|wrap", Run: runGen})
+	register(Command{Name: "gen", Summary: "代码生成：gen contract|events|errors|wrap", Run: runGen})
 }
 
 func runGen(args []string) error {
 	if len(args) == 0 {
-		return errors.New("用法: appkit gen <events|errors|wrap> [flags]")
+		return errors.New("用法: appkit gen <contract|events|errors|wrap> [flags]")
 	}
 	fs := flag.NewFlagSet("gen "+args[0], flag.ContinueOnError)
 	switch args[0] {
+	case "contract":
+		in := fs.String("in", "", "输入 contract.yaml 文件")
+		dir := fs.String("dir", "", "契约包输出目录")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		return gen.Contract(*in, *dir)
 	case "events", "errors":
 		in := fs.String("in", "", "输入 yaml 文件")
 		out := fs.String("out", "", "输出 Go 文件")
@@ -38,6 +45,6 @@ func runGen(args []string) error {
 		}
 		return gen.Wrap(*src, *iface, *system, *out)
 	default:
-		return errors.New("未知 gen 子命令 " + args[0] + "（可用: events|errors|wrap）")
+		return errors.New("未知 gen 子命令 " + args[0] + "（可用: contract|events|errors|wrap）")
 	}
 }

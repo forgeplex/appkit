@@ -1,0 +1,50 @@
+# genfixture 的契约夹具：覆盖契约方法的全部四种合法形态
+# （DESIGN §5.3 的粗粒度约束：req+resp / 无 req / 仅 error / 仅 ctx），
+# 外加命名 DTO（types）与数组字段。修改后执行
+#
+#	go test ./internal/gen -run TestGolden -update
+#
+# 重写 genfixture 下检入的生成物（golden 与可编译夹具是同一份文件）。
+version: 1
+package: genfixture
+system: greet
+types:
+  - name: Entry
+    doc: 是分录概要（List 类响应的元素类型；命名 DTO 嵌套封顶一层）。
+    fields:
+      - {name: entry_id, type: string, required: true}
+      - {name: amount, type: decimal}
+      - {name: at, type: timestamp}
+methods:
+  - name: Greet
+    path: /greet
+    doc: 打招呼（req + resp 形态）。
+    idempotent: true
+    request:
+      - {name: name, type: string, required: true}
+    response:
+      - {name: message, type: string}
+  - name: Stats
+    path: /stats
+    doc: 服务统计（无 req、有 resp 形态）。
+    idempotent: true
+    response:
+      - {name: served, type: int64}
+  - name: Reset
+    path: /reset
+    doc: 重置（有 req、仅 error 形态）。
+    request:
+      - {name: scope, type: string}
+  - name: Ping
+    path: /ping
+    doc: 探活（仅 ctx、仅 error 形态）。
+    idempotent: true
+  - name: Search
+    path: /search
+    doc: 检索分录（命名 DTO 数组响应形态）。
+    idempotent: true
+    request:
+      - {name: prefix, type: string}
+    response:
+      - {name: entries, type: "[]Entry"}
+      - {name: next_cursor, type: string}

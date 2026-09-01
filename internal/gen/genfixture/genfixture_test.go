@@ -1,3 +1,17 @@
+// Package genfixture 是代码生成器的可编译夹具：全部接口与 DTO 由
+// contract.yaml 生成（service.gen.go / wrap.gen.go），事件与错误码由
+// events.yaml / codes.yaml 生成——检入的生成物随全仓编译与测试持续验证。
+//
+// 生成物同时充当 golden：internal/gen 的 TestGolden 逐字节比对重新生成的
+// 输出。修改 testdata 下的 yaml 后，在仓库根目录执行
+//
+//	go test ./internal/gen -run TestGolden -update
+//
+// 重写生成物。等价的 CLI 调用：
+//
+//	appkit gen contract -in internal/gen/testdata/contract.yaml -dir internal/gen/genfixture
+//	appkit gen events -in internal/gen/testdata/events.yaml -out internal/gen/genfixture/events.gen.go
+//	appkit gen errors -in internal/gen/testdata/codes.yaml -out internal/gen/genfixture/codes.gen.go
 package genfixture
 
 import (
@@ -43,6 +57,11 @@ func (s *stubService) Ping(context.Context) error {
 	return s.err
 }
 
+func (s *stubService) Search(_ context.Context, req SearchRequest) (SearchReply, error) {
+	s.calls = append(s.calls, "Search")
+	return SearchReply{Entries: []Entry{{EntryID: "e-1", Amount: "1.00"}}, NextCursor: req.Prefix + "|next"}, s.err
+}
+
 // wrapCalls 把四个方法统一为 func(ctx) error，供表驱动复用。
 func wrapCalls(w Service) []struct {
 	name string
@@ -56,6 +75,7 @@ func wrapCalls(w Service) []struct {
 		{"Stats", func(ctx context.Context) error { _, err := w.Stats(ctx); return err }},
 		{"Reset", func(ctx context.Context) error { return w.Reset(ctx, ResetRequest{Scope: "all"}) }},
 		{"Ping", func(ctx context.Context) error { return w.Ping(ctx) }},
+		{"Search", func(ctx context.Context) error { _, err := w.Search(ctx, SearchRequest{Prefix: "e"}); return err }},
 	}
 }
 
