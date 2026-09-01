@@ -46,7 +46,7 @@ func TestGreetService(t *testing.T) {
 		{name: "显式en", req: greetapi.GreetRequest{Name: "Ada", Lang: "en"}, wantMsg: "Hello, Ada!"},
 		{name: "中文", req: greetapi.GreetRequest{Name: "Ada", Lang: "zh"}, wantMsg: "你好，Ada！"},
 		{name: "空白名字", req: greetapi.GreetRequest{Name: "  "}, wantCode: apperr.CodeInvalidArgument},
-		{name: "不支持的语言", req: greetapi.GreetRequest{Name: "Ada", Lang: "fr"}, wantCode: greetapi.CodeUnsupportedLang},
+		{name: "不支持的语言", req: greetapi.GreetRequest{Name: "Ada", Lang: "fr"}, wantCode: greetapi.CodeGreetUnsupportedLang},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -85,7 +85,7 @@ func TestGreetHandler(t *testing.T) {
 		{name: "空白名字422", url: "/greet/%20", wantStatus: http.StatusUnprocessableEntity,
 			wantCode: apperr.CodeInvalidArgument},
 		{name: "不支持语言422", url: "/greet/Ada?lang=fr", wantStatus: http.StatusUnprocessableEntity,
-			wantCode: greetapi.CodeUnsupportedLang},
+			wantCode: greetapi.CodeGreetUnsupportedLang},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -116,7 +116,16 @@ func TestGreetHandler(t *testing.T) {
 
 // TestGatewayHandler 覆盖契约边界语义：本地实现与远程 client 走同一接口、
 // 业务错误码穿过边界不变、事务内调用被运行时守卫拦截。
+// svc 一律按真实装配形态给：ProvideContract 链路 Resolve 到的是
+// WrapService 包的实现（守卫在 wrapper 里，裸实现没有），远程兜底是
+// 生成 client——handler 里不再手写 contract.Call。
 func TestGatewayHandler(t *testing.T) {
+	local := greetapi.WrapService(greet.NewService(), 0)
+	// 远程形态对拍：生成 client 打生成 server handler（真 HTTP 回环）。
+	greetSrv := httptest.NewServer(greetapi.NewHTTPHandler(greetapi.WrapService(greet.NewService(), 0)))
+	t.Cleanup(greetSrv.Close)
+	remote := greetapi.NewClient(greetSrv.URL, "gateway", nil)
+
 	tests := []struct {
 		name       string
 		svc        greetapi.Service
@@ -126,16 +135,22 @@ func TestGatewayHandler(t *testing.T) {
 		wantMsg    string
 		wantCode   string
 	}{
-		{name: "本地实现经契约边界", svc: greet.NewService(),
+		{name: "本地实现经契约边界", svc: local,
 			url: "/hello/Ada?lang=zh", wantStatus: http.StatusOK, wantMsg: "你好，Ada！"},
-		{name: "业务错误码跨契约边界不变", svc: greet.NewService(),
+		{name: "业务错误码跨契约边界不变", svc: local,
 			url: "/hello/Ada?lang=fr", wantStatus: http.StatusUnprocessableEntity,
-			wantCode: greetapi.CodeUnsupportedLang},
-		{name: "事务内调用被运行时守卫拦截", svc: greet.NewService(),
+			wantCode: greetapi.CodeGreetUnsupportedLang},
+		{name: "事务内调用被运行时守卫拦截", svc: local,
 			url: "/hello/Ada", inTx: true, wantStatus: http.StatusInternalServerError,
 			wantCode: apperr.CodeTxBoundary},
-		{name: "远程client同一接口兜底", svc: remoteClient{},
-			url: "/hello/Ada", wantStatus: http.StatusOK, wantMsg: "Hello, Ada! (via remote greet)"},
+		{name: "远程生成client同一接口", svc: remote,
+			url: "/hello/Ada", wantStatus: http.StatusOK, wantMsg: "Hello, Ada!"},
+		{name: "远程形态错误码经problem+json重建", svc: remote,
+			url: "/hello/Ada?lang=fr", wantStatus: http.StatusUnprocessableEntity,
+			wantCode: greetapi.CodeGreetUnsupportedLang},
+		{name: "远程形态事务守卫同样拦截", svc: remote,
+			url: "/hello/Ada", inTx: true, wantStatus: http.StatusInternalServerError,
+			wantCode: apperr.CodeTxBoundary},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -1,0 +1,17 @@
+# greet 域的契约事实源。重新生成（在仓库根目录）：
+#
+#	go run ./cmd/appkit gen contract -in examples/greeter/greetapi/contract.yaml -dir examples/greeter/greetapi
+#	go run ./cmd/appkit gen errors -in examples/greeter/greetapi/codes.yaml -out examples/greeter/greetapi/codes.gen.go
+version: 1
+package: greetapi
+system: greet
+methods:
+  - name: Greet
+    path: /greet
+    doc: 打招呼。lang 空值等价 "en"；不支持的语言返回 GREET_UNSUPPORTED_LANG。
+    idempotent: true
+    request:
+      - {name: name, type: string, required: true}
+      - {name: lang, type: string}
+    response:
+      - {name: message, type: string}

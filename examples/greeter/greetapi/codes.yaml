@@ -1,0 +1,5 @@
+# greet 域的错误码事实源（与 contract.yaml 同目录，重新生成命令见其头部注释）。
+version: 1
+package: greetapi
+codes:
+  - {code: GREET_UNSUPPORTED_LANG, status: 422, message: "不支持的问候语言"}

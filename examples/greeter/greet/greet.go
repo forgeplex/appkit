@@ -27,10 +27,14 @@ type module struct{ log *slog.Logger }
 
 func (m *module) Name() string { return "greet" }
 
-// Register 只做声明：契约实现进 Registry，路由由框架挂到根 mux。
+// Register 只做声明：契约实现经 ProvideContract 进 Registry（裸实现进不来——
+// wrapper 由 greetapi.WrapService 提供，方法体经 contract.Call 过边界），
+// 路由由框架挂到根 mux。
 func (m *module) Register(reg *appkit.Registry) error {
 	svc := NewService()
-	appkit.ProvideValue(reg, svc)
+	appkit.ProvideContract(reg,
+		func(*appkit.Registry) (greetapi.Service, error) { return svc, nil },
+		func(v greetapi.Service) greetapi.Service { return greetapi.WrapService(v, 0) })
 	reg.Mount(Pattern, NewHandler(m.log, svc))
 	return nil
 }
@@ -39,11 +43,6 @@ func (m *module) Register(reg *appkit.Registry) error {
 func NewService() greetapi.Service { return service{} }
 
 type service struct{}
-
-// errUnsupportedLang 是包级错误模板：apperr 值不可变，WithDetail 返回副本，
-// 共享模板是安全的。
-var errUnsupportedLang = apperr.New(greetapi.CodeUnsupportedLang,
-	http.StatusUnprocessableEntity, "不支持的问候语言")
 
 func (service) Greet(_ context.Context, req greetapi.GreetRequest) (greetapi.GreetReply, error) {
 	name := strings.TrimSpace(req.Name)
@@ -56,7 +55,9 @@ func (service) Greet(_ context.Context, req greetapi.GreetRequest) (greetapi.Gre
 	case "zh":
 		return greetapi.GreetReply{Message: fmt.Sprintf("你好，%s！", name)}, nil
 	default:
-		return greetapi.GreetReply{}, errUnsupportedLang.WithDetail("lang", req.Lang)
+		// 错误 sentinel 由 codes.yaml 生成：错误身份 = 错误码，
+		// WithDetail 返回副本，共享模板安全。
+		return greetapi.GreetReply{}, greetapi.ErrGreetUnsupportedLang.WithDetail("lang", req.Lang)
 	}
 }
 

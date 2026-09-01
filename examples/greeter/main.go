@@ -79,8 +79,9 @@ func run(target string) error {
 		appkit.Logger(log),
 		appkit.Middleware(httpserver.Base(log)...),
 		// greet 不在 target 集内时，gateway 对 greetapi.Service 的 Resolve
-		// 落到这个远程兜底。真实项目传合约仓库生成的 HTTP client 构造器
-		//（实现同一接口），示例用假 client 代替以免起第二个进程。
+		// 落到这个远程兜底。真实项目直接用生成 client：
+		// greetapi.NewClient("http://greet:8080", "gateway", nil)；
+		// 示例用假 client 代替以免起第二个进程。
 		appkit.Remote(func(*appkit.Registry) (greetapi.Service, error) {
 			return remoteClient{}, nil
 		}),
@@ -99,8 +100,8 @@ func run(target string) error {
 	return nil
 }
 
-// remoteClient 顶替合约仓库生成的 HTTP client 的位置：实现同一个
-// greetapi.Service。真实生成物会请求 greet 服务并用 apperr.FromProblem 把
+// remoteClient 顶替 greetapi.NewClient 的位置：实现同一个 greetapi.Service。
+// 真生成物会经 contract.Call 请求 greet 服务、用 apperr.FromProblem 把
 // problem+json 重建回 *apperr.Error——错误码跨网络不变，gateway 无感切换。
 // 示例就地返回可辨识的应答，以免要求起第二个进程。
 type remoteClient struct{}

@@ -10,7 +10,6 @@ import (
 	"net/http"
 
 	"github.com/forgeplex/appkit"
-	"github.com/forgeplex/appkit/contract"
 	"github.com/forgeplex/appkit/examples/greeter/greetapi"
 	"github.com/forgeplex/appkit/httpserver"
 )
@@ -49,20 +48,16 @@ type helloReply struct {
 	Via     string `json:"via"`
 }
 
-// NewHandler 返回 /hello 处理器。对 svc 的每次调用都必须经 contract.Call：
-// 进程内调用同样带运行时守卫（事务内直接失败）、ctx 防火墙、独立超时与
-// 错误规范化——单体与微服务两种形态下语义一致（DESIGN §5.3）。
-// 真实项目中 contract.Call 藏在合约仓库生成的 wrapper/client 方法体内。
+// NewHandler 返回 /hello 处理器。svc 由组合根装配：本地形态是
+// greetapi.WrapService 包的实现，远程形态是 greetapi.NewClient——
+// 两者的契约边界四件套（守卫/防火墙/超时/错误规范化）都已在方法体内，
+// 本函数裸调即可，两种形态一行不改。
 func NewHandler(log *slog.Logger, svc greetapi.Service) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		req := greetapi.GreetRequest{
+		reply, err := svc.Greet(r.Context(), greetapi.GreetRequest{
 			Name: r.PathValue("name"),
 			Lang: r.URL.Query().Get("lang"),
-		}
-		reply, err := contract.Call(r.Context(), "greet", "Greet", 0,
-			func(ctx context.Context) (greetapi.GreetReply, error) {
-				return svc.Greet(ctx, req)
-			})
+		})
 		if err != nil {
 			httpserver.WriteError(log, w, err)
 			return

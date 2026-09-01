@@ -7,9 +7,9 @@
 
 | 路径 | 角色 |
 |---|---|
-| `greetapi/` | 契约包：接口 + DTO + 错误码。**顶替合约仓库生成物的位置**——真实项目中它由 psp-contracts 从 OpenAPI 生成、以独立 module 发版，提供方与消费方都只 import 它 |
-| `greet/` | 提供方模块：`Provide` 一个 `greetapi.Service` 本地实现，`Mount GET /greet/{name}`；handler 里演示 apperr → `httpserver.WriteError` 统一出口 |
-| `gateway/` | 消费方模块：`Resolve[greetapi.Service]`，每次调用经 `contract.Call` 过契约边界（守卫/防火墙/超时/错误规范化），`Mount GET /hello/{name}` |
+| `greetapi/` | 契约包：`contract.yaml` + `codes.yaml` 是事实源，`appkit gen` 生成接口/DTO/wrapper/client/server/openapi 全套（`*.gen.go` 禁手改）。真实项目中这套文件住在独立合约仓库（psp-contracts）、以独立 module 发版，提供方与消费方都只 import 它 |
+| `greet/` | 提供方模块：`ProvideContract` + `greetapi.WrapService` 把实现包进契约边界进 Registry，`Mount GET /greet/{name}`；handler 里演示 apperr → `httpserver.WriteError` 统一出口 |
+| `gateway/` | 消费方模块：`Resolve[greetapi.Service]` 拿到已包边界的实现（本地 wrapper 或生成 client），handler 裸调即可，`Mount GET /hello/{name}` |
 | `main.go` | 组合根：flag `-target` → `config.Load` → `telemetry.Init` → `appkit.New(...).Run`；`appkit.Remote` 注册远程兜底 |
 
 ## 跑法
@@ -21,11 +21,18 @@ go run ./examples/greeter -target=all
 ```
 
 拆分形态（greet 不在 target 集内，gateway 的 Resolve 落到 `appkit.Remote`
-注册的远程兜底——示例用一个假 client 顶替，真实项目传 contracts 生成的
-HTTP client 构造器，实现同一接口）：
+注册的远程兜底——示例用一个假 client 顶替，真实项目传生成 client
+`greetapi.NewClient("http://greet:8080", "gateway", nil)`，实现同一接口）：
 
 ```sh
 go run ./examples/greeter -target=gateway
+```
+
+契约包改动后重新生成（在仓库根目录）：
+
+```sh
+go run ./cmd/appkit gen contract -in examples/greeter/greetapi/contract.yaml -dir examples/greeter/greetapi
+go run ./cmd/appkit gen errors -in examples/greeter/greetapi/codes.yaml -out examples/greeter/greetapi/codes.gen.go
 ```
 
 验证：
@@ -52,7 +59,8 @@ GREETER_ADDR=:9090 GREETER_LOG__LEVEL=debug go run ./examples/greeter -target=al
 ## 示例演示的框架约束
 
 - **跨模块只经契约类型**：gateway 只 import `greetapi`，看不到 greet 的实现。
-- **进程内调用 ≠ 裸方法调用**：`contract.Call` 让本地调用同样带独立超时、
-  ctx 防火墙与错误规范化；事务内发起契约调用直接失败（`TX_BOUNDARY`）。
-- **错误身份 = 错误码**：`apperr.Is(err, greetapi.CodeUnsupportedLang)` 在
-  本地实现与远程 client 两种形态下判定一致。
+- **进程内调用 ≠ 裸方法调用**：契约边界四件套（事务守卫、ctx 防火墙、
+  独立超时、错误规范化）在生成 wrapper/client 的方法体内；事务内发起
+  契约调用直接失败（`TX_BOUNDARY`）。
+- **错误身份 = 错误码**：`apperr.Is(err, greetapi.CodeGreetUnsupportedLang)` 在
+  本地实现与远程 client 两种形态下判定一致（远程侧经 problem+json 重建）。
