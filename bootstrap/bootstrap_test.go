@@ -2,8 +2,10 @@ package bootstrap
 
 import (
 	"context"
+	"crypto/ed25519"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -70,5 +72,26 @@ func TestPoolOptionsReachProductionPool(t *testing.T) {
 	}
 	if !hooked.Load() {
 		t.Fatal("AfterConnect 钩子未被调用——PoolOptions 没接到 bootstrap 建的池上")
+	}
+}
+
+// TestAuthnIssuerRequired 配置了验签公钥但缺 iss 约束必须在启动期报错：
+// 没有 iss 的验签会接受任何持私钥者签的令牌（含同密钥的其他系统令牌），
+// 这是静默放宽而不是可缺省项。报错点在 Minimal/数据库逻辑之前，
+// 最小模式同样覆盖。
+func TestAuthnIssuerRequired(t *testing.T) {
+	pub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = Run(context.Background(), Options{
+		Service: "bpauthn",
+		Modules: func(Deps) ([]appkit.Module, error) { return nil, nil },
+		// Minimal 也给出：报错点在数据库分支之前，最小模式同样触发。
+		Minimal:        func(Deps) ([]appkit.Module, error) { return nil, nil },
+		AuthnPublicKey: pub,
+	}, RunOptions{ConfigFile: filepath.Join(t.TempDir(), "absent.yaml")})
+	if err == nil || !strings.Contains(err.Error(), "AuthnIssuer") {
+		t.Fatalf("缺 AuthnIssuer 应启动报错并指名字段，实际 %v", err)
 	}
 }

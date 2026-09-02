@@ -12,6 +12,7 @@ package bootstrap
 import (
 	"cmp"
 	"context"
+	"crypto/ed25519"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/authn"
 	"github.com/forgeplex/appkit/config"
 	"github.com/forgeplex/appkit/httpserver"
 	"github.com/forgeplex/appkit/outbox"
@@ -117,6 +119,15 @@ type Options struct {
 	// 此前域要给池加钩子只能整个自建池绕开 bootstrap——迁移/outbox/
 	// 幂等装配全部重写一遍，正是这条例外最不该存在的地方。
 	PoolOptions []pgtx.PoolOption
+	// AuthnPublicKey 是访问令牌的 Ed25519 验签公钥（组合根只持公钥，
+	// 私钥在鉴权提供方）。非空时在根链 Base 之后挂 authn.Middleware：
+	// 验签结果（appkit.Actor）注入 ctx，reg.Require / appkit.Check 据此
+	// 判定。留空 = 不启用验签（最小模式、内部网部署）。
+	AuthnPublicKey ed25519.PublicKey
+	// AuthnIssuer 是期望的令牌 iss（提供方按分区签发，如 "rbac-demo"）。
+	// AuthnPublicKey 非空时必填，缺了启动报错——没有 iss 约束的验签
+	// 会接受任何持私钥者签的令牌。
+	AuthnIssuer string
 }
 
 // RunOptions 是运行期参数，对应 Main 解析出的命令行 flag。
@@ -195,6 +206,14 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 		appkit.HTTPAddr(base.Addr),
 		appkit.Logger(d.Log),
 		appkit.Middleware(httpserver.Base(d.Log)...),
+	}
+	if len(o.AuthnPublicKey) > 0 {
+		// 验签挂在 Base 之后（内一层）：RequestID/AccessLog 在外层，
+		// 401 响应也进访问日志。
+		if o.AuthnIssuer == "" {
+			return fmt.Errorf("%s: 配置了 AuthnPublicKey 但 AuthnIssuer 为空——没有 iss 约束的验签会接受任何持私钥者签的令牌", o.Service)
+		}
+		opts = append(opts, appkit.Middleware(authn.Middleware(o.AuthnPublicKey, o.AuthnIssuer)))
 	}
 	if base.Debug.Pprof {
 		opts = append(opts, appkit.Pprof())

@@ -19,8 +19,8 @@
 ## 布局速查
 
 - 运行时：根包（Module/Registry/Run）、`contract`、`config`、`apperr`、
-  `health`、`telemetry`、`httpserver`、`tx`/`pgtx`、`pgmigrate`、`outbox`、
-  `idem`、`money`、`audit`
+  `health`、`telemetry`、`httpserver`、`authn`、`tx`/`pgtx`、`pgmigrate`、
+  `outbox`、`idem`、`money`、`audit`
 - 工具链：`cmd/appkit` + `internal/cli`（薄壳）+ `internal/{scaffold,archcheck,gen,doctor}`
 - 规则分发：`ruleset`（golangci/arch-lint/CI 模板，appkit sync 物化到各仓库）
   ——appkit 只生产、自己不消费，golden 测试只锁「模板文本没变」，锁不住

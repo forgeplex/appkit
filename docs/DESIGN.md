@@ -90,6 +90,9 @@ appkit/                          # module github.com/forgeplex/appkit
 │                                #   App.Migrate：只应用迁移即返回（initContainer 用）
 ├── worker.go                    # Registry.Worker：长驻后台任务的托管注册
 │                                #   （关停等待 + 异常退出上报，见 §8）
+├── permission.go                # 权限抽象（★ 根包，零第三方类型）：
+│                                #   PermissionDecl 声明收集 / Actor 主体快照 /
+│                                #   Require 统一判定（401/403/step-up 矩阵）——见 §5.4
 ├── bootstrap/                   # ★ 隔离层：域/组合服务 main() 的全部固定装配
 │                                #   （配置→遥测→池→总线→模块→运行→反序关停）。
 │                                #   用户仓库的 main 只声明"装哪些模块"，
@@ -106,6 +109,10 @@ appkit/                          # module github.com/forgeplex/appkit
 ├── httpserver/                  # 根 HTTP 中间件链（RequestID/Recover/AccessLog/OTel）
 │                                #   标准库实现，模块接缝只用 http.Handler；
 │                                #   模块内部想用 gin 组路由是模块自己的事
+├── authn/                       # 验签机制件（golang-jwt，框架内唯一第三方
+│                                #   依赖新增点）：EdDSA Bearer 令牌 + X-Step-Up
+│                                #   证明 → 注入 appkit.Actor。判定不在这，在根包
+│                                #   Require；claims 布局即提供方契约——见 §5.4
 ├── apperr/                      # Error{Code, HTTPStatus, Message, Details}
 │                                #   RFC 9457 (problem+json) 映射；
 │                                #   ★ 错误身份 = 错误码（apperr.Is(err, code)），
@@ -268,6 +275,8 @@ type Module interface {
 func Provide[T any](reg *Registry, ctor func(*Registry) (T, error)) // 注册契约实现（惰性构造）
 func Resolve[T any](reg *Registry) (T, error)                       // 取依赖；启动期缺失 fail-fast、循环依赖报错
 func (r *Registry) Mount(prefix string, h http.Handler)             // 路由（http.Handler，非 gin 类型）
+func (r *Registry) Permissions(decls ...PermissionDecl)             // 声明本模块权限码（仅 Register 阶段，§5.4）
+func (r *Registry) Require(code string, h http.Handler) http.Handler // 端点绑码（判定矩阵统一在框架，§5.4）
 func (r *Registry) Migrations(schema string, fsys fs.FS)
 func (r *Registry) Consumer(topic string, h outbox.Handler)
 func (r *Registry) Health(name string, c health.Checker)
@@ -326,6 +335,72 @@ contract.yaml 生成同一接口的进程内 wrapper 与 HTTP client，方法体
 跨模块一致性只有两条路：**同步契约调用**（视为可失败、须幂等）或 **outbox 事件**。
 禁止：跨模块共享事务、跨 schema JOIN、传指针。
 
+### 5.4 鉴权与权限：声明 / 绑定 / 判定 / step-up
+
+鉴权是每个系统都要、但语义人人不同的一块。框架的切法是**机制与语义分离**：
+
+- **语义归提供方**（如 rbac 域）：角色模型、通配匹配、令牌签发、挑战动作
+  （TOTP/MFA）的验证——这些是产品决策，换一家就全换；
+- **机制归框架**：声明收集、绑定校验、判定矩阵、证明验签——每个系统长得
+  一样，写进 N 个域就是 N 份会漂移的样板。
+
+这层抽象之前有两个结构性洞：端点绑码拼错要到运行时 403 才暴露（绑定字符串
+不在任何校验视野里）；权限目录的完整性靠组合根记得手工全量注入，漏了启动
+失败——脆弱环节。现在两者都由装配期校验收口。
+
+**声明（仅 Register 阶段）**：`reg.Permissions(decl)` 声明本模块的权限码，
+`Challenge: true` 标记高危码。声明只允许 Register 阶段（迟到 panic），因为
+汇总在 Setup 期就要被消费——提供方（rbac）的 SyncCatalog 从
+`reg.PermissionDecls()` 读**全应用目录**同步落库。目录完整性从「组合根记得
+注入」变成「各域自声明」，组合根这个环节退役。
+
+**绑定（Register/Setup 两阶段皆可）**：`reg.Require("files:delete", handler)`
+返回带判定的 handler。模块内部 mux 通常在 Setup 期装配，所以两个阶段都收；
+全部 Setup 跑完后框架统一校验**绑定 ⊆ 声明**——拼错的码在监听之前曝光
+（报错点名模块与码），而不是等到运行时 403。跨模块绑码合法（gateway 绑
+别域的码）。
+
+**Actor（主体快照）**：验签中间件注入 ctx 的主体最小形态
+`{UserID, TenantID, Perms []string, StepUpAt}`。判定永远是**集合包含**
+（`slices.Contains(Perms, code)`）：通配等匹配语义归提供方，在**签发侧**
+展开为精确码再进令牌。快照模型的代价是权限变更要等令牌过期才生效；换来
+判定零远程调用、零每请求查库，且判定语义不依赖任何提供方——换 rbac 时
+框架与全部业务域代码零改动。
+
+**判定矩阵（框架统一，错误身份是错误码）**：
+
+| 请求状态 | 响应 |
+|---|---|
+| 无 Actor / UserID 空（未认证） | 401 `UNAUTHENTICATED` |
+| 已认证、Perms 不含该码 | 403 `PERMISSION_DENIED`（detail `required`=码） |
+| 持 Challenge 码、证明缺失或超过 5 分钟 | 403 `STEP_UP_REQUIRED` |
+| 其余 | 放行 |
+
+**验签（authn 包，机制件）**：`authn.Middleware(pub, issuer)` 解析 Bearer
+访问令牌与 `X-Step-Up` 证明——EdDSA 算法白名单（防算法混淆攻击）、iss、
+exp 必填，全部过验后注入 Actor。无 Authorization 头原样放行（判公开与否是
+Require 的职责——公开端点是合法状态）；**有头但验不过必须 401**：坏凭证是
+攻击不是匿名，静默降级会掩盖问题。依赖方向单向：authn → 根包，组合根挂链
+（或 bootstrap 两行配置），根包不 import authn。
+
+**claims 布局 = 提供方契约**（照此签发即可写出第二个提供方、平替 rbac）：
+
+```
+访问令牌（Authorization: Bearer）：iss · sub（必填）· exp（必填）· tid（可选）· perms []string（精确码）
+step-up  （X-Step-Up）           ：iss · sub（须与访问令牌一致）· exp · purpose="step-up" · iat（证明时刻）
+```
+
+**step-up 谁验什么**——三段分工：提供方验**挑战动作**（用户真的过了
+MFA/TOTP），过了签一枚 step-up 令牌；框架 Authn 验**证明**（签名、iss、
+sub 与访问令牌一致、purpose、exp），取 iat 进 `Actor.StepUpAt`；框架
+Require 验**策略**（该码是否标了 Challenge、证明是否新鲜）。挑战的**消费方
+是客户端**不是模块：Require 在单请求内联返回 403 `STEP_UP_REQUIRED` →
+客户端引导用户完成挑战 → 带 `X-Step-Up` 头重试同一请求。无广播、无消费
+注册——check 是中间件，不是事件。
+
+拆分部署时每个服务自挂 Authn（Authorization/X-Step-Up 头本来就在线路上，
+下游不靠上游「帮忙认证过了」）；Actor 不进 `callctx` 白名单，也不该进。
+
 ## 6. 请求完整路径（以"记一笔账"POST 为例）
 
 | # | 层 | 做什么 | 禁止什么（执行手段） |
@@ -372,6 +447,9 @@ contract.yaml 生成同一接口的进程内 wrapper 与 HTTP client，方法体
 | 两种部署形态语义一致 | `apptest.Conform` 让同一批用例跑过每个绑定，比对错误码/返回值/边界语义 | ▲ 测试级：写了才有；但不写就只剩口头承诺 |
 | 脚手架的 sqlc NUMERIC override 真能过 pgx | override 只指向 decimal.Decimal（pgx 经 Valuer/Scanner 原生编解码）；`internal/scaffold` 的 `TestDomainNumericOverrideRoundTrips` 把渲染后声明的类型真库读写一遍（27 位小数 + NULL）。编译测试对"扫描不了 OID 1700"结构性失明——money.Money 那次教训就是编译全绿、运行即炸 | ▲ 测试级：需 `TEST_DATABASE_URL`（`make test-db`），无 DB 时 skip |
 | 出站 HTTP 也带上 `callctx` 白名单 | `callctx.Transport` 装进 `http.Client` 一次即可（不必逐调用点写 `Inject`）；`apptest.Conform` 填了 `Binding.SeenMeta` 就当场验请求头 | ▲ API 设计级 + 测试级：漏点从「每个调用点」收敛到「一处装配」，且验得到。但两者都得自己接——不填 `SeenMeta` 就仍是口头承诺 |
+| 端点权限绑定 ⊆ 已声明码 | Registry 收集绑定（Register/Setup 期都可能产生，模块内部 mux 在 Setup 装配），全部 Setup 之后、监听之前统一校验，拼错的码点名（模块、码）报错 | ★ 装配期硬失败 |
+| 权限判定语义统一（集合包含 + step-up 新鲜度） | `reg.Require` 是唯一判定入口，401/403/STEP_UP 矩阵在框架；业务域不再各写一份会漂移的判定 | ★ API 设计级 |
+| 验签只在 authn 一处、模块不自解凭证 | 组合根挂链 + 脚手架注释教学 | ▲ 提高绕过成本：模块仍可自解 Authorization 头绕过，无机制挡 |
 
 逃生舱（防止约束被政治性推翻）：带理由的 `//nolint`（nolintlint 强制）、
 go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走**事件驱动读模型**

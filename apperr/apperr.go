@@ -24,6 +24,7 @@ const (
 	CodeTxBoundary       = "TX_BOUNDARY"          // 事务内发起跨模块调用（运行时守卫）
 	CodeIdempotency      = "IDEMPOTENCY_CONFLICT" // 同幂等键不同 payload
 	CodeMigrationDrift   = "MIGRATION_DRIFT"      // 已应用的迁移内容被改动（启动期守卫）
+	CodeStepUpRequired   = "STEP_UP_REQUIRED"     // 已认证但权限码带 Challenge：须先完成 step-up 挑战（403 + 重新挑战）
 )
 
 // Error 是唯一跨层传播的错误类型。值不可变：With* 方法返回副本，
@@ -131,4 +132,16 @@ func Conflict(format string, args ...any) *Error {
 
 func Unavailable(cause error) *Error {
 	return New(CodeUnavailable, http.StatusServiceUnavailable, "dependency unavailable").WithCause(cause)
+}
+
+func Unauthenticated(format string, args ...any) *Error {
+	return New(CodeUnauthenticated, http.StatusUnauthorized, fmt.Sprintf(format, args...))
+}
+
+func PermissionDenied(format string, args ...any) *Error {
+	return New(CodePermissionDenied, http.StatusForbidden, fmt.Sprintf(format, args...))
+}
+
+func StepUpRequired(format string, args ...any) *Error {
+	return New(CodeStepUpRequired, http.StatusForbidden, fmt.Sprintf(format, args...))
 }

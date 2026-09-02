@@ -118,6 +118,13 @@ func (m *mod) Register(reg *appkit.Registry) error {
 		reg.Migrations(schema, m.migrations)
 	}
 
+	// 权限码声明（应用级目录，与数据分区无关）：汇总进全应用目录，鉴权
+	// 提供方（如 rbac）据此同步落库。端点绑码用 reg.Require；验签中间件
+	// 是组合根职责，见 docs/GUIDE.md 鉴权章节。
+	reg.Permissions(appkit.PermissionDecl{
+		Code: "{{.Name}}:read", Name: "读取", Category: "{{.Name}}",
+	})
+
 	reg.Setup(func(context.Context) error {
 		svc := appkit.MustResolve[*{{.Name}}.Service](reg)
 		m.handler = {{.Name}}http.NewPingHandler(m.opts.Log, svc)

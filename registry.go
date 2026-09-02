@@ -24,6 +24,13 @@ type Registry struct {
 	health     *health.Registry
 	starts     []startHook
 	stops      []stopHook
+
+	// 权限码声明与端点绑定：声明只在 Register 阶段收集（registered 置位
+	// 后拒绝迟到声明），绑定在 Register/Setup 阶段都可能产生（模块内部
+	// mux 通常在 Setup 装配），统一在全部 Setup 之后校验 ⊆ 关系。
+	permDecls    map[string]permDeclReg
+	permBindings []permBinding
+	registered   bool
 	// startStages 记录每个模块最近一次 OnStart 的 stage，供 OnStop 定序。
 	startStages map[string]int
 	// workerErr 承接 Worker 的异常退出，带缓冲避免写侧阻塞。
@@ -90,6 +97,7 @@ func newRegistry() *Registry {
 		health:      health.NewRegistry(),
 		startStages: make(map[string]int),
 		workerErr:   make(chan error, 1),
+		permDecls:   make(map[string]permDeclReg),
 	}
 }
 

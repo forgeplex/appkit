@@ -132,7 +132,10 @@ func TestDomainScaffold(t *testing.T) {
 			"bootstrap.Main(bootstrap.Options{", `Service: "ledgerd"`,
 			"Modules: func(d bootstrap.Deps)", "ledger.Module(")
 		mustContain(t, "module.go", readFile(t, dir, "internal/module/module.go"),
-			`Schema = "ledger"`, "reg.Migrations(Schema", "reg.Health(", "appkit.Provide(")
+			`Schema = "ledger"`, "reg.Migrations(Schema", "reg.Health(", "appkit.Provide(",
+			// 权限码声明从第一天就在骨架里：目录由各域自声明、框架汇总，
+			// 组合根不再手抄全目录。
+			"reg.Permissions(", `"ledger:read"`)
 		sqlcYml := readFile(t, dir, "sqlc.yaml")
 		mustContain(t, "sqlc.yaml", sqlcYml,
 			"internal/postgres/sqlc", `schema: "db/migrations"`,
@@ -263,6 +266,8 @@ func TestDomainPartitionedScaffold(t *testing.T) {
 			`apperr.InvalidArgument(`,
 			"outbox.Publish(ctx, pgtx.From(ctx, p.pool), schema, evt)",
 			`reg.Worker("outbox-relay/"+tenant`,
+			// 权限码是应用级目录，分区形态同样声明。
+			"reg.Permissions(", `"rbac:read"`,
 		)
 		// 单形态的痕迹不得出现。
 		for _, gone := range []string{`Schema = "rbac"`, "pgtx.New(m.opts.Pool)", "outbox.NewPublisher("} {

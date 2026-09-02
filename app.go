@@ -184,6 +184,9 @@ func (a *App) register(enabled []Module) error {
 		}
 	}
 	a.reg.current = ""
+	// Register 阶段结束：此后 Permissions 声明视为迟到（Setup 期汇总即被
+	// 提供方消费，迟到声明破坏时序）。
+	a.reg.registered = true
 	return nil
 }
 

@@ -50,6 +50,11 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.reg.runSetups(ctx); err != nil {
 		return err
 	}
+	// 全部 Setup 之后统一校验权限绑定 ⊆ 声明——模块内部 mux 在 Setup 期
+	// 绑的码也要覆盖；拼错的码在监听之前曝光，而不是等到运行时 403。
+	if err := a.reg.validatePermBindings(); err != nil {
+		return err
+	}
 	// 消费者装配放在全部 Setup 之后：Register 与 Setup 阶段登记的都会生效。
 	if err := a.subscribeConsumers(); err != nil {
 		return err

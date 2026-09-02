@@ -841,6 +841,111 @@ CI**：`domain-ci.yml` 里有一步 appkit-lint，版本随域仓库 go.mod 钉�
 go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@v0.4.0 -moneyfloat.scope 'internal/(identity|authn)' ./...
 ```
 
+## 鉴权与权限（声明 / 绑定 / 判定 / step-up）
+
+这章是可选能力，接入顺序：**声明 → 绑码 → 组合根挂验签**，之后判定矩阵
+（401/403/step-up）全部在框架，业务域不写一行鉴权代码。设计是可插拔的：
+判定机制在 appkit，鉴权语义（角色模型、令牌签发、MFA）在提供方域（如
+rbac）——换提供方，业务域与框架代码零改动（DESIGN §5.4）。
+
+### ① 声明（域仓库，Register 阶段）
+
+脚手架生成的 module.go 已带样例：
+
+```go
+reg.Permissions(appkit.PermissionDecl{
+    Code: "files:read", Name: "读取", Category: "files",
+    // Description: "…",           // 供管理界面展示
+    // Challenge:  true,           // 高危码：持码之外还须新鲜 step-up 证明
+})
+```
+
+码全应用唯一（撞码启动报错，报出双方模块）；声明只允许 Register 阶段——
+提供方（如 rbac）在 Setup 期从 `reg.PermissionDecls()` 读**全应用目录**
+同步落库，权限清单不用再手工维护。
+
+### ② 绑码（端点）
+
+```go
+reg.Mount("POST /files", reg.Require("files:write", handler))
+// 模块内部 mux 的形态（Setup 期装配同样合法）：
+// mux.Handle("DELETE /files/{id}", reg.Require("files:delete", h))
+```
+
+绑定的码必须在某处声明过（跨模块绑码合法，gateway 可以绑别域的码）；拼错
+的码在启动时直接失败，不会拖到运行时 403：
+
+```text
+appkit: 模块 "files" 绑定了未声明的权限码 "files:wirte"——在 Register 阶段用 reg.Permissions 声明
+```
+
+### ③ 组合根挂验签（两行）
+
+私钥在提供方；组合根只持 Ed25519 公钥。`appkit new system` 生成的 main.go
+加两个字段：
+
+```go
+bootstrap.Main(bootstrap.Options{
+    Service: "sso",
+    // …Modules / Minimal / AppOptions 照旧…
+    AuthnPublicKey: mustEd25519Pub(cfg.Authn.PubkeyFile), // 非空 = 根链挂验签
+    AuthnIssuer:    cfg.Authn.Issuer,                     // 如 "rbac-demo"
+})
+```
+
+```go
+func mustEd25519Pub(path string) ed25519.PublicKey {
+	p, err := os.ReadFile(path)
+	if err != nil {
+		panic(err)
+	}
+	block, _ := pem.Decode(p)
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		panic(err)
+	}
+	ed, ok := pub.(ed25519.PublicKey)
+	if !ok {
+		panic(path + ": 不是 Ed25519 公钥")
+	}
+	return ed
+}
+```
+
+配了公钥不配 issuer 会启动报错——没有 iss 约束的验签会接受任何持私钥者
+签的令牌。手写 `appkit.New` 的等价形态：`appkit.Middleware(authn.Middleware(pub, issuer))`。
+
+行为约定：无 Authorization 头原样放行（公开端点是合法状态，判公开与否是
+Require 的事，挂中间件 ≠ 全站要登录）；有头但验不过必须 401——坏凭证是
+攻击不是匿名，不静默降级。
+
+### ④ 判定矩阵与 step-up 客户端流程
+
+| 客户端收到 | 含义 | 客户端动作 |
+|---|---|---|
+| 401 `UNAUTHENTICATED` | 未登录 / 凭证无效 | 走登录 |
+| 403 `PERMISSION_DENIED` | 已登录但没这个码 | 提示无权限（无重试路径） |
+| 403 `STEP_UP_REQUIRED` | 高危码，须新鲜证明 | 引导 MFA → 向提供方换取证明 → 带 `X-Step-Up` 头**重试同一请求** |
+
+step-up 是内联协议，无广播：`Challenge: true` 的码在持码之外还要证明。
+客户端收到 `STEP_UP_REQUIRED` 才发起挑战（提供方验挑战动作，签一枚短
+step-up 令牌），重试时放进 `X-Step-Up` 头；框架验它的签名、iss、sub（须
+与访问令牌一致）、purpose、exp，取 iat 作证明时刻，5 分钟内有效。
+
+### 提供方契约（照此签发即可写第二个提供方）
+
+- **访问令牌**（`Authorization: Bearer`）：JWT / EdDSA；`iss`、`sub`、`exp`
+  必填，`tid`（业务租户）可选，`perms` 是**精确码数组**——通配展开在签发侧
+  完成，框架判定永远是集合包含；
+- **step-up 令牌**（`X-Step-Up`）：JWT / EdDSA；`iss`、`sub`（与访问令牌
+  一致）、`exp`、`purpose="step-up"`、`iat`；
+- **密钥与 iss**：Ed25519 公钥交组合根配置，iss 唯一标识提供方（多分区
+  各自一个 iss）。
+
+两个注意：权限是令牌快照，变更（授/撤）在令牌过期后才生效——需要即时
+生效的码，提供方把对应令牌的 `exp` 签短一点；拆分部署时每个服务**自己**
+挂验签中间件（凭证都在请求头上，本就该各自验），Actor 不跨契约调用传播。
+
 ## 10. 规则速查
 
 | 你想做 | 正确做法 | 错误做法（会被什么拦住） |
@@ -852,6 +957,7 @@ go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@v0.4.0 -moneyfloat.scope
 | 写 SQL | `db/queries/*.sql` + sqlc | handler/service 里拼 SQL（depguard 拦 pgx import） |
 | 表示金额 | `decimal.Decimal`（存储/运算，sqlc 全局 override NUMERIC）+ `money.Money`（需币种绑定时，领域层）+ JSON 边界字符串（入站用 `money.ParseCanonical`） | float64、裸 decimal 上 JSON 面（都在 appkit-lint 里，make lint 与 CI 都跑） |
 | 返回错误 | 合约错误码（`apperr.Is(err, identityv1.CodeXxx)` 单体/微服务行为一致） | 字符串比对、裸 errors.New 跨层 |
+| 给端点加鉴权 | `reg.Require(code, handler)`（码先在 Register 阶段声明；组合根配 `AuthnPublicKey`/`AuthnIssuer`） | 各写各的 JWT 验签判定（样板漂移、拼错码无人兜底）；自解 Authorization 头（无机制挡，别做） |
 | 跑后台任务 | `reg.Worker(name, run)` | 自己 `go func()`（关停不等它、崩了没人管） |
 | 跑周期任务 | `reg.Worker(name, job.Every(pool, ...))` | 裸 `time.Ticker`（多副本每轮重复执行） |
 | 改数据库结构 | 新增 `000N_xxx.sql`（建表同一文件里写 `COMMENT ON TABLE`）+ `make schema` | 改已应用的迁移文件（启动报 MIGRATION_DRIFT）；手改 `db/schema/`（CI 报漂移） |

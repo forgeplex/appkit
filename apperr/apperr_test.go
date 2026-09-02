@@ -156,6 +156,9 @@ func TestShortcuts(t *testing.T) {
 		{"NotFound", apperr.NotFound("account %s", "a-1"), apperr.CodeNotFound, http.StatusNotFound},
 		{"Conflict", apperr.Conflict("version mismatch"), apperr.CodeConflict, http.StatusConflict},
 		{"Unavailable", apperr.Unavailable(cause), apperr.CodeUnavailable, http.StatusServiceUnavailable},
+		{"Unauthenticated", apperr.Unauthenticated("authentication required"), apperr.CodeUnauthenticated, http.StatusUnauthorized},
+		{"PermissionDenied", apperr.PermissionDenied("permission denied"), apperr.CodePermissionDenied, http.StatusForbidden},
+		{"StepUpRequired", apperr.StepUpRequired("step-up authentication required"), apperr.CodeStepUpRequired, http.StatusForbidden},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
