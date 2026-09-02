@@ -2,6 +2,54 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.6.0（2026-09-02）
+
+权限抽象进框架：声明 / 绑定 / 判定 / step-up
+
+为什么：给系统接鉴权时，每个域要各复制一份约 90 行的 JWT 验签 + 权限
+判定样板，且设计上有两个结构性洞——端点绑码拼错要到运行时 403 才暴露
+（绑定字符串不在任何校验视野里）；权限目录的完整性靠组合根记得手工
+全量注入，漏了启动失败。这版把**机制**收进框架（声明收集、绑定校验、
+判定矩阵、证明验签），**语义**留给可插拔的提供方域（角色模型、通配
+匹配、令牌签发、MFA 挑战——如 rbac）：换提供方，业务域与框架代码
+零改动。
+
+这一版干了什么：
+
+- 根包 permission.go（零第三方类型，守根包依赖纯净）：模块在 Register
+  阶段用 `reg.Permissions` 声明权限码（迟到声明 panic，Setup 期汇总即被
+  提供方消费）；`reg.PermissionDecls()` 输出全应用目录（提供方 Setup 期
+  同步落库，组合根手工注入环节退役）；`reg.Require(code, h)` 端点绑码，
+  判定矩阵统一在框架——401 UNAUTHENTICATED / 403 PERMISSION_DENIED /
+  403 STEP_UP_REQUIRED；全部 Setup 之后校验**绑定 ⊆ 声明**，拼错的码
+  在监听之前曝光并点名模块与码（★ 装配期硬失败）。
+- Actor 主体快照：`{UserID, TenantID, Perms, StepUpAt}`。判定永远是
+  集合包含——通配等匹配语义归提供方，在签发侧展开为精确码；权限变更
+  随令牌过期生效，判定零远程调用、零每请求查库。
+- 新 authn 包（机制件，引入 golang-jwt/v5）：`authn.Middleware(pub,
+  issuer)` 验 Bearer 令牌与 X-Step-Up 证明——EdDSA 算法白名单（防算法
+  混淆攻击）+ iss + exp 必查验签，注入 Actor。无 Authorization 头放行
+  （判公开与否是 Require 的职责）；有头验不过 401——坏凭证是攻击不是
+  匿名。claims 布局即框架与提供方之间的契约（iss/sub/exp/tid/perms；
+  step-up 另有 purpose/iat，sub 须与访问令牌一致），照此签发即可写出
+  第二个提供方。
+- step-up 分工：提供方验挑战动作并签 step-up 令牌；框架验证明（签名/
+  iss/sub/purpose/exp，取 iat）；Require 验策略（Challenge 标记 + 5 分钟
+  新鲜度）。消费方是客户端：403 STEP_UP_REQUIRED → 完成 MFA → 带
+  X-Step-Up 重试，无广播、无消费注册。
+- apperr 补 `STEP_UP_REQUIRED` 码与 `Unauthenticated`/`PermissionDenied`
+  构造捷径。
+- bootstrap 两行接入：`AuthnPublicKey` / `AuthnIssuer`（配钥不配 iss
+  启动报错——没有 iss 约束的验签会接受任何持私钥者签的令牌）。
+- 脚手架两种域形态（普通/分区域）的 module.go 带权限声明样例与教学
+  注释；DESIGN §5.4 设计节 + §7 约束表三行、GUIDE 新增鉴权接入章节
+  （声明 → 绑码 → 组合根两行 → step-up 客户端流程 → 提供方契约）。
+
+影响面：纯加法，apidiff 相对 v0.5.5 零 incompatible；不配置
+AuthnPublicKey 的系统行为不变。0.x 期间号是节拍：这版是新框架面
+（权限子系统），域仓库的接入方式（声明 + 绑码 + 组合根挂验签）值得
+每个升级者读一遍 GUIDE 鉴权章节，故 minor 而非 patch。
+
 ## v0.5.5（2026-09-02）
 
 分区域域 CI 解锁
