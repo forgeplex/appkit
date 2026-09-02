@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgeplex/appkit/internal/dbtest"
@@ -108,6 +110,18 @@ func TestDoForeignHandleErrors(t *testing.T) {
 		t.Fatal("Do 遇到异质事务句柄应当报错")
 	}
 }
+
+// sqlcBatchDBTX 复刻 sqlc（v1.30）在包内存在任一批处理注解时生成的 DBTX
+// 形状——SendBatch 会被加进整包共享的接口。pgtx.DB 必须仍赋值得进去，
+// 否则带批处理的域仓库里 pgtx.From 的返回值进不了 sqlc.New（issue #2）。
+type sqlcBatchDBTX interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
+}
+
+var _ sqlcBatchDBTX = pgtx.DB(nil)
 
 // ---- 需要 Postgres 的测试（TEST_DATABASE_URL）----
 
@@ -269,6 +283,55 @@ func TestDoPanicRollsBackAndRethrows(t *testing.T) {
 	}
 }
 
+// TestDoGoexitReleasesConn 复现 issue #1：fn 内 runtime.Goexit（testing 的
+// t.Fatal/FailNow 即此实现）不是 panic，recover 兜不住——收尾若不在 defer
+// 里，事务悬挂、连接不归还。单连接池让泄漏显形：Goexit 之后第二次 Do
+// 必须还能拿到连接，超时即失败。
+func TestDoGoexitReleasesConn(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL 未设置，跳过需要 Postgres 的测试")
+	}
+	pool, err := pgtx.NewPool(context.Background(), dsn, pgtx.WithMaxConns(1))
+	if err != nil {
+		t.Fatalf("NewPool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	tr := pgtx.New(pool)
+	table := testTable(t, pool)
+
+	// Goexit 会在退出前执行整条 defer 链：Do 的回滚 defer 先于本 goroutine
+	// 的 close(exited)，所以 <-exited 时回滚已完成。
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		_ = tr.Do(context.Background(), func(ctx context.Context) error {
+			if err := insert(ctx, t, pool, table, "a"); err != nil {
+				return err
+			}
+			runtime.Goexit() // 模拟 t.Fatal：Do 不再返回，只剩 defer 收尾
+			return nil
+		})
+	}()
+	<-exited
+
+	// 连接必须已归还：池上限 1，若上个事务悬挂，这次 Do 在超时前拿不到连接。
+	// 拿到了则顺带断言写入已随回滚消失（visible 不能用——它走 Background
+	// ctx 直查池，连接未归还时会永远阻塞而不是报错）。
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var n int
+	if err := tr.Do(ctx, func(ctx context.Context) error {
+		return pgtx.From(ctx, pool).QueryRow(ctx,
+			"SELECT count(*) FROM "+table+" WHERE v = $1", "a").Scan(&n)
+	}); err != nil {
+		t.Fatalf("Goexit 后连接应已归还，后续 Do 失败: %v", err)
+	}
+	if n != 0 {
+		t.Fatal("Goexit 后写入不应可见（事务应被回滚）")
+	}
+}
+
 func TestFromInsideAndOutsideTx(t *testing.T) {
 	pool := dbtest.Pool(t)
 	tr := pgtx.New(pool)
@@ -315,6 +378,34 @@ func TestFromInsideAndOutsideTx(t *testing.T) {
 	}
 	if !visible(t, pool, table, "a") {
 		t.Fatal("提交后应可见")
+	}
+}
+
+// TestFromSendBatch 冒烟：SendBatch 经 From 在事务内可用且随事务提交
+// （issue #2 的运行时半边；编译半边是 sqlcBatchDBTX 断言）。
+func TestFromSendBatch(t *testing.T) {
+	pool := dbtest.Pool(t)
+	tr := pgtx.New(pool)
+	table := testTable(t, pool)
+
+	err := tr.Do(context.Background(), func(ctx context.Context) error {
+		var b pgx.Batch
+		b.Queue("INSERT INTO "+table+" (v) VALUES ($1)", "a")
+		b.Queue("INSERT INTO "+table+" (v) VALUES ($1)", "b")
+		br := pgtx.From(ctx, pool).SendBatch(ctx, &b)
+		defer br.Close()
+		for range 2 {
+			if _, err := br.Exec(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !visible(t, pool, table, "a") || !visible(t, pool, table, "b") {
+		t.Fatal("批处理两行都应提交可见")
 	}
 }
 

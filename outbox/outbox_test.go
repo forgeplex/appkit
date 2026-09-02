@@ -181,6 +181,7 @@ func (d *captureDB) Exec(_ context.Context, _ string, args ...any) (pgconn.Comma
 }
 func (d *captureDB) Query(context.Context, string, ...any) (pgx.Rows, error) { return nil, nil }
 func (d *captureDB) QueryRow(context.Context, string, ...any) pgx.Row        { return nil }
+func (d *captureDB) SendBatch(context.Context, *pgx.Batch) pgx.BatchResults  { return nil }
 
 // TestPublishSnapshotsCallMeta 验证发布时把 callctx 白名单快照进事件 meta：
 // 事件是异步的，投递时原请求早就结束了，不在这里存下来链路就断了。
