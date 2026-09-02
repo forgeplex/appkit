@@ -2,6 +2,44 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.8.0（2026-09-02）
+
+pgtx 修缮：事务收尾兜住 Goexit + DB 对齐 sqlc 批处理
+
+为什么：两处都是框架该兜的底，而不是该让下游立规矩绕行的坑。
+其一，Do 用 recover 兜异常退出，但 runtime.Goexit 不是 panic（testing
+的 t.Fatal/FailNow 即此实现）——recover 拿到 nil，回滚分支不执行，
+事务既不提交也不回滚，连接被占住直到进程退出；集成测试里「事务内
+断言失败」是高频写法，一旦这么写，泄漏的是真连接且测试本体可能
+还是绿的，极难归因。其二，DB 接口缺 SendBatch——sqlc 只要见到任一
+条批处理注解（:batchexec/:batchmany/:copyfrom 等）就会给整包共享的
+DBTX 加上该方法，pgtx.From 的返回值进不了 sqlc.New，事务感知的
+调用链断掉，下游只能自造一份 dbtxFrom 复制语义绕开——两份逻辑
+并存，pgtx 修了语义下游感知不到。
+
+这一版干了什么：
+
+- Do 收尾挪进无条件 defer（committed 标记区分提交/回滚），recover
+  整个删掉：defer 在返回、panic、Goexit 三种退出路径下都执行，连接
+  必归还；panic 原样穿出不再经 recover 转手。回滚失败仍并进返回
+  错误（ErrTxClosed 无害忽略），错误/panic 的既有语义不变。
+- DB 补 SendBatch：pgx v5 里 *pgxpool.Pool 与 pgx.Tx 的签名完全一致，
+  接口的实现断言两行不用动。测试含编译期形状断言（复刻 sqlc 批处理
+  生成的 DBTX）与 From().SendBatch 在事务内提交的集成冒烟。
+- 回归反证：Goexit 测试（单连接池让泄漏显形——Goexit 后第二次 Do
+  必须还拿得到连接）在旧代码上挂死、新代码 0.02s 通过。make check /
+  test-lint / test-db -race 真库全绿。
+
+影响面：apidiff 相对 v0.7.0 计一行 incompatible——pgtx.DB 加方法对
+接口的实现方是破坏，但 DB 全仓只有框架自身返回、下游只消费不实现，
+实际风险面为零，随本版说明并请实现方知悉。用 sqlc 批处理的仓库升级
+后可删自造的 dbtxFrom，直接把 pgtx.From(ctx, pool) 喂给 sqlc.New；
+在事务内写 t.Fatal 的测试从此合法且不再泄漏连接。minor 而非 patch：
+接口面变化值得每个用 sqlc 批处理的升级者读一遍。
+
+Fixes #1
+Fixes #2
+
 ## v0.7.0（2026-09-02）
 
 租户机制归框架：authn 焊 callctx + 单 schema 域 RLS 强制 + 第三种域形态 -tenant
