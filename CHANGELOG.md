@@ -2,7 +2,7 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
-## v0.8.0（2026-09-02）
+## v0.7.1（2026-09-02）
 
 pgtx 修缮：事务收尾兜住 Goexit + DB 对齐 sqlc 批处理
 
@@ -31,11 +31,11 @@ DBTX 加上该方法，pgtx.From 的返回值进不了 sqlc.New，事务感知�
   test-lint / test-db -race 真库全绿。
 
 影响面：apidiff 相对 v0.7.0 计一行 incompatible——pgtx.DB 加方法对
-接口的实现方是破坏，但 DB 全仓只有框架自身返回、下游只消费不实现，
-实际风险面为零，随本版说明并请实现方知悉。用 sqlc 批处理的仓库升级
-后可删自造的 dbtxFrom，直接把 pgtx.From(ctx, pool) 喂给 sqlc.New；
-在事务内写 t.Fatal 的测试从此合法且不再泄漏连接。minor 而非 patch：
-接口面变化值得每个用 sqlc 批处理的升级者读一遍。
+接口的实现方是形式上的破坏，但 DB 全仓只有框架自身返回、下游只消费
+不实现，实际是修「与 sqlc 批处理 DBTX 不兼容」这个 bug 而非改语义，
+故 patch 而非 minor。用 sqlc 批处理的仓库升级后可删自造的 dbtxFrom，
+直接把 pgtx.From(ctx, pool) 喂给 sqlc.New；在事务内写 t.Fatal 的
+测试从此合法且不再泄漏连接。
 
 Fixes #1
 Fixes #2
