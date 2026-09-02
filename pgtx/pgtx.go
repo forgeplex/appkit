@@ -205,7 +205,11 @@ type beginner interface {
 // Do 划定一个事务边界：ctx 无事务则在池上开新事务；已有事务（嵌套 Do）则在
 // 其上开 savepoint。fn 返回错误或 panic 都会回滚（panic 回滚后继续抛出），
 // 否则提交。fn 收到的 ctx 携带事务句柄，经 From 取到的 DBTX 即该事务。
-func (t *Transactor) Do(ctx context.Context, fn func(ctx context.Context) error) error {
+//
+// 收尾靠无条件 defer 而非 recover：recover 兜不住 runtime.Goexit（testing
+// 的 t.Fatal/FailNow 即是），Goexit 下事务既不提交也不回滚 = 连接泄漏到
+// 进程退出。defer 在返回、panic、Goexit 三种退出路径下都执行，连接必归还。
+func (t *Transactor) Do(ctx context.Context, fn func(ctx context.Context) error) (err error) {
 	var b beginner = t.pool
 	if h := tx.Value(ctx); h != nil {
 		cur, ok := h.(pgx.Tx)
@@ -219,29 +223,27 @@ func (t *Transactor) Do(ctx context.Context, fn func(ctx context.Context) error)
 		return fmt.Errorf("pgtx: 开启事务: %w", err)
 	}
 
+	committed := false
 	defer func() {
-		if p := recover(); p != nil {
-			_ = ptx.Rollback(rollbackCtx(ctx))
-			panic(p)
+		if !committed {
+			// 已提交/已收尾的事务再 Rollback 得 ErrTxClosed，忽略；其余回滚
+			// 失败并进返回错误（panic/Goexit 路径 err 无人消费，并进去无害）。
+			if rbErr := ptx.Rollback(rollbackCtx(ctx)); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+				err = errors.Join(err, fmt.Errorf("pgtx: 回滚: %w", rbErr))
+			}
 		}
 	}()
 
 	if err := t.beforeFn(ctx, ptx); err != nil {
-		if rbErr := ptx.Rollback(rollbackCtx(ctx)); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
-			return errors.Join(err, fmt.Errorf("pgtx: 回滚: %w", rbErr))
-		}
 		return err
 	}
-
 	if err := fn(tx.With(ctx, ptx)); err != nil {
-		if rbErr := ptx.Rollback(rollbackCtx(ctx)); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
-			return errors.Join(err, fmt.Errorf("pgtx: 回滚: %w", rbErr))
-		}
 		return err
 	}
 	if err := ptx.Commit(ctx); err != nil {
 		return fmt.Errorf("pgtx: 提交: %w", err)
 	}
+	committed = true
 	return nil
 }
 
@@ -252,11 +254,15 @@ func rollbackCtx(ctx context.Context) context.Context {
 }
 
 // DB 与 sqlc 生成代码的 DBTX 接口签名一致：pgx.Tx 与 *pgxpool.Pool 都满足它，
-// sqlc Querier 拿它即可透明地跑在事务内或池上。
+// sqlc Querier 拿它即可透明地跑在事务内或池上。含 SendBatch——sqlc 只要在
+// 任意一条查询上见到批处理注解（:batchexec/:batchmany/:copyfrom 等），就会
+// 给该包共享的 DBTX 整体加上 SendBatch，缺它则 From 的返回值赋给生成的
+// Querier 时编译不过。
 type DB interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults
 }
 
 var (
