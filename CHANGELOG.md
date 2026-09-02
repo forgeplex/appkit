@@ -2,6 +2,60 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.7.0（2026-09-02）
+
+租户机制归框架：authn 焊 callctx + 单 schema 域 RLS 强制 + 第三种域形态 -tenant
+
+为什么：租户此前框架只收了「传播」（callctx 三路径自动），没收「解析
+入口」（租户身份从请求哪里来、谁可信）与「存储强制」（单 schema 域的
+跨租户过滤）——每个域自己实现，风格漂移只是表象，漏一条租户 WHERE 是
+静默跨租户泄漏。这版与权限抽象（v0.6.0）同构切分：机制归框架（身份
+来源唯一化 + RLS 存储强制），语义归域（租户模型/层级/生命周期/目录表，
+归各域与 rbac/identity）。域形态从此三选一：默认 plain（单租户）/
+-tenant（行级 RLS）/ -partitioned（schema 隔离），互斥、生成时选定。
+
+这一版干了什么：
+
+- authn → callctx 焊接（身份来源唯一化）：验过的令牌 tid 焊进
+  callctx——有值覆盖入站头带来的值、无值清零，「无租户令牌 + 伪造的
+  X-Tenant-Id」不能成立。头只在未认证入口存活（那是内部东西向的合法
+  形态：Transport 注入 → Extract 读出）；边缘剥头归网关，框架不越位。
+  业务代码取租户唯一入口 `callctx.From(ctx).TenantID`。
+- pgtx 机制件（DDL 库函数是唯一事实源）：`NewTenant(pool)` 每次 Do 开
+  事务后把租户落成事务级 GUC `app.tenant_id`（set_config 事务级，连接
+  归池即净；无租户不设——基础设施表的 relay/claim 不带租户，不能被
+  卡死）。`TenantScopeSQL` 建策略函数（GUC 缺失 RAISE 42501 而非匹配
+  零行——事务外直查业务表响亮失败，「查询成功但什么都看不见」才是
+  危险形态）。`TenantPolicySQL` 三件套：ENABLE + **FORCE**（表主通常
+  就是应用角色，不 FORCE 则 RLS 是装饰）+ 策略（USING/WITH CHECK 都
+  比对 tenant_id，拦住「把别家的租户写进去」）。
+- `pgtx.VerifyTenantRLS` 启动期守卫（Setup 期调用，晚于迁移，看到的是
+  终态）：有 tenant_id 列的表必须三件套齐，且连接角色不得 superuser/
+  BYPASSRLS（否则 RLS 静默不生效）——缺一样拒绝启动，点名全部问题表
+  并附修复 SQL。
+- schemadoc 补 RLS 渲染（此前直接 unsupported 报错，租户域进不了
+  schema 工作流）：策略三件套如实渲染进 db/schema/<表>.sql，策略被删/
+  FORCE 被摘即漂移检查变红；未 ENABLE 的「装饰态」点名标注而非装作
+  没有。
+- 脚手架 -tenant 形态（与 -partitioned 互斥）：module.go 走 NewTenant +
+  Setup 首行 VerifyTenantRLS；0001 基础迁移追加策略函数；0002 样例迁移
+  （tenant_id 列 + 租户打头索引 + 三件套 + COMMENT）建真表照抄；生成
+  仓库的 AGENTS/README 教 RLS 写法与数据库角色要求（非 superuser、
+  NOBYPASSRLS）。
+- 文档：DESIGN §5.5 租户隔离（三形态表 + 诚实标注的洞：未认证入口信
+  头、superuser 绕过靠启动校验兜住）+ §7 两行；GUIDE §3.2 租户域章节
+  （含逃生舱：跨租户批处理逐租户 callctx.With + Do；迁移内回填先回填
+  后挂 policy）+ 鉴权章节租户身份小段 + §4 幂等键作用域示例改为
+  callctx 取租户。
+
+影响面：一处**行为变化**——authn 认证请求中 callctx.TenantID 由令牌
+决定（头值被覆盖/清零）。既有「令牌无 tid + 依赖 X-Tenant-Id 头租户」
+的部署升级后头不再生效，须在令牌里签发 tid 或改造为东西向内部调用；
+其余纯加法，apidiff 相对 v0.6.0 零 incompatible，不生成 -tenant 域、
+不挂 RLS 的仓库行为不变。0.x 期间号是节拍：这版改了一条既有语义并
+新增框架面（租户子系统），值得每个多租户部署读一遍 GUIDE §3.2，故
+minor 而非 patch。
+
 ## v0.6.0（2026-09-02）
 
 权限抽象进框架：声明 / 绑定 / 判定 / step-up
