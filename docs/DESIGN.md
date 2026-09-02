@@ -126,7 +126,9 @@ appkit/                          # module github.com/forgeplex/appkit
 ├── tx/                          # 事务边界的【接口面】：Transactor.Do(ctx, fn)、HasTx(ctx)
 │                                #   —— 零驱动依赖，业务包只 import 这个
 ├── pgtx/                        # tx 的 pgx 实现：tx 藏 ctx、DBTX 取用（有 tx 用 tx 无则 pool）
-│                                #   由框架装配注入，业务代码永不 import
+│                                #   由框架装配注入，业务代码永不 import；
+│                                #   分区路由（NewRouted，SET LOCAL search_path）与
+│                                #   租户下沉（NewTenant，事务级 GUC + RLS）也在这——见 §5.5
 ├── outbox/                      # 同事务 Publish 落表、relay(SKIP LOCKED 轮询)、
 │                                #   inbox 消费去重；Bus 接口可插拔：
 │                                #   directbus(单库直投 inbox) / natsbus / kafkabus
@@ -140,7 +142,8 @@ appkit/                          # module github.com/forgeplex/appkit
 │                                #   （由 appkit sync 物化进各 repo，CI 做 drift check）
 ├── ci/                          # GitHub Actions reusable workflows（域 repo 一行 uses:）
 ├── cmd/appkit/                  # CLI：
-│                                #   new domain <name>   生成域 repo 骨架
+│                                #   new domain <name>   生成域 repo 骨架（-partitioned 分区
+│                                #                       形态 / -tenant 租户形态，见 §5.5）
 │                                #   new system <name>   生成组合 repo 骨架
 │                                #   sync                物化/刷新 lint 配置与 CI 引用
 │                                #   dev                 go work init/use 全部子 repo
@@ -401,6 +404,55 @@ Require 验**策略**（该码是否标了 Challenge、证明是否新鲜）。�
 拆分部署时每个服务自挂 Authn（Authorization/X-Step-Up 头本来就在线路上，
 下游不靠上游「帮忙认证过了」）；Actor 不进 `callctx` 白名单，也不该进。
 
+### 5.5 租户隔离：三种形态，机制归框架、语义归域
+
+租户是多租户系统都要做、但不做约束就会每个域长出自己一套的一块——不是
+风格漂移问题，是安全问题：漏一条租户 WHERE 是**静默跨租户泄漏**。切法与
+鉴权（§5.4）同构——**机制归框架，语义归域**：
+
+- **语义归域与 rbac/identity**：租户模型（扁平/层级）、生命周期（开通/
+  冻结/注销）、目录表、配额——产品决策，框架不预设；
+- **机制归框架**：租户身份的**来源唯一化**（authn 从令牌 tid 焊入
+  callctx，头只是东西向传播的载体）与**存储层强制**（RLS，漏 WHERE 从
+  泄漏变成查不到行/写入被拒）。
+
+三种形态，`appkit new domain` 一次选定（互斥）：
+
+| 形态 | 生成 flag | 隔离方式 | 适用 |
+|---|---|---|---|
+| plain | （默认） | 单租户域，无隔离需求 | 域本身就是独占的 |
+| tenant | `-tenant` | 单 schema，行级（RLS） | 租户共享同一份数据模型，量级单库可容 |
+| partitioned | `-partitioned` | schema 级（每租户一套 schema） | 强隔离/合规要求，或单 schema 撑不住量级 |
+
+tenant 形态的机制三件套（全部在 `pgtx`，DDL 库函数是唯一事实源）：
+
+1. **身份焊接**（authn）：验过的令牌 `tid` 覆盖或清零 callctx 里的
+   TenantID——认证请求以令牌为准，「无租户令牌 + 伪造的 X-Tenant-Id」
+   不能成立。头只在**未认证**入口存活（那是内部东西向的合法形态：
+   Transport 注入 → Extract 读出）；边缘剥头是网关的职责，框架不越位。
+2. **GUC 下沉**（`pgtx.NewTenant`）：每次 `Do` 开事务后把租户身份落成
+   事务级 GUC `app.tenant_id`（`set_config(..., true)`，连接归池即净）；
+   无租户则不设——基础设施表（outbox/idem/audit）的 relay、claim 不带
+   租户，不能被强租户卡死。策略函数 `appkit_current_tenant()` 在 GUC
+   缺失时 RAISE（42501）而不是匹配零行：事务外直查业务表响亮失败，
+   「查询成功但什么都看不见」才是危险形态。
+3. **RLS 三件套**（`pgtx.TenantPolicySQL`）：ENABLE + **FORCE** + 策略
+   （USING/WITH CHECK 都比对 tenant_id）。FORCE 必须有：应用角色通常
+   就是表主，不 FORCE 则 RLS 对它是装饰；WITH CHECK 拦住「把别家的
+   tenant_id 写进去」。启动期 `pgtx.VerifyTenantRLS` 校验完整性：有
+   tenant_id 列的表必须三件套齐，且连接角色不得 superuser/BYPASSRLS
+   （否则 RLS 静默不生效），缺一样拒绝启动、点名表并附修复 SQL。
+
+诚实标注的洞：未认证公开端点仍信任头值（公开端点本就不该查租户数据，
+边缘剥头归网关）；superuser 绕过靠 Setup 期角色检查兜住（运行时 RLS 挡
+不了 superuser，这是 Postgres 语义）；schema 文档如实渲染 RLS DDL
+（策略被删/FORCE 被摘，漂移检查跟着变红），未 ENABLE 的「装饰态」点名
+而非装作没有。
+
+partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只会得到两套
+都要维护的机制。逃生舱不进 API：跨租户批处理逐租户 `callctx.With` + Do；
+迁移内跨租户回填在同一文件里先回填后挂 policy（DDL 顺序自控）。
+
 ## 6. 请求完整路径（以"记一笔账"POST 为例）
 
 | # | 层 | 做什么 | 禁止什么（执行手段） |
@@ -435,9 +487,11 @@ Require 验**策略**（该码是否标了 Challenge、证明是否新鲜）。�
 | 已应用的迁移不可变 | 历史表存内容 sha256，启动期逐个比对，不符即 `MIGRATION_DRIFT` 拒绝启动；`.gitattributes` 钉 `*.sql eol=lf` 消除跨平台误报 | ★ 运行时级，启动即暴露 |
 | 分区域域的 schema 由调用方确定 | 迁移/查询无前缀 + 事务级 `SET LOCAL search_path`（`pgtx.NewRouted` 按 `callctx.Meta.TenantID` 查组合根注入的映射）；查询必须经 `tx.Do`，事务外落默认 search_path 即「表不存在」报错 | ★ 运行时级：路由失败（查无分区）即回滚 422，无法静默落到错误分区 |
 | 分区域域的 SQL 无前缀纪律 | `partitioned: true` 时 archcheck 前缀规则翻转（任何 schema 前缀违规，无 DB 即拦）；sqlc 编译器兜底——带前缀与无前缀两个世界各自封闭，混写双向都是编译错误 | ▲ CI 级 + ★ 编译器级 |
+| 单 schema 域跨租户泄漏 | RLS 三件套（ENABLE+FORCE+策略，`pgtx.TenantPolicySQL`）+ 事务级 GUC（`pgtx.NewTenant` 的 Do）；Setup 期 `pgtx.VerifyTenantRLS` 校验完整性（缺三件套/角色 superuser 或 BYPASSRLS 即拒启，点名表并附修复 SQL） | ★ 运行时级：漏写 WHERE 只会查不到行/写入被拒，且缺件启动即暴露 |
+| 租户身份来源唯一（令牌 tid） | authn 验签后把 tid 焊进 callctx（有值覆盖、无值清零）——伪造的 X-Tenant-Id 在认证请求里活不下来 | ★ 中间件级；未认证入口仍信头（东西向合法形态），边缘剥头归网关——这是文档级边界，不是机检 |
 | schema 文档支持分区域域 | 暂无：`appkit schema` 对 `partitioned: true` 明确报错（分区映射由组合根注入，域仓库无从枚举；先想清楚「按分区画还是按逻辑模型画」再补） | ✗ 尚未落地（写在这里是为了不假装它已生效） |
 | 没人跑迁移不可能 | 登记了迁移却既无 `Migrator` 又无 `SkipMigrations()` → 启动报错；`-migrate` 无 `database.url` 亦报错 | ★ 装配级 fail-fast |
-| schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`，产出因此是迁移的纯函数；CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（分区、生成列、RLS、继承…）点名报错而非静默输出残缺 DDL | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行——`domain-ci.yml` 经 `@main` 被全部存量域仓库共享，硬加检查会让它们在合并那一刻集体变红。代价是从不启用的仓库永远不被检查；跑过一次 `make schema` 就永久转严 |
+| schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`，产出因此是迁移的纯函数；CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（分区、生成列、继承…）点名报错而非静默输出残缺 DDL；RLS 如实渲染成 DDL（含策略三件套，策略被删/FORCE 被摘即漂移），未 ENABLE 的装饰态点名标注 | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行——`domain-ci.yml` 经 `@main` 被全部存量域仓库共享，硬加检查会让它们在合并那一刻集体变红。代价是从不启用的仓库永远不被检查；跑过一次 `make schema` 就永久转严 |
 | 表有说明（`COMMENT ON TABLE`） | 缺的表在 `db/SCHEMA.md` 表清单里标 ⚠ 缺说明并给出该补的那一句；`appkit schema -check` 在 CI 里逐表打 `::warning` 注解 | ▲ 软约束：不阻断 CI（刻意的，存量仓库不会突然红），且 `db/SCHEMA.md` 带 `linguist-generated` 在 PR diff 里默认折叠——⚠ 没人主动打开就看不见，::warning 注解是让它浮出水面的那一半 |
 | 长驻任务死了必被发现 | `Registry.Worker` 托管：异常退出上报主循环并触发关停（不再是"探针绿着、事件停摆"） | ★ API 设计级 |
 | ctx 只能传白名单元数据 | `callctx.Meta` 是具名字段的 struct 而非 map，防火墙剥值后只放回它 | ★ 编译器级：塞不进去 |
@@ -476,6 +530,10 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   与 `appkit check` 双向都是硬错误，跨域访问的静态保证从 archcheck 前缀扫描
   **转移**为 sqlc 编译解析，强度不降级。已知的洞：`appkit schema` 暂不支持
   该形态（明确报错而非产出误导内容，见 §7）。
+- **租户域（`appkit new domain <name> -tenant`）**：单 schema、行级隔离，
+  机制与边界见 §5.5。选型对照：租户共享同一份数据模型、量级单库可容 →
+  tenant；强隔离/合规或单 schema 撑不住量级 → partitioned；域本身独占 →
+  默认。三种形态一次选定、互斥生成。
 - **迁移的施加时机是部署决策**：默认随进程启动（多副本经 advisory lock 串行，安全但
   N 个副本同时改 schema）；规模上来后改为 initContainer/Job 里跑 `<svc> -migrate`
   （只应用迁移即退出，不监听端口），服务副本再以 `appkit.SkipMigrations()` 起来。

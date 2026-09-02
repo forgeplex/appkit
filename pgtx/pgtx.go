@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/internal/metrics"
 	"github.com/forgeplex/appkit/tx"
 )
@@ -102,6 +103,9 @@ type Transactor struct {
 	// 不可比较类型（相对存量 tag 的 apidiff incompatible）。idem.mwConfig
 	// 的 injectedOptions 是同款取舍。
 	route *router
+	// tenant 标记 NewTenant 构造：Do 开事务后把 callctx 里的租户身份落成
+	// 事务级 GUC，供 RLS 策略读取（见 NewTenant 与 tenant.go）。
+	tenant bool
 }
 
 // router 包一层路由函数以保持 Transactor 可比较（见 Transactor.route）。
@@ -130,8 +134,20 @@ func NewRouted(pool *pgxpool.Pool, route func(ctx context.Context) (string, erro
 	return &Transactor{pool: pool, route: &router{fn: route}}
 }
 
-// routeSchema 在事务开启后落位 search_path。嵌套 Do（savepoint）会再次走到
-// 这里：ctx 相同、route 纯函数（只读 ctx）时解析出同一 schema，重复 SET 无害。
+// NewTenant 构造租户隔离 Transactor（单 schema 域、按行隔离的形态）：
+// 每次 Do 在开启事务后把 callctx 里的租户身份（authn 验签时从令牌 tid
+// 焊入）落成事务级 GUC app.tenant_id——RLS 策略（TenantPolicySQL 生成）
+// 据此过滤行，业务查询漏写 WHERE tenant_id 也查不到、写不进别家的行。
+//
+// 租户身份为空时不设 GUC：租户业务表的策略函数会对缺 GUC 的查询响亮
+// 报错（见 TenantScopeSQL），而基础设施表（outbox/idem/audit——无
+// tenant_id 列、无策略）的操作不受影响。跨租户批处理逐租户 callctx.With
+// 后各开一次 Do；迁移文件内的跨租户回填在同一文件里先回填后挂策略。
+func NewTenant(pool *pgxpool.Pool) *Transactor {
+	return &Transactor{pool: pool, tenant: true}
+}
+
+// routeSchema 在事务开启后落位 search_path（嵌套幂等性见 beforeFn）。
 func (t *Transactor) routeSchema(ctx context.Context, ptx pgx.Tx) error {
 	if t.route == nil {
 		return nil
@@ -149,7 +165,35 @@ func (t *Transactor) routeSchema(ctx context.Context, ptx pgx.Tx) error {
 	return nil
 }
 
-// schemaRe 与 pgmigrate/outbox 的约束一致：schema 名会拼进 SQL，白名单防注入。
+// beforeFn 落事务前置状态：分区的 search_path 与租户 GUC（各自按构造
+// 形态启用）。嵌套 Do（savepoint）会再次走到这里：route 纯函数、租户
+// 取自同一 ctx，重复执行解析出同样的值，幂等无害。
+func (t *Transactor) beforeFn(ctx context.Context, ptx pgx.Tx) error {
+	if err := t.routeSchema(ctx, ptx); err != nil {
+		return err
+	}
+	return t.setTenantGUC(ctx, ptx)
+}
+
+// setTenantGUC 把 callctx 里的租户身份落成事务级 GUC（set_config 第三参
+// true：事务结束自动还原，连接归还池时不带走）。空租户不设——语义见
+// NewTenant。
+func (t *Transactor) setTenantGUC(ctx context.Context, ptx pgx.Tx) error {
+	if !t.tenant {
+		return nil
+	}
+	tenant := callctx.From(ctx).TenantID
+	if tenant == "" {
+		return nil
+	}
+	if _, err := ptx.Exec(ctx, "SELECT set_config('"+tenantGUC+"', $1, true)", tenant); err != nil {
+		return fmt.Errorf("pgtx: 设置租户 GUC: %w", err)
+	}
+	return nil
+}
+
+// schemaRe 与 pgmigrate/outbox 的约束一致：标识符（schema 名、表名）会
+// 拼进 SQL，白名单防注入。
 var schemaRe = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
 
 // beginner 抽象 pool 与 pgx.Tx 共同的 Begin：后者的 Begin 即 savepoint，
@@ -182,7 +226,7 @@ func (t *Transactor) Do(ctx context.Context, fn func(ctx context.Context) error)
 		}
 	}()
 
-	if err := t.routeSchema(ctx, ptx); err != nil {
+	if err := t.beforeFn(ctx, ptx); err != nil {
 		if rbErr := ptx.Rollback(rollbackCtx(ctx)); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
 			return errors.Join(err, fmt.Errorf("pgtx: 回滚: %w", rbErr))
 		}

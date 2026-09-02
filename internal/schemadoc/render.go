@@ -89,6 +89,37 @@ func renderTableSQL(schema string, t Table) string {
 		}
 	}
 
+	// RLS 如实渲染成 DDL：租户域靠它做行级隔离（pgtx.TenantPolicySQL 三件套），
+	// 策略被删/被改/FORCE 被摘必须能在 schema 文档与漂移检查里看出来。
+	if t.RLS != nil {
+		b.WriteString("\n")
+		if len(t.RLS.Policies) > 0 && !t.RLS.Enabled {
+			b.WriteString("-- ⚠ RLS 未 ENABLE：下面的策略不生效（装饰态）\n")
+		}
+		if t.RLS.Enabled {
+			fmt.Fprintf(&b, "ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n", qual)
+			if t.RLS.Force {
+				fmt.Fprintf(&b, "ALTER TABLE %s FORCE ROW LEVEL SECURITY;\n", qual)
+			}
+		}
+		for _, p := range t.RLS.Policies {
+			fmt.Fprintf(&b, "CREATE POLICY %s ON %s", p.Name, qual)
+			if p.Cmd != "" && p.Cmd != "ALL" {
+				fmt.Fprintf(&b, " FOR %s", p.Cmd)
+			}
+			if p.Roles != "" && p.Roles != "{public}" {
+				fmt.Fprintf(&b, " TO %s", strings.Trim(p.Roles, "{}"))
+			}
+			if p.Using != "" {
+				fmt.Fprintf(&b, "\n    USING (%s)", p.Using)
+			}
+			if p.WithCheck != "" {
+				fmt.Fprintf(&b, "\n    WITH CHECK (%s)", p.WithCheck)
+			}
+			b.WriteString(";\n")
+		}
+	}
+
 	var comments strings.Builder
 	if t.Comment != "" {
 		fmt.Fprintf(&comments, "COMMENT ON TABLE %s IS %s;\n", qual, sqlLiteral(t.Comment))

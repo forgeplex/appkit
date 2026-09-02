@@ -184,6 +184,54 @@ appkit new domain rbac -partitioned -dir rbac
 不降级：带前缀与无前缀两个世界各自封闭，混写在 sqlc 编译与 `appkit check`
 双向都是硬错误（DESIGN §8）。
 
+### 3.2 变体：租户域（单 schema、行级隔离）
+
+当**多个租户共享同一份数据模型**、量级单库可容时（大多数 SaaS 的订单/文档/
+配置类域），用 `-tenant` 生成租户域：
+
+```sh
+appkit new domain docs -tenant -dir docs
+```
+
+与分区域域（§3.1）的差别在隔离层级：这里全部租户**共表**，靠 `tenant_id`
+列 + 行级安全（RLS）在存储层隔开；业务代码的形态与普通域**完全一样**——
+事务照旧 `tx.Do`、SQL 照旧带 schema 前缀，没有任何「租户分支」。
+
+机制四件（生成物里都已就位，读懂即可，不必重写）：
+
+1. **租户身份的来源唯一**：`authn` 验签后把令牌 `tid` 焊进
+   `callctx.From(ctx).TenantID`——有值覆盖、无值清零。`X-Tenant-Id` 头只是
+   内部东西向传播的载体（Transport 注入 → 入站 Extract 读出），认证请求里
+   伪造的头值活不下来。业务代码取租户只有一个入口：`callctx.From(ctx).TenantID`。
+2. **事务自动带租户**：`pgtx.NewTenant(pool)` 的 `Do` 开事务后把租户身份落成
+   事务级 GUC `app.tenant_id`（连接归池即净）。基础设施表（outbox/幂等/审计）
+   无租户、不受影响。
+3. **RLS 三件套**：建租户表的迁移里，`tenant_id text NOT NULL` 列 + 以
+   tenant_id 打头的索引 + `pgtx.TenantPolicySQL` 的输出（ENABLE + **FORCE** +
+   策略）——生成物 `db/migrations/0002_demo_notes.sql` 就是照抄模板。含义：
+   SQL 里漏写租户 WHERE，只会**查不到**别的租户的行；把别家的 tenant_id
+   写进去，直接被拒。漏挂三件套的表，服务启动时被 `pgtx.VerifyTenantRLS`
+   点名拒绝（module.go 的 Setup，错误信息附修复 SQL）。
+4. **角色要求**：连接角色必须是**非 superuser 且不带 BYPASSRLS**——否则 RLS
+   静默不生效，verify 同样会拦。一条 SQL 的事：
+
+   ```sql
+   CREATE ROLE docs_app LOGIN PASSWORD '...';
+   GRANT USAGE ON SCHEMA docs TO docs_app;
+   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA docs TO docs_app;
+   ```
+
+逃生舱（不在 API 里，写在这里）：跨租户批处理逐租户 `callctx.With(ctx,
+callctx.Meta{TenantID: t})` + `Do`，循环即得；迁移内跨租户回填数据时，把
+回填语句放在挂 policy 的三件套**之前**（同一文件内 DDL 顺序自控）。
+
+schema 文档支持本形态：RLS 如实渲染进 `db/schema/<表>.sql`，策略被删或
+FORCE 被摘，CI 漂移检查跟着变红。租户模型本身（层级、生命周期、目录表）
+是业务语义，归各域与 rbac/identity——框架只管「身份从哪来、存储怎么隔」。
+
+三种形态怎么选：域本身就是独占的 → 默认；租户共模型、量级可容 → `-tenant`；
+强隔离/合规要求或单 schema 撑不住 → `-partitioned`（§3.1）。互斥，一次选定。
+
 ## 4. 第三步：写第一个用例（identity 的"创建用户"）
 
 **① 迁移与查询**（只允许操作 `identity` schema，跨 schema 引用会被 `appkit check` 拒绝）：
@@ -284,7 +332,9 @@ idemMW := idem.Middleware(idem.NewStore(m.opts.Pool, Schema), m.opts.Log,
 		return []byte(m.Amount().String()), nil // "80"/"80.00" 都是 "80"
 	}),
 	idem.WithKeyScope(func(r *http.Request, _ string) (string, error) {
-		return tenantFromRequest(r), nil // 从鉴权材料取，别信请求头自报的租户
+		// 租户身份唯一来源：callctx（authn 已从令牌 tid 焊入；租户域见 §3.2）。
+		// 别信请求头自报的租户——认证请求里它已被令牌覆盖/清零。
+		return callctx.From(r.Context()).TenantID, nil
 	}),
 )
 ```
@@ -946,6 +996,12 @@ step-up 令牌），重试时放进 `X-Step-Up` 头；框架验它的签名、is
 生效的码，提供方把对应令牌的 `exp` 签短一点；拆分部署时每个服务**自己**
 挂验签中间件（凭证都在请求头上，本就该各自验），Actor 不跨契约调用传播。
 
+**租户身份也在这条链上**：验签过后 `tid` 不只进 Actor，还会焊进
+`callctx`（有值覆盖、无值清零入站头带来的值）——租户域（§3.2）靠它
+下沉到存储层做 RLS。所以业务代码取租户永远 `callctx.From(ctx).TenantID`，
+读请求头即伪造面（未认证入口的头值是东西向传播的合法形态，边缘剥头
+归网关）。
+
 ## 10. 规则速查
 
 | 你想做 | 正确做法 | 错误做法（会被什么拦住） |
@@ -964,6 +1020,7 @@ step-up 令牌），重试时放进 `X-Step-Up` 头；框架验它的签名、is
 | 搞清楚现有表长什么样 | 读 `db/SCHEMA.md` / `db/schema/<表>.sql` | 翻整条迁移历史在脑子里重放 |
 | 加业务指标 | `otel.Meter("你的域名")` 自建 | 往框架指标上加标签（基数无界） |
 | 传 request id / 租户 | `callctx.Meta`（入站/契约/事件自动，生成 client 出站自动焊 `Transport`） | 自己往 ctx 塞值（跨契约调用会被防火墙剥掉） |
+| 多租户的数据隔离 | 生成时选形态：`-tenant`（RLS 行级）/ `-partitioned`（schema 级，§3.1）；建租户表照抄 0002 样例（tenant_id + 索引 + 三件套） | 手写 `WHERE tenant_id = ...` 满代码（漏一条就是静默泄漏）；业务代码读 `X-Tenant-Id` 头（认证请求里已被令牌覆盖/清零） |
 | 确认拆分部署不会变行为 | 提供方域仓库里写一条 `apptest.Conform`（local + remote 两个绑定） | 只测本地实现（远程那条路径第一次跑就是在生产） |
 
 ## FAQ

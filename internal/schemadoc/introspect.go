@@ -99,6 +99,20 @@ func readCatalog(ctx context.Context, pool *pgxpool.Pool, schema string) (Schema
 	if err != nil {
 		return Schema{}, err
 	}
+	// 策略挂到所属表上：未 ENABLE 但挂了策略的表也标出来（RLS 零值 +
+	// 策略），渲染层会点出这个「装饰态」而不是装作没有。
+	pols, err := readPolicies(ctx, pool, schema)
+	if err != nil {
+		return Schema{}, err
+	}
+	for i := range rels {
+		if p := pols[rels[i].table.Name]; len(p) > 0 {
+			if rels[i].table.RLS == nil {
+				rels[i].table.RLS = &RLS{}
+			}
+			rels[i].table.RLS.Policies = p
+		}
+	}
 	attrs := map[uint32]map[int16]string{}
 	names := map[uint32]string{}
 	for i := range rels {
@@ -155,7 +169,7 @@ func readRelations(ctx context.Context, pool *pgxpool.Pool, schema string) ([]re
 	const q = `
 SELECT c.oid, c.relname, c.relkind::text,
        COALESCE(obj_description(c.oid, 'pg_class'), ''),
-       c.relispartition, c.relrowsecurity, c.relhassubclass,
+       c.relispartition, c.relrowsecurity, c.relforcerowsecurity, c.relhassubclass,
        CASE WHEN c.relkind IN ('v','m') THEN pg_get_viewdef(c.oid, true) ELSE '' END
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -170,12 +184,13 @@ ORDER BY c.relname`
 	var out []relation
 	for rows.Next() {
 		var (
-			r                             relation
-			kind, viewDef                 string
-			partition, rls, hasSubclasses bool
+			r                      relation
+			kind, viewDef          string
+			partition, rls, forced bool
+			hasSubclasses          bool
 		)
 		if err := rows.Scan(&r.oid, &r.table.Name, &kind, &r.table.Comment,
-			&partition, &rls, &hasSubclasses, &viewDef); err != nil {
+			&partition, &rls, &forced, &hasSubclasses, &viewDef); err != nil {
 			return nil, fmt.Errorf("读取表清单: %w", err)
 		}
 		switch kind {
@@ -197,12 +212,40 @@ ORDER BY c.relname`
 		switch {
 		case partition:
 			return nil, unsupported(r.table.Name, "分区子表")
-		case rls:
-			return nil, unsupported(r.table.Name, "行级安全策略（RLS）")
 		case hasSubclasses:
 			return nil, unsupported(r.table.Name, "表继承")
 		}
+		// RLS 是租户域的常态（pgtx.TenantPolicySQL），如实读取并渲染；
+		// 未 ENABLE 但挂了策略的「装饰态」也照实读——渲染层会点出来。
+		if rls {
+			r.table.RLS = &RLS{Enabled: true, Force: forced}
+		}
 		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// readPolicies 读 schema 的全部行级安全策略，按表名分组。
+func readPolicies(ctx context.Context, pool *pgxpool.Pool, schema string) (map[string][]RLSPolicy, error) {
+	rows, err := pool.Query(ctx, `
+SELECT tablename, policyname, cmd,
+       COALESCE(roles::text, ''), COALESCE(qual, ''), COALESCE(with_check, '')
+FROM pg_policies
+WHERE schemaname = $1
+ORDER BY tablename, policyname`, schema)
+	if err != nil {
+		return nil, fmt.Errorf("查询 schema %q 的 RLS 策略: %w", schema, err)
+	}
+	defer rows.Close()
+
+	out := map[string][]RLSPolicy{}
+	for rows.Next() {
+		var table string
+		var p RLSPolicy
+		if err := rows.Scan(&table, &p.Name, &p.Cmd, &p.Roles, &p.Using, &p.WithCheck); err != nil {
+			return nil, fmt.Errorf("读取 RLS 策略: %w", err)
+		}
+		out[table] = append(out[table], p)
 	}
 	return out, rows.Err()
 }

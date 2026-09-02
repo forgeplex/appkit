@@ -9,6 +9,7 @@ import (
 	"github.com/forgeplex/appkit/audit"
 	"github.com/forgeplex/appkit/idem"
 	"github.com/forgeplex/appkit/outbox"
+	"github.com/forgeplex/appkit/pgtx"
 	"github.com/forgeplex/appkit/ruleset"
 )
 
@@ -51,6 +52,10 @@ func Domain(o Options, out io.Writer) error {
 		// 用专用模板而不是在一个模板里铺满 {{if}}。
 		files = swapTemplate(files, "module.go.tmpl", "module_partitioned.go.tmpl")
 	}
+	if o.Tenant {
+		// 同理：租户域的差别在 Transactor（NewTenant）与 Setup 期 RLS 校验。
+		files = swapTemplate(files, "module.go.tmpl", "module_tenant.go.tmpl")
+	}
 	if err := renderAll("domain", files, d, o.Dir); err != nil {
 		return fmt.Errorf("new domain %s: %w", o.Name, err)
 	}
@@ -59,6 +64,14 @@ func Domain(o Options, out io.Writer) error {
 	sqlPath := filepath.Join(o.Dir, "db", "migrations", "0001_appkit_base.sql")
 	if err := writeFile(sqlPath, []byte(baseMigrationSQL(o))); err != nil {
 		return fmt.Errorf("new domain %s: %w", o.Name, err)
+	}
+	if o.Tenant {
+		// 租户域多给一张样例迁移：RLS 三件套的写法是模式教学，也让
+		// Setup 期的 VerifyTenantRLS 从第一天就有东西可验。
+		demo := filepath.Join(o.Dir, "db", "migrations", "0002_demo_notes.sql")
+		if err := writeFile(demo, []byte(tenantDemoSQL(o))); err != nil {
+			return fmt.Errorf("new domain %s: %w", o.Name, err)
+		}
 	}
 	// 生成即合规：lint / CI 配置直接物化，不留"忘了跑 sync"的窗口。
 	// 升级 appkit 后由 appkit sync 刷新，CI 的 sync --check 校验未漂移。
@@ -102,6 +115,38 @@ func baseMigrationSQL(o Options) string {
 	b.WriteString(idem.MigrationSQL(o.Name))
 	b.WriteString("\n")
 	b.WriteString(audit.MigrationSQL(o.Name))
+	if o.Tenant {
+		// 租户域的策略函数：业务表的 RLS 策略引用它读事务级 GUC。
+		// 它在基础设施表之后建——基础设施表不挂 RLS，函数先建后用皆可。
+		b.WriteString("\n")
+		b.WriteString(pgtx.TenantScopeSQL(o.Name))
+	}
+	return b.String()
+}
+
+// tenantDemoSQL 是租户域的样例业务表迁移：tenant_id 列 + 租户打头索引 +
+// RLS 三件套（pgtx.TenantPolicySQL）。整张表可删，写法要照抄——这是
+// 「每个域的租户实现长得一样」的落点。
+func tenantDemoSQL(o Options) string {
+	var b strings.Builder
+	b.WriteString("-- 0002_demo_notes.sql —— 租户业务表的样例（可删；建真表时照抄这里的形态）。\n")
+	b.WriteString("-- 三件必做的事：\n")
+	b.WriteString("-- 1. tenant_id 列 NOT NULL——租户值来自 callctx.From(ctx).TenantID（authn 从\n")
+	b.WriteString("--    令牌 tid 焊入，业务代码不读头）；\n")
+	b.WriteString("-- 2. 以 tenant_id 打头的索引——RLS 过滤也走索引，全表扫描的隔离不是隔离；\n")
+	b.WriteString("-- 3. RLS 三件套（ENABLE + FORCE + 策略）——行级隔离在存储层强制：漏写 WHERE\n")
+	b.WriteString("--    的查询只会查不到别的租户的行，跨租户写入直接被拒，都不再是静默泄漏。\n")
+	b.WriteString("--    启动期 pgtx.VerifyTenantRLS 会校验：有 tenant_id 列却没挂三件套的表\n")
+	b.WriteString("--    会让服务拒绝启动（见 internal/module/module.go 的 Setup）。\n\n")
+	fmt.Fprintf(&b, "CREATE TABLE %q.notes (\n", o.Name)
+	b.WriteString("    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n")
+	b.WriteString("    tenant_id text NOT NULL,\n")
+	b.WriteString("    body      text NOT NULL,\n")
+	b.WriteString("    created_at timestamptz NOT NULL DEFAULT now()\n")
+	b.WriteString(");\n")
+	fmt.Fprintf(&b, "CREATE INDEX notes_tenant_idx ON %q.notes (tenant_id, created_at);\n", o.Name)
+	fmt.Fprintf(&b, "COMMENT ON TABLE %q.notes IS '样例租户表——删除我之前，先照抄我的形态';\n\n", o.Name)
+	b.WriteString(pgtx.TenantPolicySQL(o.Name, "notes"))
 	return b.String()
 }
 

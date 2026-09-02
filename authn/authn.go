@@ -33,6 +33,7 @@ import (
 
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 )
 
 // HeaderStepUp 携带 step-up 证明（另一枚 JWT）。凭证不跨边界传播——每个
@@ -69,6 +70,10 @@ type stepUpClaims struct {
 //     → 401：凭证无效必须响亮，不能静默降级为匿名；
 //   - X-Step-Up 同样原则：有头才验，验不过 401（含 sub 与访问令牌不一致、
 //     purpose 不是 step-up）；验过则 Actor.StepUpAt = 证明的 iat。
+//
+// 租户身份在此焊进 callctx：认证请求以令牌 tid 为准（覆盖或清零入站
+// X-Tenant-Id 头带来的值——该头只在内部东西向可信，外部入口可伪造）。
+// 域代码与存储层（RLS）统一从 callctx.From(ctx).TenantID 取租户。
 func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Handler {
 	parse := []jwt.ParserOption{
 		jwt.WithValidMethods([]string{jwt.SigningMethodEdDSA.Alg()}),
@@ -105,7 +110,13 @@ func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Ha
 				}
 				actor.StepUpAt = at
 			}
-			next.ServeHTTP(w, r.WithContext(appkit.WithActor(r.Context(), actor)))
+			// 租户身份焊进 callctx：令牌说了算。tid 有值则覆盖入站头带来的
+			// 租户，无值则清零——「无租户令牌 + 伪造的 X-Tenant-Id」不能
+			// 成立。未认证路径不进这里，头值存活（内部东西向的合法形态）。
+			meta := callctx.From(r.Context())
+			meta.TenantID = actor.TenantID
+			ctx := callctx.With(appkit.WithActor(r.Context(), actor), meta)
+			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
 }

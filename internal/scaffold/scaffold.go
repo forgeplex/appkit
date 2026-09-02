@@ -40,6 +40,11 @@ type Options struct {
 	// 迁移与查询全部无 schema 前缀，落位由组合根注入的分区映射（租户 → schema）
 	// 经事务级 search_path 路由确定。分区映射的定义放组合根自己的配置文件。
 	Partitioned bool
+	// Tenant 生成「租户域」形态（仅 domain）：单 schema、行级隔离——业务表
+	// 带 tenant_id 列并挂 RLS 三件套（pgtx.TenantPolicySQL），每次事务把
+	// 租户身份落成事务级 GUC（pgtx.NewTenant）。与 Partitioned 互斥：
+	// schema 隔离与行级隔离不组合。
+	Tenant bool
 }
 
 // nameRe 与 DESIGN 的域名约束一致：业务包名 = Postgres schema。
@@ -72,6 +77,9 @@ func (o *Options) normalize() error {
 	if o.AppkitVersion == "" {
 		o.AppkitVersion = "(devel)"
 	}
+	if o.Tenant && o.Partitioned {
+		return fmt.Errorf("-tenant 与 -partitioned 互斥：行级隔离与 schema 隔离不组合，先选一种隔离形态")
+	}
 	return nil
 }
 
@@ -83,6 +91,7 @@ type tmplData struct {
 	AppkitVersion string // v1.2.3；Devel 时模板不引用
 	Devel         bool   // appkit 无发布版本（源码构建）：go.mod 不 require appkit
 	Partitioned   bool   // 分区域域：迁移/查询无前缀，落位经 search_path 路由
+	Tenant        bool   // 租户域：业务表挂 RLS，租户身份经事务级 GUC 下沉到存储
 	EnvPrefix     string // 环境变量前缀（LEDGERD / PSP）
 	PgxVersion    string // 生成 go.mod 里 pgx 的版本（跟随 appkit 自身依赖）
 	// lint 工具链版本取自 ruleset：Makefile 与 domain-ci.yml 必须同版本。
@@ -99,6 +108,7 @@ func newData(o Options, envPrefix string) tmplData {
 		EnvPrefix:     envPrefix,
 		PgxVersion:    pgxVersion(),
 		Partitioned:   o.Partitioned,
+		Tenant:        o.Tenant,
 
 		GolangciVersion: ruleset.GolangciLintVersion,
 		ArchLintVersion: ruleset.ArchLintVersion,

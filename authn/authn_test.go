@@ -11,6 +11,7 @@ import (
 
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 )
 
 const testIssuer = "rbac-test"
@@ -20,9 +21,10 @@ type env struct {
 	pub  ed25519.PublicKey
 	priv ed25519.PrivateKey
 	h    http.Handler
-	// actor 捕获中间件注入的 Actor（探针 handler 读 ctx 转存）。
+	// actor 捕获中间件注入的 Actor 与 callctx（探针 handler 读 ctx 转存）。
 	actor  appkit.Actor
 	hasCtx bool
+	meta   callctx.Meta
 }
 
 func newEnv(t *testing.T) *env {
@@ -34,6 +36,7 @@ func newEnv(t *testing.T) *env {
 	e := &env{pub: pub, priv: priv}
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e.actor, e.hasCtx = appkit.ActorFrom(r.Context())
+		e.meta = callctx.From(r.Context())
 		w.WriteHeader(http.StatusOK)
 	})
 	e.h = Middleware(pub, testIssuer)(next)
@@ -76,7 +79,7 @@ func stepUpTok(sub string) jwt.MapClaims {
 // serve 发起请求，返回 (状态码, 规范化错误码)。e.actor 转存注入结果。
 func (e *env) serve(t *testing.T, bearer string, stepUp string) (int, string) {
 	t.Helper()
-	e.actor, e.hasCtx = appkit.Actor{}, false
+	e.actor, e.hasCtx, e.meta = appkit.Actor{}, false, callctx.Meta{}
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
@@ -103,6 +106,58 @@ func TestMiddlewareHappyPath(t *testing.T) {
 	if !e.hasCtx || e.actor.UserID != "u1" || e.actor.TenantID != "tenant-1" ||
 		len(e.actor.Perms) != 2 || e.actor.Perms[0] != "files:read" {
 		t.Fatalf("Actor 注入不符: %+v (hasCtx=%v)", e.actor, e.hasCtx)
+	}
+	if e.meta.TenantID != "tenant-1" {
+		t.Fatalf("tid 应同时焊进 callctx，实际 %q", e.meta.TenantID)
+	}
+}
+
+// TestMiddlewareTenantWeld 锁住租户信任模型：认证请求以令牌为准——
+// 有 tid 覆盖入站头带来的值，无 tid 清零（防「无租户令牌 + 伪造的
+// X-Tenant-Id」）；未认证请求不动 callctx（内部东西向靠头传播）。
+func TestMiddlewareTenantWeld(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta callctx.Meta
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		meta = callctx.From(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+	// 模拟真实链：httpserver.RequestID 中间件先从头 Extract 进 ctx，
+	// authn 在内层覆盖/清零。
+	inner := Middleware(pub, testIssuer)(next)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner.ServeHTTP(w, r.WithContext(callctx.Merge(r.Context(), callctx.Extract(r.Header.Get))))
+	})
+	serve := func(bearer, tenantHeader string) callctx.Meta {
+		meta = callctx.Meta{}
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		if tenantHeader != "" {
+			req.Header.Set(callctx.HeaderTenantID, tenantHeader)
+		}
+		h.ServeHTTP(httptest.NewRecorder(), req)
+		return meta
+	}
+	noTid := jwt.MapClaims{
+		"iss": testIssuer, "sub": "u1", "exp": time.Now().Add(time.Hour).Unix(),
+	}
+
+	if m := serve(sign(t, priv, accessTok("u1", nil)), "forged-t"); m.TenantID != "tenant-1" {
+		t.Fatalf("有 tid 应覆盖伪造头值，实际 %q", m.TenantID)
+	}
+	if m := serve(sign(t, priv, noTid), "forged-t"); m.TenantID != "" {
+		t.Fatalf("无 tid 应清零头带来的租户，实际 %q", m.TenantID)
+	}
+	if m := serve("", "internal-t"); m.TenantID != "internal-t" {
+		t.Fatalf("未认证请求头值应存活（东西向形态），实际 %q", m.TenantID)
+	}
+	if m := serve("", ""); m.TenantID != "" {
+		t.Fatalf("无凭证无头应无租户，实际 %q", m.TenantID)
 	}
 }
 

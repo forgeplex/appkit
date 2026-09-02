@@ -312,3 +312,88 @@ func TestDomainPartitionedCompiles(t *testing.T) {
 	}
 	buildGenerated(t, dir)
 }
+
+// TestDomainTenantScaffold 断言 -tenant 形态：NewTenant 事务、Setup 期 RLS
+// 校验、0002 样例迁移（tenant_id + 三件套），且单形态的痕迹（裸 pgtx.New）
+// 不出现。
+func TestDomainTenantScaffold(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "crm")
+	if err := Domain(Options{Name: "crm", Dir: dir, AppkitVersion: "(devel)", Tenant: true}, nil); err != nil {
+		t.Fatalf("Domain: %v", err)
+	}
+
+	assertRendered(t, dir)
+	assertGoParses(t, dir)
+	assertGofmt(t, dir)
+
+	t.Run("基础迁移带策略函数", func(t *testing.T) {
+		sql := readFile(t, dir, "db/migrations/0001_appkit_base.sql")
+		mustContain(t, "0001_appkit_base.sql", sql,
+			// 基础表照旧（单 schema 形态不变）……
+			`CREATE TABLE IF NOT EXISTS "crm".outbox`,
+			// ……只追加策略函数（DDL 来自库函数，事实源不在模板）。
+			`CREATE OR REPLACE FUNCTION "crm".appkit_current_tenant()`)
+	})
+
+	t.Run("租户装配", func(t *testing.T) {
+		mod := readFile(t, dir, "internal/module/module.go")
+		mustContain(t, "module.go", mod,
+			"pgtx.NewTenant(m.opts.Pool)",
+			// Setup 期守卫必须在：迁移先于 Setup 应用，这里看到的是终态。
+			"pgtx.VerifyTenantRLS(ctx, m.opts.Pool, Schema)",
+			// 权限码声明与其他形态一致（目录是应用级的）。
+			"reg.Permissions(", `"crm:read"`,
+		)
+		// 单形态的痕迹不得出现。
+		for _, gone := range []string{"pgtx.New(m.opts.Pool)", "pgtx.NewRouted("} {
+			if strings.Contains(mod, gone) {
+				t.Errorf("租户域的 module.go 不应出现 %q", gone)
+			}
+		}
+	})
+
+	t.Run("样例迁移三件套", func(t *testing.T) {
+		sql := readFile(t, dir, "db/migrations/0002_demo_notes.sql")
+		mustContain(t, "0002_demo_notes.sql", sql,
+			`tenant_id text NOT NULL`,
+			`CREATE INDEX notes_tenant_idx ON "crm".notes (tenant_id, created_at)`,
+			`COMMENT ON TABLE "crm".notes IS`,
+			`ALTER TABLE "crm"."notes" ENABLE ROW LEVEL SECURITY`,
+			`ALTER TABLE "crm"."notes" FORCE ROW LEVEL SECURITY`,
+			`CREATE POLICY tenant_isolation ON "crm"."notes"`,
+			// 教学注释必须点到 verify——建真表照抄的读者得知道漏挂的后果。
+			"VerifyTenantRLS",
+		)
+	})
+
+	t.Run("规程翻转", func(t *testing.T) {
+		mustContain(t, "AGENTS.md", readFile(t, dir, "AGENTS.md"),
+			"租户域", "RLS 三件套", "callctx.From(ctx).TenantID",
+			// 建表纪律要指向样例，否则代理建新表会漏挂三件套。
+			"0002_demo_notes.sql")
+		mustContain(t, "README.md", readFile(t, dir, "README.md"),
+			"-tenant", "租户域", "BYPASSRLS")
+	})
+}
+
+// TestDomainTenantCompiles 编译租户域生成仓库（同 TestDomainCompiles）。
+func TestDomainTenantCompiles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short 模式跳过编译")
+	}
+	dir := filepath.Join(t.TempDir(), "crm")
+	if err := Domain(Options{Name: "crm", Dir: dir, Tenant: true}, nil); err != nil {
+		t.Fatalf("Domain: %v", err)
+	}
+	buildGenerated(t, dir)
+}
+
+// TestDomainFormFlagsMutuallyExclusive 锁住形态互斥：行级隔离与 schema 隔离
+// 不组合，同时给两个 flag 必须当场报错而不是生成一个四不像。
+func TestDomainFormFlagsMutuallyExclusive(t *testing.T) {
+	err := Domain(Options{Name: "crm", Dir: filepath.Join(t.TempDir(), "crm"),
+		Partitioned: true, Tenant: true}, nil)
+	if err == nil || !strings.Contains(err.Error(), "互斥") {
+		t.Fatalf("-tenant 与 -partitioned 同给应报互斥错误，实际 %v", err)
+	}
+}

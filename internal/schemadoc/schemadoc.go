@@ -99,6 +99,25 @@ type Table struct {
 	Indexes     []Index
 	Triggers    []Trigger
 	ViewDef     string // 仅 view/matview
+	RLS         *RLS   // 开了 RLS 或挂了策略时非 nil（见 RLS）
+}
+
+// RLS 是一张表的行级安全状态。租户域的业务表经 pgtx.TenantPolicySQL 挂上
+// ENABLE/FORCE/策略三件套；这里如实渲染进 db/schema/<表>.sql——策略被删、
+// 被改名、FORCE 被摘，schema 文档与 CI 漂移检查都会跟着变红。
+type RLS struct {
+	Enabled  bool
+	Force    bool
+	Policies []RLSPolicy
+}
+
+// RLSPolicy 对应 pg_policies 的一行，表达式是 Postgres 展开后的文本。
+type RLSPolicy struct {
+	Name      string
+	Cmd       string // ALL / SELECT / INSERT / UPDATE / DELETE
+	Roles     string // 数组字面量，如 {PUBLIC}
+	Using     string
+	WithCheck string
 }
 
 // Framework 报告本表是否为 appkit 基础设施表。

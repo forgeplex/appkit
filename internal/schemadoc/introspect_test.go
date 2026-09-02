@@ -10,6 +10,7 @@ import (
 	"github.com/forgeplex/appkit/audit"
 	"github.com/forgeplex/appkit/idem"
 	"github.com/forgeplex/appkit/outbox"
+	"github.com/forgeplex/appkit/pgtx"
 )
 
 // ---- 需要 Postgres 的测试（TEST_DATABASE_URL）----
@@ -177,12 +178,6 @@ CREATE TABLE sd_test.ev_2026 PARTITION OF sd_test.ev FOR VALUES FROM ('2026-01-0
 			want: "生成列",
 		},
 		{
-			name: "行级安全",
-			sql: `CREATE TABLE sd_test.t (id uuid PRIMARY KEY);
-ALTER TABLE sd_test.t ENABLE ROW LEVEL SECURITY;`,
-			want: "行级安全",
-		},
-		{
 			name: "排他约束",
 			sql: `CREATE EXTENSION IF NOT EXISTS btree_gist;
 CREATE TABLE sd_test.t (id uuid PRIMARY KEY, span tstzrange, EXCLUDE USING gist (span WITH &&));`,
@@ -215,6 +210,50 @@ CREATE TABLE sd_test.child () INHERITS (sd_test.base);`,
 				t.Errorf("错误没点名特性 %q：%v", c.want, err)
 			}
 		})
+	}
+}
+
+// TestRLSRendering 锁住 RLS 的如实渲染：租户域靠它做行级隔离，策略三件套
+// 必须出现在 db/schema/<表>.sql 里——策略被删、FORCE 被摘，漂移检查要能
+// 看出来。装饰态（挂了策略但没 ENABLE）点名而非装作没有。
+// 回放（TestRoundTrip）不含 RLS：策略表达式引用的函数不进 DDL 渲染
+// （函数体事实源在迁移），这里单独验渲染文本。
+func TestRLSRendering(t *testing.T) {
+	mig := pgtx.TenantScopeSQL("sd_test") + `
+CREATE TABLE sd_test.documents (id text PRIMARY KEY, tenant_id text NOT NULL);
+` + pgtx.TenantPolicySQL("sd_test", "documents")
+	s, err := introspect(t, mig)
+	if err != nil {
+		t.Fatalf("Introspect（RLS 已支持）: %v", err)
+	}
+	var doc Table
+	for _, tb := range s.Tables {
+		if tb.Name == "documents" {
+			doc = tb
+		}
+	}
+	if doc.RLS == nil || !doc.RLS.Enabled || !doc.RLS.Force || len(doc.RLS.Policies) != 1 {
+		t.Fatalf("RLS 读取不符: %+v", doc.RLS)
+	}
+	files, err := Render(s)
+	if err != nil {
+		t.Fatalf("Render: %v", err)
+	}
+	sql := files[tablePath(doc, ".sql")]
+	for _, want := range []string{
+		"ALTER TABLE sd_test.documents ENABLE ROW LEVEL SECURITY;",
+		"ALTER TABLE sd_test.documents FORCE ROW LEVEL SECURITY;",
+		"CREATE POLICY tenant_isolation ON sd_test.documents",
+		// 表达式是 pg_policies 的原文（含 Postgres 自己加的外层括号）。
+		"USING ((tenant_id = sd_test.appkit_current_tenant()))",
+		"WITH CHECK ((tenant_id = sd_test.appkit_current_tenant()))",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("渲染缺 %q：\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, " TO ") {
+		t.Errorf("默认角色（public）不该渲染 TO 子句：\n%s", sql)
 	}
 }
 

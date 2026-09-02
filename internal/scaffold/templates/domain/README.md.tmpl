@@ -1,6 +1,6 @@
 # {{.Name}}
 
-{{.Name}} 业务域仓库，由 `appkit new domain {{.Name}}{{if .Partitioned}} -partitioned{{end}}` 生成（框架见
+{{.Name}} 业务域仓库，由 `appkit new domain {{.Name}}{{if .Partitioned}} -partitioned{{end}}{{if .Tenant}} -tenant{{end}}` 生成（框架见
 github.com/forgeplex/appkit，设计文档 docs/DESIGN.md）。
 {{- if .Partitioned}}
 
@@ -9,6 +9,15 @@ github.com/forgeplex/appkit，设计文档 docs/DESIGN.md）。
 事务开启后 `SET LOCAL search_path` 路由到当前分区，查询与迁移因此全部
 **无 schema 前缀**。新分区 = 组合根的映射加一条 + 重启，迁移自动建 schema。
 `make schema` 不适用本形态（`appkit schema` 会明确报错）。
+{{- end}}
+{{- if .Tenant}}
+
+**本仓库是租户域**：单 schema、行级隔离——业务表带 `tenant_id` 列并挂
+RLS 三件套（样例见 `db/migrations/0002_demo_notes.sql`，建真表照抄），
+每次事务把租户身份（令牌 tid 焊入 callctx）落成事务级 GUC，策略据此过滤。
+隔离在存储层强制：SQL 漏写租户 WHERE 只会查不到行/写入被拒，不再静默泄漏；
+漏挂三件套的表服务拒绝启动（`pgtx.VerifyTenantRLS`）。数据库角色要求
+**非 superuser 且不带 BYPASSRLS**（部署清单记得配套）。
 {{- end}}
 
 ## 快速开始
