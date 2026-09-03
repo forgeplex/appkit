@@ -1002,6 +1002,78 @@ step-up 令牌），重试时放进 `X-Step-Up` 头；框架验它的签名、is
 读请求头即伪造面（未认证入口的头值是东西向传播的合法形态，边缘剥头
 归网关）。
 
+## 列表端点：分页
+
+凡是返回集合的端点，统一用 `page` 包（keyset 分页），别自己发明游标格式。
+机制已收进框架：`?limit` 解析与值域校验（畸形 422，不静默裁剪——
+`?limit=1000000` 被悄悄压成 50 条时客户端以为拿到了全部）、游标的
+不透明编解码、`items + next_cursor` 响应信封、「多取一行判下一页」的
+标准技巧。留在域里的只有语义：排序键是什么（每张表不同）、keyset 的
+WHERE 子句（sqlc 手写）、要不要 total。
+
+**① handler 标准形**（列表端点照抄这个骨架）：
+
+```go
+func (h *Handler) listUsers(w http.ResponseWriter, r *http.Request) {
+	params, err := page.Parse(r) // 缺省 50、上限 200；宽窄行列表可用
+	if err != nil {              // page.WithDefault/WithMax 调整
+		httpserver.WriteError(h.log, w, err)
+		return
+	}
+	var cur identity.UserCursor
+	if params.Cursor != "" {
+		if cur, err = page.Decode[identity.UserCursor](params.Cursor); err != nil {
+			httpserver.WriteError(h.log, w, err) // 坏游标 422，直接透传
+			return
+		}
+	}
+	rows, err := h.svc.ListUsers(r.Context(), identity.ListUsersInput{
+		Cursor: cur, Fetch: params.Limit + 1, // 多取一行
+	})
+	if err != nil {
+		httpserver.WriteError(h.log, w, err)
+		return
+	}
+	items, next := page.Trim(rows, params.Limit)
+	resp := page.List[identity.UserDTO]{Items: userDTOs(items)}
+	if next != nil {
+		c, err := page.Encode(*next) // 排序键就在行里，直接编行
+		if err != nil {
+			httpserver.WriteError(h.log, w, err)
+			return
+		}
+		resp.NextCursor = &c
+	}
+	writeJSON(w, http.StatusOK, resp) // 末页 next_cursor 字段缺席
+}
+```
+
+**② keyset SQL（sqlc）标准形**——游标即排序键，子句按行比较：
+
+```sql
+-- name: ListUsers :many
+SELECT id, email, created_at FROM users
+WHERE (created_at, id) < ($1, $2)   -- 游标为空时服务层传零值（从头取）
+ORDER BY created_at DESC, id DESC
+LIMIT $3;                            -- 服务层传 limit+1
+```
+
+两条纪律：**排序键必须唯一**——时间戳做键必加 `id` 兜住同刻并列，
+否则翻页在并列处漏行；ORDER BY 的方向与比较方向一致（DESC 配 `<`）。
+
+**③ 为何不 offset**：`OFFSET 100000` 要数据库走完前十万行才开吐，
+深翻页线性变慢；且两次请求间有插入/删除时 offset 会漂移（漏行/重行）。
+keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可接受——
+那也别给 API 用。
+
+**游标对客户端是不透明契约**：编码是 base64(JSON)，但客户端**只回传、
+不解析、不构造**——JSON 结构是实现细节，改排序键不该惊动任何客户端。
+编码不签名：伪造游标最多翻到别的页（WHERE 照样全量过滤），不是安全
+边界。向前翻页客户端自存走过的游标历史；真出现双向翻页需求时框架
+纯加法扩，别在域里自己造 `?before=` 变体。
+
+## 10. 规则速查
+
 ## 10. 规则速查
 
 | 你想做 | 正确做法 | 错误做法（会被什么拦住） |
@@ -1021,6 +1093,7 @@ step-up 令牌），重试时放进 `X-Step-Up` 头；框架验它的签名、is
 | 加业务指标 | `otel.Meter("你的域名")` 自建 | 往框架指标上加标签（基数无界） |
 | 传 request id / 租户 | `callctx.Meta`（入站/契约/事件自动，生成 client 出站自动焊 `Transport`） | 自己往 ctx 塞值（跨契约调用会被防火墙剥掉） |
 | 多租户的数据隔离 | 生成时选形态：`-tenant`（RLS 行级）/ `-partitioned`（schema 级，§3.1）；建租户表照抄 0002 样例（tenant_id + 索引 + 三件套） | 手写 `WHERE tenant_id = ...` 满代码（漏一条就是静默泄漏）；业务代码读 `X-Tenant-Id` 头（认证请求里已被令牌覆盖/清零） |
+| 列表端点 | `page.Parse` + `page.Decode[T]` + keyset SQL + `page.Trim` + `page.List` 信封（排序键必加 id 兜住同刻并列） | 自发明游标格式/自解析 limit（一个仓库很快两三种格式并存）；OFFSET 深翻页（线性变慢 + 页间漂移） |
 | 确认拆分部署不会变行为 | 提供方域仓库里写一条 `apptest.Conform`（local + remote 两个绑定） | 只测本地实现（远程那条路径第一次跑就是在生产） |
 
 ## FAQ

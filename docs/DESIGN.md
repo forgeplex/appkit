@@ -120,6 +120,10 @@ appkit/                          # module github.com/forgeplex/appkit
 ├── money/                       # Money(decimal + currency) 领域值对象，不落库；
 │                                #   NUMERIC 持久化走 decimal.Decimal（pgx 原生
 │                                #   编解码，pgxmoney 已废弃）；全系统禁 float 金额
+├── page/                        # 列表端点的分页机制件：?limit 解析校验（畸形 422
+│                                #   不静默裁剪）、游标不透明编解码（JSON→base64url）、
+│                                #   items+next_cursor 信封、limit+1 多取一行判
+│                                #   下一页。机制归框架，排序键/keyset SQL 归域
 ├── idem/                        # 幂等：Stripe 式 claim 先行（独立事务 INSERT ON CONFLICT
 │                                #   占位 in-progress，防双重执行竞态）+ 响应缓存 +
 │                                #   同 key 异 payload 422 + recovery point
@@ -504,6 +508,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 端点权限绑定 ⊆ 已声明码 | Registry 收集绑定（Register/Setup 期都可能产生，模块内部 mux 在 Setup 装配），全部 Setup 之后、监听之前统一校验，拼错的码点名（模块、码）报错 | ★ 装配期硬失败 |
 | 权限判定语义统一（集合包含 + step-up 新鲜度） | `reg.Require` 是唯一判定入口，401/403/STEP_UP 矩阵在框架；业务域不再各写一份会漂移的判定 | ★ API 设计级 |
 | 验签只在 authn 一处、模块不自解凭证 | 组合根挂链 + 脚手架注释教学 | ▲ 提高绕过成本：模块仍可自解 Authorization 头绕过，无机制挡 |
+| 列表端点分页形态统一（limit 解析/游标编码/响应信封） | `page` 包：`Parse` 值域校验（畸形 422，不静默裁剪）+ 游标不透明编解码（JSON→base64url）+ `List` 信封 + `Trim` 的 limit+1 多取一行技巧；机制归框架，排序键与 keyset SQL 归域 | 约定级：用不用在域，自写手翻页无机检——形态统一靠采纳与 review |
 
 逃生舱（防止约束被政治性推翻）：带理由的 `//nolint`（nolintlint 强制）、
 go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走**事件驱动读模型**
