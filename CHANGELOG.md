@@ -2,6 +2,44 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.7.2（2026-09-03）
+
+page 包：列表端点的分页机制件
+
+为什么：分页此前每个端点自己发明——limit 解析、游标编码、响应
+信封各写各的，一个仓库里很快两三种格式并存（ledger 已实证：两种
+手写游标编码 + 手写 limit 裁剪，解析函数 ~25 行纯机制代码）。其余
+域还没有列表端点，一个域验证了形态、其余尚未发明，正是收编窗口；
+等各家发明完再收，迁移成本翻几倍。切分同权限（v0.6.0）/租户
+（v0.7.0）的既有模式：机制归框架，语义归域。
+
+这一版干了什么：
+
+- page.Parse：?limit 缺省 50、上限 200（防 ?limit=1000000 拖库的
+  DoS 面），畸形值一律 422 而非静默裁剪——被悄悄压成 50 条时客户端
+  以为拿到了全部，响亮失败才看得见；宽窄行列表用 WithDefault/
+  WithMax 定制值域。?cursor 原样透传。
+- page.Encode/Decode[T]：游标编解码，JSON → base64url（可直接进
+  query）。对客户端是不透明契约：只回传、不解析、不构造。不签名——
+  伪造游标最多翻到别的页（keyset WHERE 照样全量过滤），不是安全
+  边界，不值得密钥管理成本。
+- page.List[T] 信封：items + next_cursor，字段缺席即最后一页。
+- page.Trim：落实「limit+1 多取一行判下一页」技巧，游标锚点 =
+  返回的末行（不是被截的那行——keyset (排序键) < 游标 从末行
+  之后继续）。
+- 文档：DESIGN §7 对照表诚实标约定级（用不用在域，自写手翻页无
+  机检）；GUIDE 新章给 handler 全链骨架、sqlc keyset 标准形与
+  tiebreaker 纪律（时间戳做键必加 id 兜住同刻并列）、为何不 offset
+  （深翻页线性变慢 + 页间漂移）。
+
+留在域里的（语义）：cursor 结构体定义（排序键每表不同）、sqlc 里
+的 keyset WHERE 子句（框架不碰 SQL 拼接）、要不要 total。明确不做：
+offset/page 码 API、双向翻页、游标签名、total/COUNT。
+
+影响面：纯加法新包，apidiff 相对 v0.7.1 零 incompatible；不用它的
+仓库行为不变。已有列表端点（如 ledger 的旧游标串）不必迁移——旧
+格式继续工作，新端点用框架。
+
 ## v0.7.1（2026-09-02）
 
 pgtx 修缮：事务收尾兜住 Goexit + DB 对齐 sqlc 批处理
