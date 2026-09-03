@@ -36,7 +36,7 @@ func System(o Options, out io.Writer) error {
 	summarize(out, "组合仓库", o.Dir, []string{
 		"go.mod 里 require 各域 repo，在 cmd/" + o.Name + "/main.go 取消对应装配注释",
 		"appkit dev    # 生成 go.work 联调本地各仓",
-		"make run      # -target=all 单体起服",
+		"make run-minimal # 尚未接数据库时显式验证入口；配好 database.url 后 make run",
 	})
 	return nil
 }

@@ -24,7 +24,7 @@ RLS 三件套（样例见 `db/migrations/0002_demo_notes.sql`，建真表照抄�
 
 ```sh
 appkit dev     # 生成 go.work，联调本地 appkit / 各域仓库（go.work 不提交）
-make run       # ★ 零依赖试跑：最小模式（仅 /healthz /readyz /ping，数据面未启用）
+make run-minimal # ★ 显式零依赖试跑（仅 /healthz /readyz /ping，数据面未启用）
 make run-db    # 完整模式：自动起一次性开发 Postgres（docker）并注入 database.url
 make migrate   # 只应用迁移然后退出（生产上这一步跑在 initContainer/Job 里）
 {{- if not .Partitioned}}

@@ -3,11 +3,13 @@ package bootstrap
 import (
 	"context"
 	"crypto/ed25519"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -93,5 +95,102 @@ func TestAuthnIssuerRequired(t *testing.T) {
 	}, RunOptions{ConfigFile: filepath.Join(t.TempDir(), "absent.yaml")})
 	if err == nil || !strings.Contains(err.Error(), "AuthnIssuer") {
 		t.Fatalf("缺 AuthnIssuer 应启动报错并指名字段，实际 %v", err)
+	}
+}
+
+func TestMissingDatabaseDoesNotImplicitlyEnterMinimal(t *testing.T) {
+	minimalCalled := false
+	err := Run(context.Background(), Options{
+		Service: "bpfailclosed",
+		Modules: func(Deps) ([]appkit.Module, error) { return nil, nil },
+		Minimal: func(Deps) ([]appkit.Module, error) {
+			minimalCalled = true
+			return nil, nil
+		},
+	}, RunOptions{ConfigFile: filepath.Join(t.TempDir(), "absent.yaml")})
+	if err == nil || !strings.Contains(err.Error(), "未配置 database.url") ||
+		!strings.Contains(err.Error(), "-minimal") {
+		t.Fatalf("缺数据库应 fail closed 并给出本地最小模式提示，实际 %v", err)
+	}
+	if minimalCalled {
+		t.Fatal("仅提供 Options.Minimal 不应授权隐式降级")
+	}
+}
+
+func TestExplicitMinimalStartsOnlyInDev(t *testing.T) {
+	t.Setenv("BPMINIMAL_ADDR", "127.0.0.1:0")
+	ready := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, Options{
+			Service: "bpminimal",
+			Modules: func(Deps) ([]appkit.Module, error) { return nil, nil },
+			Minimal: func(d Deps) ([]appkit.Module, error) {
+				if !d.IsMinimal() || d.Pool != nil || d.Bus != nil {
+					return nil, fmt.Errorf("最小模式依赖不为空")
+				}
+				return []appkit.Module{appkit.ModuleFunc("minimal", func(reg *appkit.Registry) error {
+					reg.OnStart(appkit.StageServer+1, func(context.Context) error {
+						close(ready)
+						return nil
+					})
+					return nil
+				})}, nil
+			},
+		}, RunOptions{
+			Minimal:    true,
+			ConfigFile: filepath.Join(t.TempDir(), "absent.yaml"),
+		})
+	}()
+
+	select {
+	case <-ready:
+		cancel()
+	case err := <-done:
+		cancel()
+		t.Fatalf("显式 dev 最小模式启动失败: %v", err)
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("等待最小模式启动超时")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run 返回错误: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("等待最小模式关停超时")
+	}
+}
+
+func TestExplicitMinimalRejectedOutsideDev(t *testing.T) {
+	for _, env := range []string{"staging", "prod"} {
+		t.Run(env, func(t *testing.T) {
+			t.Setenv("BPMINIMALENV_ENV", env)
+			err := Run(context.Background(), Options{
+				Service: "bpminimalenv",
+				Modules: func(Deps) ([]appkit.Module, error) { return nil, nil },
+				Minimal: func(Deps) ([]appkit.Module, error) { return nil, nil },
+			}, RunOptions{Minimal: true, ConfigFile: filepath.Join(t.TempDir(), "absent.yaml")})
+			if err == nil || !strings.Contains(err.Error(), "-minimal 仅允许 env=dev") {
+				t.Fatalf("env=%s 应拒绝最小模式，实际 %v", env, err)
+			}
+		})
+	}
+}
+
+func TestMinimalAndMigrateAreMutuallyExclusive(t *testing.T) {
+	err := Run(context.Background(), Options{
+		Service: "bpminimalmigrate",
+		Modules: func(Deps) ([]appkit.Module, error) { return nil, nil },
+		Minimal: func(Deps) ([]appkit.Module, error) { return nil, nil },
+	}, RunOptions{
+		Minimal:     true,
+		MigrateOnly: true,
+		ConfigFile:  filepath.Join(t.TempDir(), "absent.yaml"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "-minimal 与 -migrate 不能同时使用") {
+		t.Fatalf("冲突模式应 fail-fast，实际 %v", err)
 	}
 }

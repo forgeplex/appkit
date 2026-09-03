@@ -6,6 +6,7 @@ database:
   # 各域共用一个库（每域独占自己的 schema）。require 域仓库并取消 main.go
   # 里 pool 注释后填写，形如：
   # url: postgres://postgres:dev@127.0.0.1:5432/{{.Name}}_dev?sslmode=disable
+  # 留空时正常启动会 fail closed；尚未接库只验证入口请 make run-minimal。
   url: ""
 log:
   level: debug

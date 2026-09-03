@@ -160,7 +160,8 @@ make gen        # sqlc 生成（改了 db/queries 后必跑）
 {{- if not .Partitioned}}
 make schema     # 重新生成 db/SCHEMA.md 与 db/schema/（改了迁移后必跑，需 docker）
 {{- end}}
-make run        # 本地起服（config/dev.yaml；database.url 留空 = 无 DB 最小模式）
+make run        # 正常起服；database.url 缺失时 fail closed
+make run-minimal # 显式无 DB 最小模式（仅 dev）
 make dev-db     # 一次性本地 Postgres（与 dev.yaml 匹配）
 make migrate    # 只应用迁移然后退出（生产上跑在 initContainer/Job 里）
 make check      # 架构检查：依赖/import 边界/跨 schema SQL/迁移序号/规则集漂移

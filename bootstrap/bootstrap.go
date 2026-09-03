@@ -47,8 +47,8 @@ type EventBus interface {
 // Database 是数据库配置。
 type Database struct {
 	// URL 形如 postgres://user:pass@host:5432/db?sslmode=disable。
-	// 留空 = 最小模式（只起探针与 Options.Minimal 声明的模块），
-	// 便于零依赖试跑；生产部署必须配置。
+	// 留空时默认拒绝启动；本地零依赖试跑必须显式传 -minimal。
+	// 生产部署必须配置。
 	URL string `koanf:"url"`
 }
 
@@ -92,7 +92,7 @@ type Deps struct {
 	Config config.Options
 }
 
-// IsMinimal 报告当前是否为最小模式（未配置 database.url）。
+// IsMinimal 报告当前是否为显式最小模式。
 func (d Deps) IsMinimal() bool { return d.Pool == nil }
 
 // Options 声明一个域服务的装配。除 Service 与 Modules 外均可留空。
@@ -106,8 +106,9 @@ type Options struct {
 	// Modules 声明本进程可装配的模块全集（实际启用集由 -target 决定）。
 	// 完整模式下 Deps.Pool 与 Deps.Bus 非 nil。必填。
 	Modules func(Deps) ([]appkit.Module, error)
-	// Minimal 声明未配置 database.url 时装配的模块（通常挂个 ping 证明服务能起）。
-	// 为 nil 时未配置数据库直接报错。此时 Deps.Pool 与 Deps.Bus 为 nil。
+	// Minimal 声明显式 -minimal 模式装配的模块（通常挂个 ping 证明服务能起）。
+	// 仅 env=dev 可启用；Deps.Pool 与 Deps.Bus 为 nil。提供此回调不会授权
+	// database.url 缺失时自动降级，运行者仍必须显式传 -minimal。
 	Minimal func(Deps) ([]appkit.Module, error)
 	// AppOptions 追加 appkit.Option，典型用途是 appkit.Remote 绑定外域契约。
 	AppOptions func(Deps) []appkit.Option
@@ -138,6 +139,8 @@ type RunOptions struct {
 	ConfigFile string
 	// MigrateOnly 为 true 时只应用迁移然后退出，不监听端口、不跑后台任务。
 	MigrateOnly bool
+	// Minimal 显式启用无数据库最小模式，仅允许 env=dev。
+	Minimal bool
 }
 
 // Main 是域服务 main() 的全部内容：解析 flag、装配、运行；
@@ -151,6 +154,8 @@ func Main(o Options) {
 	flag.StringVar(&r.ConfigFile, "config", "config/dev.yaml", "配置文件路径（可缺省）")
 	flag.BoolVar(&r.MigrateOnly, "migrate", false,
 		"只应用数据库迁移然后退出（K8s initContainer / Job 用）")
+	flag.BoolVar(&r.Minimal, "minimal", false,
+		"显式启用无数据库最小模式（仅 env=dev，只有探针与占位路由）")
 	flag.Parse()
 
 	if err := Run(context.Background(), o, r); err != nil {
@@ -220,22 +225,31 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 	}
 
 	var modules []appkit.Module
-	if base.Database.URL == "" {
+	if r.Minimal {
+		if r.MigrateOnly {
+			return fmt.Errorf("%s: -minimal 与 -migrate 不能同时使用", o.Service)
+		}
+		if base.Env != "dev" {
+			return fmt.Errorf("%s: -minimal 仅允许 env=dev，当前 env=%s", o.Service, base.Env)
+		}
+		if o.Minimal == nil {
+			return fmt.Errorf("%s: 指定了 -minimal，但 Options.Minimal 未声明最小模式模块", o.Service)
+		}
+		d.Log.Warn(o.Service + ": 显式最小模式启动：" +
+			"仅探针与 Minimal 声明的路由，数据面（迁移/outbox/幂等/审计）未启用")
+		if modules, err = o.Minimal(d); err != nil {
+			return fmt.Errorf("%s: 装配最小模式模块: %w", o.Service, err)
+		}
+	} else if base.Database.URL == "" {
 		// 迁移模式没有数据库可迁，明确报错而不是"最小模式跑完什么也没做"地成功退出——
 		// 那会让 initContainer 绿着、服务对着空库起来。
 		if r.MigrateOnly {
 			return fmt.Errorf("%s: -migrate 需要 database.url（配置文件的 database.url 或环境变量 %s_DATABASE__URL）",
 				o.Service, copts.EnvPrefix)
 		}
-		if o.Minimal == nil {
-			return fmt.Errorf("%s: 未配置 database.url（配置文件的 database.url 或环境变量 %s_DATABASE__URL）",
-				o.Service, copts.EnvPrefix)
-		}
-		d.Log.Warn(o.Service + ": 未配置 database.url，最小模式启动：" +
-			"仅探针与 Minimal 声明的路由，数据面（迁移/outbox/幂等/审计）未启用")
-		if modules, err = o.Minimal(d); err != nil {
-			return fmt.Errorf("%s: 装配最小模式模块: %w", o.Service, err)
-		}
+		return fmt.Errorf("%s: 未配置 database.url（配置文件的 database.url 或环境变量 %s_DATABASE__URL）；"+
+			"本地零依赖试跑请显式传 -minimal",
+			o.Service, copts.EnvPrefix)
 	} else {
 		pool, perr := pgtx.NewPool(ctx, base.Database.URL, o.PoolOptions...)
 		if perr != nil {

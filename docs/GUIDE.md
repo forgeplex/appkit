@@ -131,7 +131,7 @@ appkit dev       # 生成 go.work：同根目录下的兄弟仓库全部纳入�
                  # require 发版的 appkit，按发版版本构建不依赖工作区；要吃本地
                  # 未发布的 appkit 改动，才把 appkit checkout 也 go work use 进来
                  #（appkit 不在同一根目录下时按 dev 的提示手动 use）
-make run         # 零依赖试跑：最小模式（仅 /healthz /readyz /identity/ping）
+make run-minimal # 显式零依赖试跑（仅 /healthz /readyz /identity/ping）
 make run-db      # 完整模式：自动起一次性开发 Postgres（docker）并注入 database.url
 make check && make lint && make test   # = CI 跑的那几条
 ```
@@ -626,7 +626,7 @@ return app.Run(ctx)
 单个域仓库（identity 目录内）：
 
 ```sh
-make run        # 最小模式：零依赖，database.url 留空
+make run-minimal # 显式最小模式：零依赖，仅允许 env=dev
 curl localhost:8080/identity/ping          # → pong (最小模式)
 
 make run-db     # 完整模式：自动起一次性 Postgres + 迁移 + relay
@@ -648,6 +648,10 @@ curl -X POST localhost:8080/identity/users \
 
 端口被占时不用改文件：`SSO_ADDR=:18080 make run`（域仓库同理，
 `IDENTITYD_ADDR=...`）——任意配置键都能这样覆盖。
+
+正常启动缺少 `database.url` 会直接失败，即使组合根声明了 `Options.Minimal` 也
+不会自动降级。最小模式只用于本地占位验证，必须显式传 `-minimal`（生成仓库的
+`make run-minimal`），且 `staging` / `prod` 会拒绝该模式。
 
 测试：单测不需要任何环境。`TEST_DATABASE_URL` 是**给你将来写的数据层集成
 测试**的全系统约定（appkit 自身与 CI 流水线都用它；骨架初始没有测试文件）：

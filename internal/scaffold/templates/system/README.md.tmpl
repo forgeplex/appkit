@@ -8,7 +8,8 @@
 
 ```sh
 appkit dev     # 生成 go.work，联调本地 appkit 与各域仓库（go.work 不提交）
-make run       # -target=all 单体形态起服
+make run-minimal # 尚未接数据库时，显式只起探针验证入口
+make run       # 配好 database.url 后以 -target=all 单体形态起服
 make check
 ```
 
