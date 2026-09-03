@@ -145,6 +145,38 @@ func TestSkipMigrationsOptOut(t *testing.T) {
 	}
 }
 
+// TestSkipMigrationsOverridesMigrator 锁住部署承诺：bootstrap 会统一注入
+// Migrator，服务副本再通过 AppOptions 追加 SkipMigrations。两者共存时，
+// 显式 skip 必须优先，否则每个副本仍会在滚动发布时尝试 DDL。
+func TestSkipMigrationsOverridesMigrator(t *testing.T) {
+	called := false
+	ready := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	app := New([]Module{migratingModule(), gateModule(ready)},
+		HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second),
+		Migrator(func(context.Context, []MigrationSet) error {
+			called = true
+			return nil
+		}),
+		SkipMigrations())
+	runDone := make(chan error, 1)
+	go func() { runDone <- app.Run(ctx) }()
+
+	waitFor(t, ready, "SkipMigrations 与 Migrator 共存时应用未就绪")
+	if called {
+		t.Fatal("SkipMigrations 应优先于 Migrator，普通 Run 不应执行迁移")
+	}
+	cancel()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run 返回错误: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("关停超时")
+	}
+}
+
 // TestMigratorReceivesSets 验证注入执行器后拿到全部已声明迁移集。
 func TestMigratorReceivesSets(t *testing.T) {
 	var got []MigrationSet
@@ -192,6 +224,25 @@ func TestMigrateOnly(t *testing.T) {
 	}
 	if touched {
 		t.Error("Migrate 不应执行 Setup / OnStart")
+	}
+}
+
+// TestMigrateOnlyIgnoresSkipMigrations 验证显式迁移进程不会被服务副本的
+// SkipMigrations 选项短路：Migrate 的唯一职责就是施加迁移。
+func TestMigrateOnlyIgnoresSkipMigrations(t *testing.T) {
+	called := false
+	app := New([]Module{migratingModule()},
+		Migrator(func(context.Context, []MigrationSet) error {
+			called = true
+			return nil
+		}),
+		SkipMigrations())
+
+	if err := app.Migrate(context.Background()); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if !called {
+		t.Fatal("显式 Migrate 不应受 SkipMigrations 影响")
 	}
 }
 
