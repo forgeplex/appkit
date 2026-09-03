@@ -45,8 +45,9 @@ GOLANGCI ?= $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.
 ARCHLINT ?= $(GO) run github.com/fe3dback/go-arch-lint@{{.ArchLintVersion}}
 # appkit-lint 是嵌套 module（不进业务依赖图），@版本直接拉取。版本随
 # go.mod 钉的 appkit——规则与依赖同版本升级，与 domain-ci.yml 同一套取法；
-# go.work 联调取不到版本时退 @main。
-APPKITLINT_VERSION ?= $(shell v=$$($(GO) list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $$2}'); case "$$v" in v*) echo "$$v";; *) echo main;; esac)
+# go.work 联调取不到版本时退 @main。用 make 函数而不是 shell case：
+# case 分支模式里的 ) 不配平会被 make 的 $(shell) 解析器提前截断。
+APPKITLINT_VERSION ?= $(or $(filter v%,$(shell $(GO) list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $$2}')),main)
 lint:
 	$(GOLANGCI) run ./...
 	$(ARCHLINT) check
