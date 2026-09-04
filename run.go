@@ -132,15 +132,23 @@ func (a *App) registerBusLifecycle(ctx context.Context) context.CancelFunc {
 
 	// Worker 仍由 Registry 托管错误传播和等待，但忽略普通 runCtx，改用独立
 	// busCtx；因此 App 取消普通 worker 后，Broker 仍可继续处理在途消息。
-	a.reg.Worker("consume", func(context.Context) error {
+	worker := a.reg.worker("consume", func(context.Context) error {
 		return bus.Run(busCtx)
 	})
 	// 同一 stage 的 stop 逆序执行：Drain → cancelBus → Worker 等待。
 	a.reg.OnStop(func(context.Context) error {
+		if !worker.started {
+			return nil
+		}
 		cancelBus()
 		return nil
 	})
-	a.reg.OnStop(bus.Drain)
+	a.reg.OnStop(func(ctx context.Context) error {
+		if !worker.started {
+			return nil
+		}
+		return bus.Drain(ctx)
+	})
 	return cancelBus
 }
 

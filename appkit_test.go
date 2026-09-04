@@ -767,6 +767,23 @@ func TestManagedBusEarlierInfraFailureDoesNotCloseUnopenedBus(t *testing.T) {
 	}
 }
 
+func TestManagedBusEarlierWorkerFailureSkipsDrain(t *testing.T) {
+	workerErr := errors.New("module worker startup failed")
+	m := &testModule{name: "worker", register: func(reg *Registry) error {
+		reg.OnStart(StageWorker, func(context.Context) error { return workerErr })
+		return nil
+	}}
+	bus := &managedFakeBus{}
+	app := New([]Module{m}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	err := app.Run(context.Background())
+	if !errors.Is(err, workerErr) {
+		t.Fatalf("Run 应返回前序 Worker 根因，实际 %v", err)
+	}
+	if events := bus.snapshot(); !slices.Equal(events, []string{"connect", "close"}) {
+		t.Fatalf("Bus Run 未启动时应跳过 Drain，仅关闭已连接 Broker: %v", events)
+	}
+}
+
 func TestManagedBusDrainFailureStillStopsAndCloses(t *testing.T) {
 	drainErr := errors.New("drain failed")
 	bus := &managedFakeBus{drainErr: drainErr}
