@@ -619,7 +619,7 @@ func (b *managedFakeBus) Run(ctx context.Context) error {
 	return ctx.Err()
 }
 func (b *managedFakeBus) Ready(context.Context) error { return b.readyErr }
-func (b *managedFakeBus) Drain(context.Context) error {
+func (b *managedFakeBus) Drain(ctx context.Context) error {
 	if b.inFlight != nil {
 		b.mu.Lock()
 		runCtx := b.runCtx
