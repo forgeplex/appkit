@@ -624,8 +624,9 @@ return app.Run(ctx)
 
 持久化 Broker 除实现发布与订阅接口外，应实现 `appkit.ManagedSubscriber`。框架会
 在监听端口前调用 `Connect`，以受管 Worker 运行 `Run` 消费循环，将 `Ready` 接入
-`/readyz`；消费循环异常会触发整个应用关停。关停时先 `Drain` 在途消费，等待消费
-循环退出，再 `Close` 连接。生产者只有在 Broker 返回 durable ack 后才能让
+`/readyz`；消费循环异常会触发整个应用关停。关停时保持消费循环存活，先用关停
+预算执行 `Drain`（停止拉取并等待在途消费），随后取消并等待消费循环退出，最后
+`Close` 连接；即使 `Connect` 部分初始化后失败也会执行 `Close`。生产者只有在 Broker 返回 durable ack 后才能让
 `Publish` 成功；任何 nack、超时或断连都必须返回错误，使 outbox 保持未发布并重试。
 
 投递语义仍是至少一次：发布成功只表示 Broker 已持久确认，不表示消费者业务已经

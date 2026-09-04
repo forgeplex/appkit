@@ -19,7 +19,9 @@ import (
 func (r *Registry) Worker(name string, run func(ctx context.Context) error) {
 	full := r.current + "/" + name
 	done := make(chan error, 1)
+	started := false
 	r.OnStart(StageWorker, func(ctx context.Context) error {
+		started = true
 		go func() {
 			err := run(ctx)
 			done <- err
@@ -31,6 +33,11 @@ func (r *Registry) Worker(name string, run func(ctx context.Context) error) {
 		return nil
 	})
 	r.OnStop(func(ctx context.Context) error {
+		// startHooks 只按 stage 记录进度；同 stage 的更早钩子失败时，本
+		// Worker 尚未启动，不能等待一个永远不会写入的 done。
+		if !started {
+			return nil
+		}
 		select {
 		case err := <-done:
 			if err == nil || errors.Is(err, context.Canceled) {

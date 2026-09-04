@@ -564,11 +564,18 @@ type fakeBus struct {
 }
 
 type managedFakeBus struct {
-	mu       sync.Mutex
-	events   []string
-	runErr   error
-	readyErr error
-	runGate  chan struct{}
+	mu         sync.Mutex
+	events     []string
+	connectErr error
+	runErr     error
+	readyErr   error
+	drainErr   error
+	runGate    chan struct{}
+	runStarted chan struct{}
+	inFlight   chan struct{}
+	drainStart chan struct{}
+	drainGate  chan struct{}
+	runCtx     context.Context
 }
 
 func (b *managedFakeBus) record(event string) {
@@ -580,10 +587,24 @@ func (b *managedFakeBus) record(event string) {
 func (b *managedFakeBus) Subscribe(string, EventHandler) {}
 func (b *managedFakeBus) Connect(context.Context) error {
 	b.record("connect")
-	return nil
+	return b.connectErr
 }
 func (b *managedFakeBus) Run(ctx context.Context) error {
 	b.record("run")
+	b.mu.Lock()
+	b.runCtx = ctx
+	b.mu.Unlock()
+	if b.runStarted != nil {
+		close(b.runStarted)
+	}
+	if b.inFlight != nil {
+		select {
+		case <-b.inFlight:
+		case <-ctx.Done():
+			b.record("run-exit")
+			return ctx.Err()
+		}
+	}
 	if b.runGate != nil {
 		select {
 		case <-b.runGate:
@@ -599,8 +620,30 @@ func (b *managedFakeBus) Run(ctx context.Context) error {
 }
 func (b *managedFakeBus) Ready(context.Context) error { return b.readyErr }
 func (b *managedFakeBus) Drain(context.Context) error {
+	if b.inFlight != nil {
+		b.mu.Lock()
+		runCtx := b.runCtx
+		b.mu.Unlock()
+		if err := runCtx.Err(); err != nil {
+			b.record("drain-after-cancel")
+			return err
+		}
+		b.record("drain-live")
+		if b.drainStart != nil {
+			close(b.drainStart)
+		}
+		if b.drainGate != nil {
+			select {
+			case <-b.drainGate:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		close(b.inFlight)
+		return nil
+	}
 	b.record("drain")
-	return nil
+	return b.drainErr
 }
 func (b *managedFakeBus) Close(context.Context) error {
 	b.record("close")
@@ -638,8 +681,110 @@ func TestManagedBusLifecycle(t *testing.T) {
 		}
 	}
 	index := func(v string) int { return slices.Index(events, v) }
-	if index("drain") > index("close") || index("run-exit") > index("close") {
-		t.Fatalf("Close 必须在 Drain 和消费循环退出之后: %v", events)
+	if index("drain") > index("run-exit") || index("run-exit") > index("close") {
+		t.Fatalf("生命周期必须按 Drain → Run 退出 → Close: %v", events)
+	}
+}
+
+func TestManagedBusDrainRunsBeforeRunCancellation(t *testing.T) {
+	bus := &managedFakeBus{
+		runStarted: make(chan struct{}),
+		inFlight:   make(chan struct{}),
+		drainStart: make(chan struct{}),
+		drainGate:  make(chan struct{}),
+	}
+	ready := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	app := New([]Module{gateModule(ready)}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	go func() { done <- app.Run(ctx) }()
+
+	select {
+	case <-ready:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("等待应用就绪超时")
+	}
+	select {
+	case <-bus.runStarted:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("等待 Broker 消费循环启动超时")
+	}
+	cancel()
+	select {
+	case <-bus.drainStart:
+	case <-time.After(3 * time.Second):
+		t.Fatal("等待 Broker Drain 开始超时")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("在途消费完成前 App 不应退出: %v", err)
+	default:
+	}
+	close(bus.drainGate)
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	events := bus.snapshot()
+	if !slices.Contains(events, "drain-live") || slices.Contains(events, "drain-after-cancel") {
+		t.Fatalf("Drain 执行期间 Broker Run 必须仍存活: %v", events)
+	}
+	if slices.Index(events, "drain-live") > slices.Index(events, "run-exit") ||
+		slices.Index(events, "run-exit") > slices.Index(events, "close") {
+		t.Fatalf("阻塞在途消费的关停顺序错误: %v", events)
+	}
+}
+
+func TestManagedBusConnectFailureStillCloses(t *testing.T) {
+	connectErr := errors.New("connect partially initialized")
+	bus := &managedFakeBus{connectErr: connectErr}
+	app := New(nil, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	err := app.Run(context.Background())
+	if !errors.Is(err, connectErr) {
+		t.Fatalf("Run 应返回 Connect 根因，实际 %v", err)
+	}
+	events := bus.snapshot()
+	if !slices.Equal(events, []string{"connect", "close"}) {
+		t.Fatalf("Connect 失败只应执行 Close 清理部分初始化资源: %v", events)
+	}
+}
+
+func TestManagedBusEarlierInfraFailureDoesNotCloseUnopenedBus(t *testing.T) {
+	infraErr := errors.New("database unavailable")
+	m := &testModule{name: "infra", register: func(reg *Registry) error {
+		reg.OnStart(StageInfra, func(context.Context) error { return infraErr })
+		return nil
+	}}
+	bus := &managedFakeBus{}
+	app := New([]Module{m}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	err := app.Run(context.Background())
+	if !errors.Is(err, infraErr) {
+		t.Fatalf("Run 应返回前序 Infra 根因，实际 %v", err)
+	}
+	if events := bus.snapshot(); len(events) != 0 {
+		t.Fatalf("Connect 未尝试时不应调用 Broker Close: %v", events)
+	}
+}
+
+func TestManagedBusDrainFailureStillStopsAndCloses(t *testing.T) {
+	drainErr := errors.New("drain failed")
+	bus := &managedFakeBus{drainErr: drainErr}
+	ready := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	app := New([]Module{gateModule(ready)}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	go func() { done <- app.Run(ctx) }()
+	waitFor(t, ready, "等待应用就绪超时")
+	cancel()
+	err := <-done
+	if !errors.Is(err, drainErr) {
+		t.Fatalf("Run 应返回 Drain 根因，实际 %v", err)
+	}
+	events := bus.snapshot()
+	if slices.Index(events, "drain") > slices.Index(events, "run-exit") ||
+		slices.Index(events, "run-exit") > slices.Index(events, "close") {
+		t.Fatalf("Drain 失败后仍须取消、等待并关闭: %v", events)
 	}
 }
 
@@ -663,7 +808,8 @@ func TestManagedBusRunFailureStopsApp(t *testing.T) {
 func TestManagedBusReadiness(t *testing.T) {
 	bus := &managedFakeBus{readyErr: errors.New("broker not ready")}
 	app := New(nil, Bus(bus))
-	app.registerBusLifecycle()
+	cancel := app.registerBusLifecycle(context.Background())
+	defer cancel()
 	app.reg.health.SetReady(true)
 	failures := app.reg.health.Ready(context.Background())
 	if err := failures["appkit-bus/ready"]; !errors.Is(err, bus.readyErr) {
