@@ -479,13 +479,13 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 跨域只经契约类型 | 唯一可见类型就是 contracts 生成接口 | ★ 编译器级 |
 | 契约/事件/错误码单一事实源 | 只有生成物，无手写类型 | ★ 生成级 + drift check |
 | http 包不写 SQL、业务包零 infra import | depguard + go-arch-lint：配置由 `appkit sync` 物化（同时解决 IDE 集成与 golangci-lint 无配置继承），CI 先验未漂移**再按它跑这两个检查器**，版本与域仓库 `make lint` 同源（`ruleset.GolangciLintVersion` / `ArchLintVersion`） | ▲ CI 级，nolint 需写理由 |
-| 金额禁 float、ctx 不进 struct、decimal 不上 JSON 面 | appkit-lint 自研 analyzer（moneyfloat[-scope 圈定业务包] / ctxstruct / decjson）；domain-ci.yml 与域仓库 `make lint` 都跑它，版本随 go.mod 钉的 appkit 走（规则与依赖同版本升级，不搞 @main 惊喜；go.work 联调仓库退 @main） | ▲ CI 级：默认只查生产代码——测试夹具低一档，且存量域的测试不该被规则升级卡红（`-<name>.tests=true` 可连测试查） |
+| 金额禁 float、ctx 不进 struct、decimal 不上 JSON 面 | appkit-lint 自研 analyzer（moneyfloat[-scope 圈定业务包] / ctxstruct / decjson）；domain-ci.yml 与域仓库 `make lint` 都跑它，版本随 go.mod 钉的 appkit 走（规则与依赖同版本升级；go.work 联调须显式给版本，不回退 main） | ▲ CI 级：默认只查生产代码——测试夹具低一档，且存量域的测试不该被规则升级卡红（`-<name>.tests=true` 可连测试查） |
 | 事务不泄漏到业务代码 | pgtx 回调式 API，业务只见 ctx | ★ API 设计级 |
 | 事务内禁跨模块调用 | contract.Call 运行时守卫（HasTx 检查）；前提是调用经生成 wrapper（ProvideContract 强制包裹；生成物由 `appkit gen contract` 产出） | ▲ 运行时级，测试即暴露 |
 | 忘发事件不可能 | outbox.Publish 是事务 API 的一等公民 | ★ API 设计级 |
 | 生成物禁手改 | CI 重新生成后 `git diff --exit-code` | ▲ CI 级 |
 | appkit/contracts 向后兼容 | apidiff / oasdiff 门禁 | ▲ CI 级 |
-| CI 本身不可绕过 | reusable workflow + branch protection required checks | 组织级 |
+| CI 本身不可绕过 | reusable workflow 从 appkit module provenance 解析并固定完整 commit SHA、第三方 Action 固定 commit SHA、默认 `contents: read`；main/release tag protection + required checks | 组织级（仓库 ruleset 必须另行配置，见 `docs/CI_SECURITY.md`） |
 | 启动装配改不坏 | `bootstrap.Main` 收走 main() 的固定装配，代码在 module cache（0444 只读）；用户仓库的 main 只声明模块清单 | ▲ 物理级：改不动，但可绕开自己写 main（骨架默认不绕） |
 | 规则集不被改松 | `appkit check` 内联 `ruleset.Check`（配置缺失同样算漂移），不再只靠 CI 那一步 | ▲ 本地+CI 级 |
 | 已应用的迁移不可变 | 历史表存内容 sha256，启动期逐个比对，不符即 `MIGRATION_DRIFT` 拒绝启动；`.gitattributes` 钉 `*.sql eol=lf` 消除跨平台误报 | ★ 运行时级，启动即暴露 |
@@ -495,7 +495,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 租户身份来源唯一（令牌 tid） | authn 验签后把 tid 焊进 callctx（有值覆盖、无值清零）——伪造的 X-Tenant-Id 在认证请求里活不下来 | ★ 中间件级；未认证入口仍信头（东西向合法形态），边缘剥头归网关——这是文档级边界，不是机检 |
 | schema 文档支持分区域域 | 暂无：`appkit schema` 对 `partitioned: true` 明确报错（分区映射由组合根注入，域仓库无从枚举；先想清楚「按分区画还是按逻辑模型画」再补） | ✗ 尚未落地（写在这里是为了不假装它已生效） |
 | 没人跑迁移不可能 | 登记了迁移却既无 `Migrator` 又无 `SkipMigrations()` → 启动报错；`-migrate` 无 `database.url` 亦报错 | ★ 装配级 fail-fast |
-| schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`，产出因此是迁移的纯函数；CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（分区、生成列、继承…）点名报错而非静默输出残缺 DDL；RLS 如实渲染成 DDL（含策略三件套，策略被删/FORCE 被摘即漂移），未 ENABLE 的装饰态点名标注 | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行——`domain-ci.yml` 经 `@main` 被全部存量域仓库共享，硬加检查会让它们在合并那一刻集体变红。代价是从不启用的仓库永远不被检查；跑过一次 `make schema` 就永久转严 |
+| schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`，产出因此是迁移的纯函数；CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（分区、生成列、继承…）点名报错而非静默输出残缺 DDL；RLS 如实渲染成 DDL（含策略三件套，策略被删/FORCE 被摘即漂移），未 ENABLE 的装饰态点名标注 | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行。代价是从不启用的仓库永远不被检查；跑过一次 `make schema` 就永久转严。新增检查随 appkit release + sync 显式进入下游，不会由 main 突然扩散。 |
 | 表有说明（`COMMENT ON TABLE`） | 缺的表在 `db/SCHEMA.md` 表清单里标 ⚠ 缺说明并给出该补的那一句；`appkit schema -check` 在 CI 里逐表打 `::warning` 注解 | ▲ 软约束：不阻断 CI（刻意的，存量仓库不会突然红），且 `db/SCHEMA.md` 带 `linguist-generated` 在 PR diff 里默认折叠——⚠ 没人主动打开就看不见，::warning 注解是让它浮出水面的那一半 |
 | 长驻任务死了必被发现 | `Registry.Worker` 托管：异常退出上报主循环并触发关停（不再是"探针绿着、事件停摆"） | ★ API 设计级 |
 | ctx 只能传白名单元数据 | `callctx.Meta` 是具名字段的 struct 而非 map，防火墙剥值后只放回它 | ★ 编译器级：塞不进去 |

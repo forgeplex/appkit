@@ -195,7 +195,10 @@ func TestDomainScaffold(t *testing.T) {
 // TestDomainGoModVersioned 断言发布版本直接写进 require，不留占位提示。
 func TestDomainGoModVersioned(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "pay")
-	if err := Domain(Options{Name: "pay", AppkitVersion: "v0.7.3", Dir: dir}, nil); err != nil {
+	if err := Domain(Options{
+		Name: "pay", AppkitVersion: "v0.7.3", Dir: dir,
+		WorkflowRef: "0123456789abcdef0123456789abcdef01234567",
+	}, nil); err != nil {
 		t.Fatalf("Domain: %v", err)
 	}
 	gomod := readFile(t, dir, "go.mod")

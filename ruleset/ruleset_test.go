@@ -16,10 +16,11 @@ var update = flag.Bool("update", false, "重写 golden 文件")
 
 func testConfig() ruleset.Config {
 	return ruleset.Config{
-		Domain:    "ledger",
-		Module:    "github.com/forgeplex/ledger",
-		Contracts: "github.com/forgeplex/psp-contracts/go",
-		Version:   "v1.2.3",
+		Domain:      "ledger",
+		Module:      "github.com/forgeplex/ledger",
+		Contracts:   "github.com/forgeplex/psp-contracts/go",
+		Version:     "v1.2.3",
+		WorkflowRef: "0123456789abcdef0123456789abcdef01234567",
 	}
 }
 
@@ -138,7 +139,8 @@ func TestRender_域名与模块替换(t *testing.T) {
 			"deepScan: false",
 		}},
 		{".github/workflows/ci.yml", []string{
-			"uses: forgeplex/appkit/.github/workflows/domain-ci.yml@main",
+			"appkit v1.2.3",
+			"uses: forgeplex/appkit/.github/workflows/domain-ci.yml@0123456789abcdef0123456789abcdef01234567",
 			"github.com/forgeplex/ledger",
 		}},
 	}
@@ -154,6 +156,29 @@ func TestRender_域名与模块替换(t *testing.T) {
 	}
 }
 
+func TestRender_CI固定到Appkit版本(t *testing.T) {
+	ci := string(mustRender(t, testConfig())[".github/workflows/ci.yml"])
+	if !strings.Contains(ci, "appkit v1.2.3") ||
+		!strings.Contains(ci, "domain-ci.yml@0123456789abcdef0123456789abcdef01234567") {
+		t.Fatalf("发布版 CI 未固定到 appkit 版本:\n%s", ci)
+	}
+	if strings.Contains(ci, "domain-ci.yml@main") || strings.Contains(ci, "domain-ci.yml@v1.2.3") {
+		t.Fatalf("发布版 CI 不得使用可移动 ref:\n%s", ci)
+	}
+	if !strings.Contains(ci, "permissions:\n  contents: read") {
+		t.Fatalf("生成的 CI 缺少最小权限:\n%s", ci)
+	}
+}
+
+func TestRender_DevelCI同样固定Commit(t *testing.T) {
+	cfg := testConfig()
+	cfg.Version = "(devel)"
+	ci := string(mustRender(t, cfg)[".github/workflows/ci.yml"])
+	if !strings.Contains(ci, "appkit (devel)") || strings.Contains(ci, "@main") {
+		t.Fatalf("源码联调 CI 也必须固定完整 commit:\n%s", ci)
+	}
+}
+
 func TestRender_非法配置(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -165,6 +190,7 @@ func TestRender_非法配置(t *testing.T) {
 		{"domain 含连字符", func(c *ruleset.Config) { c.Domain = "led-ger" }},
 		{"domain 为保留名", func(c *ruleset.Config) { c.Domain = "postgres" }},
 		{"module 为空", func(c *ruleset.Config) { c.Module = "" }},
+		{"workflow ref 非完整 SHA", func(c *ruleset.Config) { c.WorkflowRef = "main" }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -232,6 +258,26 @@ func TestWorkflows_合法YAML(t *testing.T) {
 				t.Errorf("%s 缺少片段 %q", tt.path, tt.want)
 			}
 		})
+	}
+}
+
+func TestWorkflows_供应链引用不可变(t *testing.T) {
+	for _, path := range []string{"../.github/workflows/domain-ci.yml", "../.github/workflows/ci.yml"} {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := string(body)
+		for _, mutable := range []string{
+			"actions/checkout@v", "actions/setup-go@v", "apidiff@latest", "image: postgres:18\n",
+		} {
+			if strings.Contains(s, mutable) {
+				t.Errorf("%s 含可变执行引用 %q", path, mutable)
+			}
+		}
+		if !strings.Contains(s, "permissions:\n  contents: read") {
+			t.Errorf("%s 缺少默认只读权限", path)
+		}
 	}
 }
 

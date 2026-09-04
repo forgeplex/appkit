@@ -42,6 +42,14 @@ func Domain(o Options, out io.Writer) error {
 	if err := o.normalize(); err != nil {
 		return fmt.Errorf("new domain: %w", err)
 	}
+	workflowRef := o.WorkflowRef
+	if workflowRef == "" {
+		var err error
+		workflowRef, err = ruleset.ResolveWorkflowRef(o.AppkitVersion)
+		if err != nil {
+			return fmt.Errorf("new domain %s: 解析 CI workflow commit: %w", o.Name, err)
+		}
+	}
 	if err := ensureFreshDir(o.Dir); err != nil {
 		return fmt.Errorf("new domain: %w", err)
 	}
@@ -75,7 +83,7 @@ func Domain(o Options, out io.Writer) error {
 	}
 	// 生成即合规：lint / CI 配置直接物化，不留"忘了跑 sync"的窗口。
 	// 升级 appkit 后由 appkit sync 刷新，CI 的 sync --check 校验未漂移。
-	if _, err := ruleset.Sync(o.Dir, o.AppkitVersion); err != nil {
+	if _, err := ruleset.SyncPinned(o.Dir, o.AppkitVersion, workflowRef); err != nil {
 		return fmt.Errorf("new domain %s: 物化规则集: %w", o.Name, err)
 	}
 	summarize(out, "域仓库", o.Dir, []string{

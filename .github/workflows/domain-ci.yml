@@ -10,12 +10,15 @@ on:
         required: false
         default: "1.26"
 
+permissions:
+  contents: read
+
 jobs:
   ci:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18
+        image: postgres:18.6@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
         env:
           POSTGRES_PASSWORD: appkit
           POSTGRES_DB: appkit_test
@@ -29,9 +32,9 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://postgres:appkit@127.0.0.1:55499/appkit_test?sslmode=disable
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ inputs.go-version }}
 
@@ -45,14 +48,21 @@ jobs:
           fi
 
       # 域仓库 go.mod 钉的 appkit 版本即工具版本（规则与依赖同版本升级，
-      # 不搞 @main 惊喜）；go.work 联调仓库取不到版本时退 @main。
+      # 不搞 @main 惊喜）。CI 中取不到正式版本就是装配错误，直接失败；
+      # 本地 go.work 联调不走这条 reusable workflow。
       # 所有 go run appkit 工具必须带 @版本：不带会用域仓库的 go.sum 编译
       # appkit cmd，而 go mod tidy 又把域仓库 import 图之外的 sums 剥掉
       # ——「appkit check 能跑」与「go.mod 整洁检查」两头必红一头，域侧无解。
       - name: 解析 appkit 工具版本
         run: |
           v=$(go list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $2}')
-          case "$v" in v*) ;; *) v=main ;; esac
+          case "$v" in
+            v*) ;;
+            *)
+              echo "::error::go.mod 必须 require 正式 appkit 版本，CI 禁止回退 main（当前: $v）"
+              exit 1
+              ;;
+          esac
           echo "APPKIT_TOOL=$v" >> "$GITHUB_ENV"
 
       - name: go vet
@@ -73,8 +83,8 @@ jobs:
       # schema 文档漂移：改了迁移却没跑 make schema 就会红。
       # 不加 if: 守卫也不加 continue-on-error——跳不跳由命令自己按启用门决定：
       # db/SCHEMA.md 与 db/schema/ 都不存在的仓库打一条 ::notice 后退出 0，
-      # 任一存在就严格检查。本文件经 @main 被全部存量域仓库共享，
-      # 硬加一个新检查会让它们在合并那一刻集体变红。
+      # 任一存在就严格检查。reusable workflow 随域仓库声明的 appkit
+      # release commit 固定，新增检查只在显式升级并 sync 后生效。
       - name: appkit schema 漂移检查
         run: go run github.com/forgeplex/appkit/cmd/appkit@"$APPKIT_TOOL" schema -check
 
