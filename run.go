@@ -41,6 +41,7 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.register(enabled); err != nil {
 		return err
 	}
+	a.registerBusLifecycle()
 	if err := a.reg.resolveAll(); err != nil {
 		return err
 	}
@@ -97,6 +98,26 @@ func (a *App) Run(ctx context.Context) error {
 	cancelRun()
 	shutdownErr := a.shutdown(server, maxStage)
 	return errors.Join(startErr, serveErr, shutdownErr)
+}
+
+// registerBusLifecycle 把可选的持久化 Broker 生命周期纳入 App 的标准启动、
+// readiness、异常传播与反序关停。普通进程内 Subscriber 保持原行为。
+func (a *App) registerBusLifecycle() {
+	bus, ok := a.cfg.bus.(ManagedSubscriber)
+	if !ok {
+		return
+	}
+	previous := a.reg.current
+	a.reg.current = "appkit-bus"
+	defer func() { a.reg.current = previous }()
+
+	a.reg.Health("ready", health.CheckFunc(bus.Ready))
+	a.reg.OnStart(StageInfra, bus.Connect)
+	// Close 先登记在 Infra stage；反序关停时它会在 Drain 和 Worker 退出之后执行。
+	a.reg.OnStop(bus.Close)
+	a.reg.Worker("consume", bus.Run)
+	// 同 stage 逆序执行，所以 Drain 先于 Worker 的等待钩子。
+	a.reg.OnStop(bus.Drain)
 }
 
 // Migrate 只做「声明 → 应用迁移」然后返回：不解析依赖图、不跑 Setup/OnStart、

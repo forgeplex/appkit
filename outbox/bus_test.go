@@ -26,7 +26,7 @@ func TestDirectBusPublish(t *testing.T) {
 		wantCalls int
 		wantErr   error
 	}{
-		{name: "无订阅者返回 nil", subs: nil, topic: "t", wantCalls: 0},
+		{name: "无订阅者返回可判定错误", subs: nil, topic: "t", wantCalls: 0, wantErr: outbox.ErrNoSubscriber},
 		{name: "单 handler 被调用", subs: []sub{{"t", nil}}, topic: "t", wantCalls: 1},
 		{name: "同 topic 多 handler 全部调用", subs: []sub{{"t", nil}, {"t", nil}, {"t", nil}}, topic: "t", wantCalls: 3},
 		{name: "一个失败其余仍被调用且返回错误", subs: []sub{{"t", errBoom}, {"t", nil}}, topic: "t", wantCalls: 2, wantErr: errBoom},

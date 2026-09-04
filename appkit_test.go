@@ -563,6 +563,114 @@ type fakeBus struct {
 	topics []string
 }
 
+type managedFakeBus struct {
+	mu       sync.Mutex
+	events   []string
+	runErr   error
+	readyErr error
+	runGate  chan struct{}
+}
+
+func (b *managedFakeBus) record(event string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.events = append(b.events, event)
+}
+
+func (b *managedFakeBus) Subscribe(string, EventHandler) {}
+func (b *managedFakeBus) Connect(context.Context) error {
+	b.record("connect")
+	return nil
+}
+func (b *managedFakeBus) Run(ctx context.Context) error {
+	b.record("run")
+	if b.runGate != nil {
+		select {
+		case <-b.runGate:
+			return b.runErr
+		case <-ctx.Done():
+			b.record("run-exit")
+			return ctx.Err()
+		}
+	}
+	<-ctx.Done()
+	b.record("run-exit")
+	return ctx.Err()
+}
+func (b *managedFakeBus) Ready(context.Context) error { return b.readyErr }
+func (b *managedFakeBus) Drain(context.Context) error {
+	b.record("drain")
+	return nil
+}
+func (b *managedFakeBus) Close(context.Context) error {
+	b.record("close")
+	return nil
+}
+
+func (b *managedFakeBus) snapshot() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.events)
+}
+
+func TestManagedBusLifecycle(t *testing.T) {
+	bus := &managedFakeBus{}
+	ready := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	app := New([]Module{gateModule(ready)}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	go func() { done <- app.Run(ctx) }()
+
+	select {
+	case <-ready:
+		cancel()
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("等待应用就绪超时")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	events := bus.snapshot()
+	for _, want := range []string{"connect", "run", "drain", "run-exit", "close"} {
+		if !slices.Contains(events, want) {
+			t.Fatalf("生命周期缺少 %q: %v", want, events)
+		}
+	}
+	index := func(v string) int { return slices.Index(events, v) }
+	if index("drain") > index("close") || index("run-exit") > index("close") {
+		t.Fatalf("Close 必须在 Drain 和消费循环退出之后: %v", events)
+	}
+}
+
+func TestManagedBusRunFailureStopsApp(t *testing.T) {
+	gate := make(chan struct{})
+	bus := &managedFakeBus{runErr: errors.New("broker disconnected"), runGate: gate}
+	done := make(chan error, 1)
+	app := New(nil, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	go func() { done <- app.Run(context.Background()) }()
+	close(gate)
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "broker disconnected") {
+			t.Fatalf("消费循环错误应触发应用关停，实际 %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("消费循环失败后应用未关停")
+	}
+}
+
+func TestManagedBusReadiness(t *testing.T) {
+	bus := &managedFakeBus{readyErr: errors.New("broker not ready")}
+	app := New(nil, Bus(bus))
+	app.registerBusLifecycle()
+	app.reg.health.SetReady(true)
+	failures := app.reg.health.Ready(context.Background())
+	if err := failures["appkit-bus/ready"]; !errors.Is(err, bus.readyErr) {
+		t.Fatalf("Broker readiness 未接入应用探针: %v", failures)
+	}
+}
+
 func (b *fakeBus) Subscribe(topic string, _ EventHandler) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
