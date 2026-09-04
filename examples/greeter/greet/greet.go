@@ -35,7 +35,7 @@ func (m *module) Register(reg *appkit.Registry) error {
 	appkit.ProvideContract(reg,
 		func(*appkit.Registry) (greetapi.Service, error) { return svc, nil },
 		func(v greetapi.Service) greetapi.Service { return greetapi.WrapService(v, 0) })
-	reg.Mount(Pattern, NewHandler(m.log, svc))
+	reg.MountPublic(Pattern, NewHandler(m.log, svc))
 	return nil
 }
 

@@ -36,7 +36,7 @@ func (m *module) Register(reg *appkit.Registry) error {
 		m.h = NewHandler(m.log, appkit.MustResolve[greetapi.Service](reg))
 		return nil
 	})
-	reg.Mount(Pattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	reg.MountPublic(Pattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		m.h.ServeHTTP(w, r)
 	}))
 	return nil

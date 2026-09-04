@@ -66,13 +66,15 @@ type stepUpClaims struct {
 // Middleware 验签并注入 appkit.Actor。语义：
 //   - 无 Authorization 头的请求原样放行（不注入 Actor）——判公开与否是
 //     Require 的职责，公开端点（探针等）不因本中间件存在而关死；
-//   - 有头但验签失败（坏签名、错算法、错 iss、过期、缺 exp、sub 为空）
-//     → 401：凭证无效必须响亮，不能静默降级为匿名；
+//   - 除内建 /healthz、/readyz 探针外，有头但验签失败（坏签名、错算法、
+//     错 iss、过期、缺 exp、sub 为空）→ 401：凭证无效必须响亮，不能
+//     静默降级为匿名；探针始终隐式 Public；
 //   - X-Step-Up 同样原则：有头才验，验不过 401（含 sub 与访问令牌不一致、
 //     purpose 不是 step-up）；验过则 Actor.StepUpAt = 证明的 iat。
 //
-// 租户身份在此焊进 callctx：认证请求以令牌 tid 为准（覆盖或清零入站
-// X-Tenant-Id 头带来的值——该头只在内部东西向可信，外部入口可伪造）。
+// 租户身份在此焊进 callctx：认证请求以令牌 tid 为准。严格安全模式会在
+// 更外层先清掉所有 unsigned 身份头与预置 principal，本中间件只从已验签
+// token 重建用户与租户身份。
 // 域代码与存储层（RLS）统一从 callctx.From(ctx).TenantID 取租户。
 func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Handler {
 	parse := []jwt.ParserOption{
@@ -82,6 +84,12 @@ func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Ha
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 框架探针是隐式 Public：kubelet 不应因误带/陈旧凭证而把存活
+			// 检查变成 401。身份边界仍在更外层清除 unsigned 身份头。
+			if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+				next.ServeHTTP(w, r)
+				return
+			}
 			raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if !ok {
 				next.ServeHTTP(w, r)
@@ -110,9 +118,8 @@ func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Ha
 				}
 				actor.StepUpAt = at
 			}
-			// 租户身份焊进 callctx：令牌说了算。tid 有值则覆盖入站头带来的
-			// 租户，无值则清零——「无租户令牌 + 伪造的 X-Tenant-Id」不能
-			// 成立。未认证路径不进这里，头值存活（内部东西向的合法形态）。
+			// 租户身份焊进 callctx：令牌说了算。tid 有值则写入，空值则保持
+			// 清空——「无租户令牌 + 伪造的 X-Tenant-Id」不能成立。
 			meta := callctx.From(r.Context())
 			meta.TenantID = actor.TenantID
 			ctx := callctx.With(appkit.WithActor(r.Context(), actor), meta)

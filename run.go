@@ -18,7 +18,7 @@ import (
 )
 
 // Run 启动应用并阻塞到 ctx 取消、收到 SIGINT/SIGTERM 或 HTTP 服务异常退出，
-// 然后优雅关停。
+// 然后优雅关停。调用前必须通过 Security 显式选择 HTTP 安全模式。
 //
 // 启动顺序：Register（声明）→ Remote 绑定 → 依赖图解析（fail-fast）→ 迁移 →
 // Setup（装配）→ 消费者订阅 Bus → OnStart 按 stage 升序 → HTTP 监听 → 置 ready。
@@ -43,6 +43,11 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.register(enabled); err != nil {
 		return err
 	}
+	// 安全模式是监听 HTTP 的前置条件，零值不能退化成匿名服务。
+	// Migrate 不走 Run，因此迁移专用进程不受这条 HTTP 约束影响。
+	if err := validateSecurityMode(a.cfg.securityMode); err != nil {
+		return err
+	}
 	cancelBus := a.registerBusLifecycle(ctx)
 	defer cancelBus()
 	if err := a.reg.resolveAll(); err != nil {
@@ -52,6 +57,11 @@ func (a *App) Run(ctx context.Context) error {
 		return err
 	}
 	if err := a.reg.runSetups(ctx); err != nil {
+		return err
+	}
+	// Setup 也允许挂路由，因此必须等全部 Setup 完成后再校验；校验仍发生在
+	// buildMux/listen 之前，任何未分类路由都不可能先监听再暴露。
+	if err := a.reg.validateRouteSecurity(a.cfg.securityMode, a.cfg.pprof); err != nil {
 		return err
 	}
 	// 全部 Setup 之后统一校验权限绑定 ⊆ 声明——模块内部 mux 在 Setup 期
@@ -229,7 +239,11 @@ func (a *App) buildMux() (mux *http.ServeMux, err error) {
 	mux.Handle("/healthz", a.reg.health.LiveHandler())
 	mux.Handle("/readyz", a.reg.health.ReadyHandler())
 	if a.cfg.pprof {
-		mountPprof(mux)
+		guard := func(h http.Handler) http.Handler { return h }
+		if a.cfg.securityMode == SecurityInternalService || a.cfg.securityMode == SecurityMixed {
+			guard = requireService
+		}
+		mountPprof(mux, guard)
 	}
 	defer func() {
 		if p := recover(); p != nil {
@@ -244,14 +258,14 @@ func (a *App) buildMux() (mux *http.ServeMux, err error) {
 
 // mountPprof 挂标准 pprof 端点集。显式列举而非 import 副作用挂
 // DefaultServeMux：路由必须落在应用自己的 mux 上，与探针同级。
-func mountPprof(mux *http.ServeMux) {
-	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
-	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+func mountPprof(mux *http.ServeMux, guard func(http.Handler) http.Handler) {
+	mux.Handle("GET /debug/pprof/", guard(http.HandlerFunc(pprof.Index)))
+	mux.Handle("GET /debug/pprof/cmdline", guard(http.HandlerFunc(pprof.Cmdline)))
+	mux.Handle("GET /debug/pprof/profile", guard(http.HandlerFunc(pprof.Profile)))
+	mux.Handle("GET /debug/pprof/symbol", guard(http.HandlerFunc(pprof.Symbol)))
+	mux.Handle("GET /debug/pprof/trace", guard(http.HandlerFunc(pprof.Trace)))
 	for _, name := range []string{"goroutine", "heap", "allocs", "block", "mutex", "threadcreate"} {
-		mux.Handle("GET /debug/pprof/"+name, pprof.Handler(name))
+		mux.Handle("GET /debug/pprof/"+name, guard(pprof.Handler(name)))
 	}
 }
 
@@ -269,12 +283,23 @@ func (a *App) buildServer(h http.Handler) *http.Server {
 	for _, f := range a.cfg.httpServerOpts {
 		f(server)
 	}
+	if a.cfg.securityMode != SecurityDisabled {
+		// HTTPServer 是超时等传输参数的扩展点，不是替换根 handler 的逃生口。
+		// 严格模式强制恢复，防止绕过路由分类、guard 与身份边界；disabled
+		// 保留历史逃生口，避免 dev/test 兼容模式出现无关行为变化。
+		server.Handler = h
+	}
 	return server
 }
 
 func (a *App) wrap(h http.Handler) http.Handler {
 	for i := len(a.cfg.middleware) - 1; i >= 0; i-- {
 		h = a.cfg.middleware[i](h)
+	}
+	if a.cfg.securityMode != SecurityDisabled {
+		// 放在所有可注入中间件之外：调用方无法通过中间件顺序让 unsigned
+		// identity header 或预置 ctx 绕过信任边界；验签发生在边界内并重建。
+		h = identityBoundary(h)
 	}
 	return h
 }

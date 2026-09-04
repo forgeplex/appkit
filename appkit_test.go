@@ -33,6 +33,13 @@ type testModule struct {
 func (m *testModule) Name() string                 { return m.name }
 func (m *testModule) Register(reg *Registry) error { return m.register(reg) }
 
+// newTestApp keeps lifecycle tests explicit about their dev/test-only security mode.
+// Security-specific tests call New directly so the unspecified-mode failure remains visible.
+func newTestApp(modules []Module, opts ...Option) *App {
+	opts = append([]Option{Security(SecurityDisabled)}, opts...)
+	return New(modules, opts...)
+}
+
 func TestResolveMemoizedAndLazy(t *testing.T) {
 	reg := newRegistry()
 	var calls atomic.Int32
@@ -150,7 +157,7 @@ func TestTargetFiltersModulesAndRemoteFallback(t *testing.T) {
 	}}
 
 	// target 只含 gateway：greeter 落到 Remote 绑定。
-	app := New([]Module{provider, consumer},
+	app := newTestApp([]Module{provider, consumer},
 		Target("gateway"),
 		Remote(func(*Registry) (greeter, error) { return localGreeter{from: "remote"}, nil }),
 	)
@@ -176,7 +183,7 @@ func TestTargetFiltersModulesAndRemoteFallback(t *testing.T) {
 }
 
 func TestTargetUnknownModule(t *testing.T) {
-	app := New([]Module{&testModule{name: "ledger", register: func(*Registry) error { return nil }}},
+	app := newTestApp([]Module{&testModule{name: "ledger", register: func(*Registry) error { return nil }}},
 		Target("ledgerr"))
 	if _, err := app.enabledModules(); err == nil {
 		t.Fatal("未知 target 模块应报错")
@@ -208,7 +215,7 @@ func TestRunLifecycleOrder(t *testing.T) {
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	app := New([]Module{m}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(2*time.Second))
+	app := newTestApp([]Module{m}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(2*time.Second))
 	done := make(chan error, 1)
 	go func() { done <- app.Run(ctx) }()
 
@@ -242,7 +249,7 @@ func TestRunLifecycleOrder(t *testing.T) {
 // 「挂着但没人知道」——危险默认不能靠文档提醒），声明 Pprof() 后
 // 索引页与具名 profile 都可用。
 func TestPprofGatedByOption(t *testing.T) {
-	mux, err := New(nil).buildMux()
+	mux, err := newTestApp(nil).buildMux()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +259,7 @@ func TestPprofGatedByOption(t *testing.T) {
 		t.Fatalf("默认不应挂 pprof: /debug/pprof/ = %d, want 404", rec.Code)
 	}
 
-	mux, err = New(nil, Pprof()).buildMux()
+	mux, err = newTestApp(nil, Pprof()).buildMux()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +316,7 @@ func TestRunInfraFailureReturnsWithoutDeadlock(t *testing.T) {
 		return nil
 	}}
 
-	app := New([]Module{relay, infra}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	app := newTestApp([]Module{relay, infra}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(context.Background()) }()
 
@@ -353,7 +360,7 @@ func TestRunStartFailureCancelsStartedWorkers(t *testing.T) {
 		return nil
 	}}
 
-	app := New([]Module{worker, boom}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	app := newTestApp([]Module{worker, boom}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(context.Background()) }()
 
@@ -404,7 +411,7 @@ func TestShutdownMirrorsStartOrder(t *testing.T) {
 	ready := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	// worker 先注册、infra 后注册：纯注册逆序会先停 infra（错误）。
-	app := New([]Module{worker, infra, plain, gateModule(ready)},
+	app := newTestApp([]Module{worker, infra, plain, gateModule(ready)},
 		HTTPAddr("127.0.0.1:0"), ShutdownTimeout(2*time.Second))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(ctx) }()
@@ -446,7 +453,7 @@ func TestRunBindErrorSynchronous(t *testing.T) {
 	}
 	defer ln.Close()
 
-	app := New(nil, HTTPAddr(ln.Addr().String()), ShutdownTimeout(time.Second))
+	app := newTestApp(nil, HTTPAddr(ln.Addr().String()), ShutdownTimeout(time.Second))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(context.Background()) }()
 
@@ -482,7 +489,7 @@ func TestOnStopTimeoutDoesNotBlockOthers(t *testing.T) {
 
 	ready := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	app := New([]Module{blocker, infra, gateModule(ready)},
+	app := newTestApp([]Module{blocker, infra, gateModule(ready)},
 		HTTPAddr("127.0.0.1:0"), ShutdownTimeout(300*time.Millisecond))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(ctx) }()
@@ -515,7 +522,7 @@ func TestOnStopTimeoutDoesNotBlockOthers(t *testing.T) {
 // 记日志、走关停、并入返回错误。
 func TestRunConsumesServerError(t *testing.T) {
 	ready := make(chan struct{})
-	app := New([]Module{gateModule(ready)}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	app := newTestApp([]Module{gateModule(ready)}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(context.Background()) }()
 
@@ -539,14 +546,14 @@ func TestRunConsumesServerError(t *testing.T) {
 // TestBuildServerDefaultsAndOverride 验证 http.Server 的安全默认超时，
 // 以及 HTTPServer 选项可覆盖。
 func TestBuildServerDefaultsAndOverride(t *testing.T) {
-	s := New(nil).buildServer(nil)
+	s := newTestApp(nil).buildServer(nil)
 	if s.ReadTimeout != 60*time.Second || s.WriteTimeout != 60*time.Second ||
 		s.IdleTimeout != 120*time.Second || s.ReadHeaderTimeout != 10*time.Second {
 		t.Fatalf("默认超时不符: read=%v write=%v idle=%v header=%v",
 			s.ReadTimeout, s.WriteTimeout, s.IdleTimeout, s.ReadHeaderTimeout)
 	}
 
-	s2 := New(nil, HTTPServer(func(srv *http.Server) {
+	s2 := newTestApp(nil, HTTPServer(func(srv *http.Server) {
 		srv.ReadTimeout = 5 * time.Second
 	})).buildServer(nil)
 	if s2.ReadTimeout != 5*time.Second {
@@ -661,7 +668,7 @@ func TestManagedBusLifecycle(t *testing.T) {
 	ready := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	app := New([]Module{gateModule(ready)}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	app := newTestApp([]Module{gateModule(ready)}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	go func() { done <- app.Run(ctx) }()
 
 	select {
@@ -696,7 +703,7 @@ func TestManagedBusDrainRunsBeforeRunCancellation(t *testing.T) {
 	ready := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	app := New([]Module{gateModule(ready)}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	app := newTestApp([]Module{gateModule(ready)}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	go func() { done <- app.Run(ctx) }()
 
 	select {
@@ -739,7 +746,7 @@ func TestManagedBusDrainRunsBeforeRunCancellation(t *testing.T) {
 func TestManagedBusConnectFailureStillCloses(t *testing.T) {
 	connectErr := errors.New("connect partially initialized")
 	bus := &managedFakeBus{connectErr: connectErr}
-	app := New(nil, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	app := newTestApp(nil, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	err := app.Run(context.Background())
 	if !errors.Is(err, connectErr) {
 		t.Fatalf("Run 应返回 Connect 根因，实际 %v", err)
@@ -757,7 +764,7 @@ func TestManagedBusEarlierInfraFailureDoesNotCloseUnopenedBus(t *testing.T) {
 		return nil
 	}}
 	bus := &managedFakeBus{}
-	app := New([]Module{m}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	app := newTestApp([]Module{m}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	err := app.Run(context.Background())
 	if !errors.Is(err, infraErr) {
 		t.Fatalf("Run 应返回前序 Infra 根因，实际 %v", err)
@@ -774,7 +781,7 @@ func TestManagedBusEarlierWorkerFailureSkipsDrain(t *testing.T) {
 		return nil
 	}}
 	bus := &managedFakeBus{}
-	app := New([]Module{m}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	app := newTestApp([]Module{m}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	err := app.Run(context.Background())
 	if !errors.Is(err, workerErr) {
 		t.Fatalf("Run 应返回前序 Worker 根因，实际 %v", err)
@@ -790,7 +797,7 @@ func TestManagedBusDrainFailureStillStopsAndCloses(t *testing.T) {
 	ready := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	app := New([]Module{gateModule(ready)}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	app := newTestApp([]Module{gateModule(ready)}, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	go func() { done <- app.Run(ctx) }()
 	waitFor(t, ready, "等待应用就绪超时")
 	cancel()
@@ -809,7 +816,7 @@ func TestManagedBusRunFailureStopsApp(t *testing.T) {
 	gate := make(chan struct{})
 	bus := &managedFakeBus{runErr: errors.New("broker disconnected"), runGate: gate}
 	done := make(chan error, 1)
-	app := New(nil, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	app := newTestApp(nil, Bus(bus), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	go func() { done <- app.Run(context.Background()) }()
 	close(gate)
 	select {
@@ -824,7 +831,7 @@ func TestManagedBusRunFailureStopsApp(t *testing.T) {
 
 func TestManagedBusReadiness(t *testing.T) {
 	bus := &managedFakeBus{readyErr: errors.New("broker not ready")}
-	app := New(nil, Bus(bus))
+	app := newTestApp(nil, Bus(bus))
 	cancel := app.registerBusLifecycle(context.Background())
 	defer cancel()
 	app.reg.health.SetReady(true)
@@ -854,7 +861,7 @@ func TestBusAssembly(t *testing.T) {
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	app := New([]Module{m, gateModule(ready)},
+	app := newTestApp([]Module{m, gateModule(ready)},
 		HTTPAddr("127.0.0.1:0"), Bus(bus), ShutdownTimeout(time.Second))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(ctx) }()
@@ -893,7 +900,7 @@ func TestBusMissingFailFast(t *testing.T) {
 		reg.Consumer("pay.settled", func(context.Context, Event) error { return nil })
 		return nil
 	}}
-	app := New([]Module{m}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
+	app := newTestApp([]Module{m}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(context.Background()) }()
 
@@ -943,7 +950,7 @@ func TestRunInjectsLoggerIntoHealth(t *testing.T) {
 	}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	app := New([]Module{m, gateModule(ready)},
+	app := newTestApp([]Module{m, gateModule(ready)},
 		Logger(slog.New(logCap)), HTTPAddr("127.0.0.1:0"), ShutdownTimeout(2*time.Second))
 	done := make(chan error, 1)
 	go func() { done <- app.Run(ctx) }()

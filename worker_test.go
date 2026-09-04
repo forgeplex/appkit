@@ -26,7 +26,7 @@ func TestWorkerRunsAndStopsWithCtx(t *testing.T) {
 	}}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	app := New([]Module{m, gateModule(ready)},
+	app := newTestApp([]Module{m, gateModule(ready)},
 		HTTPAddr("127.0.0.1:0"), ShutdownTimeout(2*time.Second))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(ctx) }()
@@ -58,7 +58,7 @@ func TestWorkerCrashStopsApp(t *testing.T) {
 		})
 		return nil
 	}}
-	app := New([]Module{m, gateModule(ready)},
+	app := newTestApp([]Module{m, gateModule(ready)},
 		HTTPAddr("127.0.0.1:0"), ShutdownTimeout(2*time.Second))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(context.Background()) }()
@@ -91,7 +91,7 @@ func TestWorkerHangDoesNotBlockShutdown(t *testing.T) {
 		return nil
 	}}
 	ctx, cancel := context.WithCancel(context.Background())
-	app := New([]Module{m, gateModule(ready)},
+	app := newTestApp([]Module{m, gateModule(ready)},
 		HTTPAddr("127.0.0.1:0"), ShutdownTimeout(300*time.Millisecond))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(ctx) }()
@@ -122,7 +122,7 @@ func TestWorkerNotStartedAfterSameStageFailureDoesNotWait(t *testing.T) {
 		})
 		return nil
 	}}
-	app := New([]Module{m}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(100*time.Millisecond))
+	app := newTestApp([]Module{m}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(100*time.Millisecond))
 	err := app.Run(context.Background())
 	if !errors.Is(err, boom) {
 		t.Fatalf("Run 应保留同 stage 启动根因，实际 %v", err)
@@ -138,7 +138,7 @@ func TestWorkerNotStartedAfterSameStageFailureDoesNotWait(t *testing.T) {
 // TestMigrationsWithoutMigratorFailFast 验证登记了迁移却没有执行器时启动即报错，
 // 且错误里带上「怎么修」——静默跳过迁移会让服务对着旧 schema 跑。
 func TestMigrationsWithoutMigratorFailFast(t *testing.T) {
-	app := New([]Module{migratingModule()},
+	app := newTestApp([]Module{migratingModule()},
 		HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second))
 	err := app.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "未注入迁移执行器") ||
@@ -152,7 +152,7 @@ func TestMigrationsWithoutMigratorFailFast(t *testing.T) {
 func TestSkipMigrationsOptOut(t *testing.T) {
 	ready := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	app := New([]Module{migratingModule(), gateModule(ready)},
+	app := newTestApp([]Module{migratingModule(), gateModule(ready)},
 		HTTPAddr("127.0.0.1:0"), SkipMigrations(), ShutdownTimeout(time.Second))
 	runDone := make(chan error, 1)
 	go func() { runDone <- app.Run(ctx) }()
@@ -176,7 +176,7 @@ func TestSkipMigrationsOverridesMigrator(t *testing.T) {
 	called := false
 	ready := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	app := New([]Module{migratingModule(), gateModule(ready)},
+	app := newTestApp([]Module{migratingModule(), gateModule(ready)},
 		HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second),
 		Migrator(func(context.Context, []MigrationSet) error {
 			called = true
@@ -206,7 +206,7 @@ func TestMigratorReceivesSets(t *testing.T) {
 	var got []MigrationSet
 	ready := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	app := New([]Module{migratingModule(), gateModule(ready)},
+	app := newTestApp([]Module{migratingModule(), gateModule(ready)},
 		HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second),
 		Migrator(func(_ context.Context, sets []MigrationSet) error {
 			got = sets

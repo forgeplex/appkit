@@ -13,13 +13,10 @@
 //   - 事件：outbox 发布时 ToMap 快照进 Event.Meta，relay 投递前 FromMap
 //     还原进 ctx——异步链路上 request id 同样连得起来。
 //
-// 租户的信任模型：入站 Extract 信任 X-Tenant-Id 头，这只对内部东西向
-// 成立（上游经 callctx.Transport 注入、下游 Extract 读回）。外部入口的
-// 可信来源是令牌——authn 验签后以令牌 tid 覆盖 ctx 里的租户、无 tid 则
-// 清零：认证请求里头带来的租户值不存活，「无租户令牌 + 伪造的头」不能
-// 成立。未认证入口头值存活（内部服务间不带用户令牌的调用）；会暴露在
-// 外网的公开端点不该凭头里的租户查数据——剥掉外网流量里的该头是网关
-// 职责，框架不越位。
+// 租户的信任模型：Extract 只负责传输，不赋予可信语义。App 的严格安全模式
+// 在最外层清除 X-Tenant-Id/X-Caller 与预置 principal；随后用户 token 或
+// 服务凭证验证器从已验证声明重建 Meta。因而匿名请求即使伪造身份头也不会
+// 得到可信租户；Disabled 仅供 dev/test，保留旧的原样传播行为。
 //
 // 剩下的半条是出站 HTTP：合约仓库的 client 是手写的（appkit gen 只生成
 // events/errors/wrap，不生成 client），得自己接上。装配 Transport 一次即可：

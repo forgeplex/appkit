@@ -40,6 +40,10 @@ lint / CI 配置（.golangci.yml、.go-arch-lint.yml、.github/workflows/ci.yml�
 CI 都会校验未漂移（改松规则不会让检查变绿）。CI 先验漂移、再按这份配置跑
 `make lint` 的那两个检查器，版本与本地钉在同一个。
 运行配置在 `config/dev.yaml`，任意键可被 `{{.EnvPrefix}}_*` 环境变量覆盖。
+其中 `security.mode: disabled` 只供本地开发；任何监听 HTTP 的 staging/prod
+进程都必须按暴露面显式选择严格模式并装配对应验签器，裸 `reg.Mount` 会在
+严格模式下于监听前被拒绝。当前 bootstrap 阶段可完整配置 `user_facing`；
+`internal_service/mixed` 在服务 JWT 验证器落地前保持 fail closed。
 
 **已应用的迁移不可再改**：历史表存着每个文件的 sha256，改动已应用的文件会让服务
 以 `MIGRATION_DRIFT` 拒绝启动（错误信息里带修复命令）。改结构一律新增 `000N_*.sql`。

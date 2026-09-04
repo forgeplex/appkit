@@ -66,15 +66,24 @@ func TestSystemScaffold(t *testing.T) {
 	})
 
 	t.Run("配置与部署说明", func(t *testing.T) {
-		mustContain(t, "config/dev.yaml", readFile(t, dir, "config/dev.yaml"), "env: dev")
+		mustContain(t, "config/dev.yaml", readFile(t, dir, "config/dev.yaml"),
+			"env: dev", "security:", "mode: disabled", "env=dev", "staging/prod")
 		mustContain(t, "Makefile", readFile(t, dir, "Makefile"), "run-minimal:", "-minimal")
 		mustContain(t, "config/prod.yaml", readFile(t, dir, "config/prod.yaml"),
-			"env: prod", "pprof: false")
+			"env: prod", "security:", `mode: ""`, "user_facing",
+			"internal_service/mixed", "fail closed", "pprof: false")
 		mustContain(t, "deploy/README.md", readFile(t, dir, "deploy/README.md"),
 			"-target=all", "-target=relay",
+			"security.mode", "AuthnPublicKey", "AuthnIssuer", "internal_service/mixed",
+			"fail closed", "-migrate", "不要求 security.mode",
 			// 迁移与告警是部署时才想起来的两件事，写在这里而不是散在别处。
 			"-migrate", "appkit.SkipMigrations()", "MIGRATION_DRIFT",
 			"appkit.outbox.oldest_pending.age")
+		mustContain(t, "AGENTS.md", readFile(t, dir, "AGENTS.md"),
+			"HTTP 身份边界", "security.mode", "disabled", "user_facing",
+			"internal_service", "mixed", "AuthnPublicKey", "AuthnIssuer", "pprof")
+		mustContain(t, "README.md", readFile(t, dir, "README.md"),
+			"security.mode: disabled", "user_facing", "internal_service/mixed", "fail closed")
 	})
 }
 
