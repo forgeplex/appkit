@@ -24,6 +24,7 @@ type appConfig struct {
 	target          string
 	httpAddr        string
 	middleware      []func(http.Handler) http.Handler
+	securityMode    SecurityMode
 	logger          *slog.Logger
 	shutdownTimeout time.Duration
 	drainDelay      time.Duration
@@ -55,9 +56,9 @@ func Middleware(mw ...func(http.Handler) http.Handler) Option {
 }
 
 // Pprof 在主端口挂载 /debug/pprof/* 排障端点（goroutine/heap/profile/
-// cmdline/symbol/trace 等）。默认关闭：这些端点暴露进程内部信息
-// （goroutine 栈、堆采样可能含敏感数据），开启是显式的排障决策——
-// 先确认服务端口不暴露公网，或网络策略已挡好。
+// cmdline/symbol/trace 等）。默认关闭：这些端点暴露进程内部信息。
+// UserFacing 模式会拒绝挂载；InternalService/Mixed 模式要求已验证服务身份；
+// SecurityDisabled 下无身份保护，只能用于可信的 dev/test 环境。
 //
 // 开关走配置而不是代码（bootstrap 的 debug.pprof）：线上排障改
 // configmap 重启即生效，不必发版。
@@ -103,6 +104,8 @@ func Bus(s Subscriber) Option {
 
 // HTTPServer 在框架默认值（ReadTimeout 60s、WriteTimeout 60s、IdleTimeout 120s、
 // ReadHeaderTimeout 10s）之上调整 http.Server。可多次注册，按序应用。
+// 严格安全模式下 Handler 由框架固定为已分类路由与身份边界，回调对它的
+// 修改不会生效；SecurityDisabled 保留历史行为。
 func HTTPServer(fn func(*http.Server)) Option {
 	return func(c *appConfig) { c.httpServerOpts = append(c.httpServerOpts, fn) }
 }
@@ -123,6 +126,7 @@ func SkipMigrations() Option {
 }
 
 // New 构造 App。modules 全集在此声明，实际启用集由 Target 决定。
+// 会调用 Run 的 App 必须通过 Security 显式选择 HTTP 安全模式；Migrate 不需要。
 func New(modules []Module, opts ...Option) *App {
 	cfg := appConfig{
 		target:          "all",

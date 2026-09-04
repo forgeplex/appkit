@@ -114,7 +114,8 @@ func TestMiddlewareHappyPath(t *testing.T) {
 
 // TestMiddlewareTenantWeld 锁住租户信任模型：认证请求以令牌为准——
 // 有 tid 覆盖入站头带来的值，无 tid 清零（防「无租户令牌 + 伪造的
-// X-Tenant-Id」）；未认证请求不动 callctx（内部东西向靠头传播）。
+// X-Tenant-Id」）；单独使用本机制件时未认证请求不动 callctx。真实 App 的
+// strict identity boundary 会在它之前清掉 unsigned 身份头。
 func TestMiddlewareTenantWeld(t *testing.T) {
 	pub, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
@@ -195,6 +196,19 @@ func TestMiddlewareNoCredentialPassesThrough(t *testing.T) {
 	}
 	if e.hasCtx {
 		t.Fatal("无凭证不应注入 Actor")
+	}
+}
+
+func TestMiddlewareProbesIgnoreCredentials(t *testing.T) {
+	e := newEnv(t)
+	for _, path := range []string{"/healthz", "/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer malformed")
+		rec := httptest.NewRecorder()
+		e.h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("探针 %s 应隐式 Public，不因畸形凭证失败，实际 %d", path, rec.Code)
+		}
 	}
 }
 

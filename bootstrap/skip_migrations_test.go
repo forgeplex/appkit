@@ -22,6 +22,7 @@ func TestAppOptionsSkipMigrationsOverridesBootstrapMigrator(t *testing.T) {
 	}
 	t.Setenv("BPSKIP_DATABASE__URL", dsn)
 	t.Setenv("BPSKIP_ADDR", "127.0.0.1:0")
+	t.Setenv("BPSKIP_SECURITY__MODE", "disabled")
 
 	ready := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
