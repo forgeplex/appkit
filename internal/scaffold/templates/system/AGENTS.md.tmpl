@@ -25,7 +25,8 @@
 ## 命令
 
 ```sh
-make run        # -target=all 单体起服
+make run        # 配好 database.url 后以 -target=all 单体起服
+make run-minimal # 显式无 DB 最小模式（仅 dev）
 appkit dev -root ..   # 生成 go.work 联调各本地仓库（不提交）
 appkit doctor   # 环境体检
 go build ./...  # 装配正确性由启动期 fail-fast 兜底：缺契约绑定/缺 Bus 起不来

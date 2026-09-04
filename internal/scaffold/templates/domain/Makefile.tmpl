@@ -5,11 +5,15 @@
 GO ?= go
 DEV_DB_URL := postgres://postgres:dev@127.0.0.1:54329/{{.Name}}_dev?sslmode=disable
 
-.PHONY: run dev-db run-db migrate gen schema lint check test
+.PHONY: run run-minimal dev-db run-db migrate gen schema lint check test
 
-# 零依赖试跑：config/dev.yaml 的 database.url 留空 → 最小模式（仅探针 + /ping）。
+# 正常启动必须有 database.url；缺配置时 fail closed。
 run:
 	$(GO) run ./cmd/{{.Name}}d
+
+# 零依赖试跑必须显式选择最小模式（仅探针 + /ping）。
+run-minimal:
+	$(GO) run ./cmd/{{.Name}}d -minimal
 
 # 启动/复用一次性开发 Postgres（docker），与 config/dev.yaml 注释里的地址一致。
 dev-db:

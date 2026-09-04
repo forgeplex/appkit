@@ -6,7 +6,7 @@ log:
   level: debug
   format: text
 database:
-  # 留空 = 最小模式：只有 /healthz /readyz /ping，数据面（迁移/outbox/幂等/审计）未启用。
+  # 留空时正常启动会 fail closed；零依赖试跑必须显式 make run-minimal。
   # 完整模式：make dev-db 启动一次性 Postgres 后，取消下一行注释（或 make run-db 直接以环境变量注入）。
   # url: postgres://postgres:dev@127.0.0.1:54329/{{.Name}}_dev?sslmode=disable
   url: ""

@@ -80,7 +80,7 @@ func Domain(o Options, out io.Writer) error {
 	}
 	summarize(out, "域仓库", o.Dir, []string{
 		"appkit dev    # 生成 go.work 联调兄弟仓库；要吃本地未发布的 appkit 改动，把 appkit 也纳入",
-		"make run      # 零依赖试跑（最小模式）；make run-db 进完整模式",
+		"make run-minimal # 显式零依赖试跑；make run-db 进完整模式",
 		"make check && make test",
 	})
 	return nil

@@ -40,7 +40,7 @@ func main() {
 	})
 }
 
-// minimal 是未配置 database.url 时的占位模块：证明服务能跑，不装任何业务。
+// minimal 是显式 -minimal 时的占位模块：证明服务能跑，不装任何业务。
 // 路由与完整模块同一 pattern——切换模式不移动端点。
 func minimal(bootstrap.Deps) ([]appkit.Module, error) {
 	return []appkit.Module{
