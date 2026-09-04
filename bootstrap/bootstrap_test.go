@@ -37,6 +37,29 @@ func TestDebugPprofConfigMapping(t *testing.T) {
 	}
 }
 
+func TestSplitTargetRejectsImplicitDirectBus(t *testing.T) {
+	err := Run(context.Background(), Options{
+		Service: "bpsplit",
+		Modules: func(Deps) ([]appkit.Module, error) { return nil, nil },
+	}, RunOptions{Target: "gateway", ConfigFile: filepath.Join(t.TempDir(), "absent.yaml")})
+	if err == nil || !strings.Contains(err.Error(), "禁止隐式使用进程内 DirectBus") {
+		t.Fatalf("拆分 target 应在连接数据库前拒绝默认 DirectBus，实际 %v", err)
+	}
+}
+
+func TestSplitTargetDirectBusRequiresExplicitOptIn(t *testing.T) {
+	options := Options{
+		Service: "bpsplitallow",
+		Modules: func(Deps) ([]appkit.Module, error) { return nil, nil },
+	}
+	options.AllowDirectBusForSplit = true
+	err := Run(context.Background(), options,
+		RunOptions{Target: "gateway", ConfigFile: filepath.Join(t.TempDir(), "absent.yaml")})
+	if err == nil || !strings.Contains(err.Error(), "未配置 database.url") {
+		t.Fatalf("显式 opt-in 应越过 Bus 守卫并继续正常校验，实际 %v", err)
+	}
+}
+
 // TestPoolOptionsReachProductionPool 验证 Options.PoolOptions 真的接到
 // bootstrap 建的生产池上：AfterConnect 钩子在真实路径被调用。域要给池装
 // otelpgx tracer 或会话级 GUC 时用这个注入口；此前只能整个自建池绕开

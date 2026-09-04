@@ -563,9 +563,14 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   做不到这点）。换规范化口径是单向门：存量 payload_hash 全部失配而 completed
   记录不过期，旧键持续 422 到客户端换键为止。
 - **Bus 可插拔**：单体单库用 directbus（relay 直投各域 inbox，无 broker）；
-  拆分部署切 NATS/Kafka——同一 Bus 接口，部署形态切换不改业务代码。
+  拆分部署切 NATS/Kafka——同一 Bus 接口，部署形态切换不改业务代码。DirectBus
+  对无订阅 topic 返回 `ErrNoSubscriber`，relay 不会把空投递标记成功；bootstrap
+  默认拒绝 `target != all` 继续隐式使用 DirectBus，特殊场景必须明确 opt-in。
   模块经 `reg.Consumer(topic, handler)` 声明消费（handler 用 outbox.Inbox 包去重），
   App 以 `appkit.Bus(...)` 装配；声明了消费者却未配 Bus 属启动错误（fail-fast）。
+  持久化 Broker 可额外实现 `appkit.ManagedSubscriber`：`Connect` 在监听前完成，
+  `Run` 作为受管 Worker 传播消费循环错误，`Ready` 接入 readiness；关停按
+  `Drain → 等待 Run → Close` 执行。其 `Publish` 只有拿到 durable ack 才能返回成功。
 - **业务层发事件不碰 infra 类型**：wiring 期构造 `outbox.NewPublisher(pool, schema)`，
   业务包按"接口放消费方"依赖单方法接口 `Publish(ctx, evt) error`。
 - **长驻任务一律经 `reg.Worker(name, run)`**：框架起 goroutine、关停等它退出、异常退出

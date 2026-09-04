@@ -111,6 +111,30 @@ func TestWorkerHangDoesNotBlockShutdown(t *testing.T) {
 	}
 }
 
+func TestWorkerNotStartedAfterSameStageFailureDoesNotWait(t *testing.T) {
+	boom := errors.New("earlier worker stage failed")
+	workerCalled := false
+	m := &testModule{name: "billing", register: func(reg *Registry) error {
+		reg.OnStart(StageWorker, func(context.Context) error { return boom })
+		reg.Worker("never-started", func(context.Context) error {
+			workerCalled = true
+			return nil
+		})
+		return nil
+	}}
+	app := New([]Module{m}, HTTPAddr("127.0.0.1:0"), ShutdownTimeout(100*time.Millisecond))
+	err := app.Run(context.Background())
+	if !errors.Is(err, boom) {
+		t.Fatalf("Run 应保留同 stage 启动根因，实际 %v", err)
+	}
+	if workerCalled {
+		t.Fatal("前序同 stage 钩子失败后不应启动后续 Worker")
+	}
+	if strings.Contains(err.Error(), "未在关停预算内退出") {
+		t.Fatalf("未启动 Worker 不应空等到关停超时: %v", err)
+	}
+}
+
 // TestMigrationsWithoutMigratorFailFast 验证登记了迁移却没有执行器时启动即报错，
 // 且错误里带上「怎么修」——静默跳过迁移会让服务对着旧 schema 跑。
 func TestMigrationsWithoutMigratorFailFast(t *testing.T) {

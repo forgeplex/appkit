@@ -13,6 +13,8 @@ import (
 	"sort"
 	"syscall"
 	"time"
+
+	"github.com/forgeplex/appkit/health"
 )
 
 // Run 启动应用并阻塞到 ctx 取消、收到 SIGINT/SIGTERM 或 HTTP 服务异常退出，
@@ -41,6 +43,8 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.register(enabled); err != nil {
 		return err
 	}
+	cancelBus := a.registerBusLifecycle(ctx)
+	defer cancelBus()
 	if err := a.reg.resolveAll(); err != nil {
 		return err
 	}
@@ -97,6 +101,55 @@ func (a *App) Run(ctx context.Context) error {
 	cancelRun()
 	shutdownErr := a.shutdown(server, maxStage)
 	return errors.Join(startErr, serveErr, shutdownErr)
+}
+
+// registerBusLifecycle 把可选的持久化 Broker 生命周期纳入 App 的标准启动、
+// readiness、异常传播与反序关停。普通进程内 Subscriber 保持原行为。
+func (a *App) registerBusLifecycle(ctx context.Context) context.CancelFunc {
+	bus, ok := a.cfg.bus.(ManagedSubscriber)
+	if !ok {
+		return func() {}
+	}
+	busCtx, cancelBus := context.WithCancel(context.WithoutCancel(ctx))
+	previous := a.reg.current
+	a.reg.current = "appkit-bus"
+	defer func() { a.reg.current = previous }()
+
+	a.reg.Health("ready", health.CheckFunc(bus.Ready))
+	connectAttempted := false
+	a.reg.OnStart(StageInfra, func(ctx context.Context) error {
+		connectAttempted = true
+		return bus.Connect(ctx)
+	})
+	// Close 在 Worker 启动钩子登记前绑定 Infra stage：Connect 即使只完成部分
+	// 初始化便失败，shutdown 也会执行 Close；正常关停时它排在 Worker stage 后。
+	a.reg.OnStop(func(ctx context.Context) error {
+		if !connectAttempted {
+			return nil
+		}
+		return bus.Close(ctx)
+	})
+
+	// Worker 仍由 Registry 托管错误传播和等待，但忽略普通 runCtx，改用独立
+	// busCtx；因此 App 取消普通 worker 后，Broker 仍可继续处理在途消息。
+	worker := a.reg.worker("consume", func(context.Context) error {
+		return bus.Run(busCtx)
+	})
+	// 同一 stage 的 stop 逆序执行：Drain → cancelBus → Worker 等待。
+	a.reg.OnStop(func(context.Context) error {
+		if !worker.started {
+			return nil
+		}
+		cancelBus()
+		return nil
+	})
+	a.reg.OnStop(func(ctx context.Context) error {
+		if !worker.started {
+			return nil
+		}
+		return bus.Drain(ctx)
+	})
+	return cancelBus
 }
 
 // Migrate 只做「声明 → 应用迁移」然后返回：不解析依赖图、不跑 Setup/OnStart、

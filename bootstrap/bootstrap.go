@@ -114,6 +114,10 @@ type Options struct {
 	AppOptions func(Deps) []appkit.Option
 	// NewBus 覆盖默认事件总线（默认 outbox.NewDirectBus()）。
 	NewBus func() EventBus
+	// AllowDirectBusForSplit 明确允许 target != all 时仍使用默认 DirectBus。
+	// 这只适用于调用方确认事件不会跨进程的特殊部署；默认拒绝，避免生产者侧
+	// 无本地订阅者却误把拆分部署当成可工作的跨进程事件总线。
+	AllowDirectBusForSplit bool
 	// PoolOptions 追加连接池配置，随 bootstrap 建的生产池生效：
 	// pgtx.WithAfterConnect 装 per-connection 钩子（otelpgx tracer、
 	// 会话级 GUC），pgtx.WithMaxConns 调容量。留空即框架默认。
@@ -172,6 +176,9 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 	}
 	if o.Modules == nil {
 		return fmt.Errorf("bootstrap: %s: Options.Modules 不能为 nil", o.Service)
+	}
+	if !r.Minimal && !r.MigrateOnly && isSplitTarget(r.Target) && o.NewBus == nil && !o.AllowDirectBusForSplit {
+		return fmt.Errorf("%s: -target=%q 是拆分部署，禁止隐式使用进程内 DirectBus；请通过 Options.NewBus 配置外部 Broker，或明确设置 AllowDirectBusForSplit", o.Service, r.Target)
 	}
 
 	copts := config.Options{
@@ -274,6 +281,11 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 		return app.Migrate(ctx)
 	}
 	return app.Run(ctx)
+}
+
+func isSplitTarget(target string) bool {
+	target = strings.TrimSpace(target)
+	return target != "" && target != "all"
 }
 
 func newBus(o Options) EventBus {

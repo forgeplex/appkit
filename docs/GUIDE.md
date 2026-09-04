@@ -618,8 +618,19 @@ return app.Run(ctx)
 | authn 独立扩容 | `./sso -target=authn` + 其余 `-target=identity,clients` |
 | 专职 relay 角色 | `./sso -target=relay`（模块把 relay 挂在自己的 OnStart，target 里含哪个域就跑哪个域的 relay） |
 
-拆分部署后把 `outbox.DirectBus` 换成 NATS/Kafka 实现（同一 `Bus` 接口），
-业务代码零改动。
+拆分部署必须通过 `bootstrap.Options.NewBus` 把 `outbox.DirectBus` 换成 NATS/Kafka
+实现；框架在 `target != all` 且仍使用隐式 DirectBus 时拒绝启动。只有确认事件绝不
+跨进程的特殊部署才可显式设置 `AllowDirectBusForSplit`。
+
+持久化 Broker 除实现发布与订阅接口外，应实现 `appkit.ManagedSubscriber`。框架会
+在监听端口前调用 `Connect`，以受管 Worker 运行 `Run` 消费循环，将 `Ready` 接入
+`/readyz`；消费循环异常会触发整个应用关停。关停时保持消费循环存活，先用关停
+预算执行 `Drain`（停止拉取并等待在途消费），随后取消并等待消费循环退出，最后
+`Close` 连接；即使 `Connect` 部分初始化后失败也会执行 `Close`。生产者只有在 Broker 返回 durable ack 后才能让
+`Publish` 成功；任何 nack、超时或断连都必须返回错误，使 outbox 保持未发布并重试。
+
+投递语义仍是至少一次：发布成功只表示 Broker 已持久确认，不表示消费者业务已经
+生效；消费端继续用 inbox 与业务唯一约束保证幂等生效。
 
 ## 7. 第六步：跑起来
 

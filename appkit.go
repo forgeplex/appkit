@@ -66,3 +66,21 @@ func (m funcModule) Register(reg *Registry) error { return m.register(reg) }
 type Subscriber interface {
 	Subscribe(topic string, h EventHandler)
 }
+
+// ManagedSubscriber 是需要由 App 托管生命周期的持久化消息总线可选接口。
+// 普通 Subscriber（例如 outbox.DirectBus）无需实现。实现后 App 会：启动前
+// Connect、以 Worker 运行消费循环、把 Ready 接入 /readyz，并在关停时依次
+// Drain 在途消费、等待 Run 退出、最后 Close 连接。
+//
+// 关停时 Run 的 ctx 会在 Drain 返回后取消；Run 必须随后尽快退出。Drain 必须
+// 停止接收新消息并在 ctx 预算内等待在途 handler 完成，不能等待 Run 自身退出。
+// Close 应可安全清理 Connect 部分初始化后返回错误的状态。Run 返回非
+// context.Canceled 错误会触发应用关停。
+type ManagedSubscriber interface {
+	Subscriber
+	Connect(ctx context.Context) error
+	Run(ctx context.Context) error
+	Ready(ctx context.Context) error
+	Drain(ctx context.Context) error
+	Close(ctx context.Context) error
+}

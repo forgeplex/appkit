@@ -253,6 +253,62 @@ func TestRelayIntegration(t *testing.T) {
 	}
 }
 
+func TestRelayNoSubscriberIsNotPublished(t *testing.T) {
+	pool := dbtest.Pool(t)
+	schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
+	evt := appkit.Event{ID: uuid.NewString(), Topic: "ledger.unhandled"}
+	publishOne(t, pool, schema, evt)
+
+	relay := outbox.NewRelay(pool, schema, outbox.NewDirectBus(),
+		outbox.WithInterval(10*time.Millisecond), outbox.WithMaxAttempts(2))
+	startRelay(t, relay)
+
+	waitFor(t, 5*time.Second, "无订阅事件进入死信", func() bool {
+		return countRows(t, pool,
+			`SELECT count(*) FROM `+schema+`.outbox WHERE id = $1 AND failed_at IS NOT NULL`, evt.ID) == 1
+	})
+	var (
+		publishedAt *time.Time
+		attempts    int
+		lastError   string
+	)
+	if err := pool.QueryRow(context.Background(),
+		`SELECT published_at, attempts, last_error FROM `+schema+`.outbox WHERE id = $1`, evt.ID).
+		Scan(&publishedAt, &attempts, &lastError); err != nil {
+		t.Fatalf("读取无订阅事件状态: %v", err)
+	}
+	if publishedAt != nil {
+		t.Fatalf("无订阅事件不应标记 published_at，实际 %v", publishedAt)
+	}
+	if attempts != 2 || !strings.Contains(lastError, outbox.ErrNoSubscriber.Error()) {
+		t.Fatalf("失败状态不符: attempts=%d last_error=%q", attempts, lastError)
+	}
+}
+
+type durableAckFailBus struct{ err error }
+
+func (b durableAckFailBus) Publish(context.Context, appkit.Event) error { return b.err }
+
+func TestRelayDurableAckFailureIsNotPublished(t *testing.T) {
+	pool := dbtest.Pool(t)
+	schema := dbtest.Schema(t, pool, "outbox_test", outbox.MigrationSQL)
+	evt := appkit.Event{ID: uuid.NewString(), Topic: "payment.created"}
+	publishOne(t, pool, schema, evt)
+
+	ackErr := errors.New("broker durable ack timeout")
+	relay := outbox.NewRelay(pool, schema, durableAckFailBus{err: ackErr},
+		outbox.WithInterval(10*time.Millisecond), outbox.WithMaxAttempts(1))
+	startRelay(t, relay)
+	waitFor(t, 5*time.Second, "durable ack 失败进入死信", func() bool {
+		return countRows(t, pool,
+			`SELECT count(*) FROM `+schema+`.outbox WHERE id = $1 AND failed_at IS NOT NULL`, evt.ID) == 1
+	})
+	if countRows(t, pool,
+		`SELECT count(*) FROM `+schema+`.outbox WHERE id = $1 AND published_at IS NOT NULL`, evt.ID) != 0 {
+		t.Fatal("durable ack 失败不应标记 published_at")
+	}
+}
+
 func TestInboxIntegration(t *testing.T) {
 	pool := dbtest.Pool(t)
 	errBoom := errors.New("boom")

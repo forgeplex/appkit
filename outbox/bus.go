@@ -16,6 +16,10 @@ type Bus interface {
 	Publish(ctx context.Context, evt appkit.Event) error
 }
 
+// ErrNoSubscriber 表示 DirectBus 找不到与事件 topic 匹配的订阅者。
+// relay 必须把它视为投递失败并保留事件，不能标记 published_at。
+var ErrNoSubscriber = errors.New("outbox: topic 无订阅者")
+
 // DirectBus 是进程内直投 Bus：Publish 同步调用 topic 下的全部 handler。
 // 并发安全；零值可用，但含锁，只能以指针传递。
 type DirectBus struct {
@@ -41,11 +45,15 @@ func (b *DirectBus) Subscribe(topic string, h appkit.EventHandler) {
 
 // Publish 逐个调用 evt.Topic 下的全部 handler。任一失败即返回（聚合）错误，
 // relay 因此不标记 published_at、稍后整体重投；失败者之外的 handler 本轮
-// 仍会被调用，避免一个坏消费者饿死其他消费者。无订阅者时静默返回 nil。
+// 仍会被调用，避免一个坏消费者饿死其他消费者。无订阅者时返回
+// ErrNoSubscriber，防止 relay 把没有实际投递的事件确认成功。
 func (b *DirectBus) Publish(ctx context.Context, evt appkit.Event) error {
 	b.mu.RLock()
 	handlers := slices.Clone(b.subs[evt.Topic])
 	b.mu.RUnlock()
+	if len(handlers) == 0 {
+		return fmt.Errorf("%w: %q", ErrNoSubscriber, evt.Topic)
+	}
 
 	var errs []error
 	for _, h := range handlers {
