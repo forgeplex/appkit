@@ -138,14 +138,14 @@ func (a *App) migrate(ctx context.Context) error {
 	if len(sets) == 0 {
 		return nil
 	}
-	if a.cfg.migrator == nil {
-		if !a.cfg.skipMigrations {
-			return fmt.Errorf("appkit: 有 %d 个迁移集待应用（如模块 %q 的 schema %q）但未注入迁移执行器："+
-				"注入 appkit.Migrator(pgmigrate.Runner(pool))，或以 appkit.SkipMigrations() 声明由进程外施加",
-				len(sets), sets[0].Module, sets[0].Schema)
-		}
+	if a.cfg.skipMigrations {
 		a.cfg.logger.Info("appkit: 跳过迁移（SkipMigrations）", "sets", len(sets))
 		return nil
+	}
+	if a.cfg.migrator == nil {
+		return fmt.Errorf("appkit: 有 %d 个迁移集待应用（如模块 %q 的 schema %q）但未注入迁移执行器："+
+			"注入 appkit.Migrator(pgmigrate.Runner(pool))，或以 appkit.SkipMigrations() 声明由进程外施加",
+			len(sets), sets[0].Module, sets[0].Schema)
 	}
 	if err := a.cfg.migrator(ctx, sets); err != nil {
 		return fmt.Errorf("appkit: 迁移失败: %w", err)
