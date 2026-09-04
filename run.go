@@ -13,6 +13,8 @@ import (
 	"sort"
 	"syscall"
 	"time"
+
+	"github.com/forgeplex/appkit/health"
 )
 
 // Run 启动应用并阻塞到 ctx 取消、收到 SIGINT/SIGTERM 或 HTTP 服务异常退出，
