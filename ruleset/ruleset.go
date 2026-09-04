@@ -27,10 +27,11 @@ var tmpls = template.Must(template.ParseFS(tmplFS, "templates/*.tmpl"))
 
 // Config 是渲染规则集所需的域仓库信息。
 type Config struct {
-	Domain    string // 业务包名 = Postgres schema，须匹配 ^[a-z][a-z0-9]*$
-	Module    string // 域仓库 module path
-	Contracts string // 合约 module path，可空
-	Version   string // appkit CLI 版本，写入生成头；空则记为 (devel)
+	Domain      string // 业务包名 = Postgres schema，须匹配 ^[a-z][a-z0-9]*$
+	Module      string // 域仓库 module path
+	Contracts   string // 合约 module path，可空
+	Version     string // appkit CLI 版本，写入生成头；空则记为 (devel)
+	WorkflowRef string // domain-ci.yml 的完整 40 位 commit SHA
 }
 
 // 渲染目标：模板名 → 相对仓库根的落盘路径（恒用斜杠）。
@@ -48,6 +49,16 @@ var reservedDomains = map[string]bool{
 }
 
 func (c Config) validate() error {
+	if err := c.validateRepository(); err != nil {
+		return err
+	}
+	if !commitSHARE.MatchString(c.WorkflowRef) {
+		return fmt.Errorf("workflow ref %q 不合法：须为完整 40 位 commit SHA", c.WorkflowRef)
+	}
+	return nil
+}
+
+func (c Config) validateRepository() error {
 	if !domainRE.MatchString(c.Domain) {
 		return fmt.Errorf("domain %q 不合法：须匹配 ^[a-z][a-z0-9]*$", c.Domain)
 	}
@@ -63,11 +74,18 @@ func (c Config) validate() error {
 // Render 渲染全部规则集文件；key 是相对仓库根的落盘路径，
 // 每个文件均以生成头开始（含 appkit 版本，CI 借此发现版本漂移）。
 func Render(cfg Config) (map[string][]byte, error) {
-	if err := cfg.validate(); err != nil {
-		return nil, err
-	}
 	if cfg.Version == "" {
 		cfg.Version = "(devel)"
+	}
+	if cfg.WorkflowRef == "" {
+		workflowRef, err := ResolveWorkflowRef(cfg.Version)
+		if err != nil {
+			return nil, err
+		}
+		cfg.WorkflowRef = workflowRef
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 	out := make(map[string][]byte, len(targets))
 	for _, t := range targets {

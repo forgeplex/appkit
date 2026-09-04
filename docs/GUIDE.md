@@ -868,7 +868,8 @@ if ip := callctx.ClientIP(ctx); ip.IsValid() {
 ```yaml
 jobs:
   ci:
-    uses: forgeplex/appkit/.github/workflows/domain-ci.yml@main
+    # appkit v0.7.2；sync 从该版本 module provenance 解析完整 commit。
+    uses: forgeplex/appkit/.github/workflows/domain-ci.yml@<40 位 commit SHA>
 ```
 
 这条流水线做：gofmt → vet → build → `test -race`（带 Postgres service）→
@@ -878,7 +879,10 @@ go-arch-lint** → `go mod tidy` 漂移检查。
 顺序不是随手排的：**先验规则集未漂移，再按规则集跑检查器**——反过来就可能在
 一份被改松的配置上跑出绿色。`appkit check` 本身也查规则集漂移（含配置文件被删），
 所以本地 `make check` 就能拦下"把规则改松让检查变绿"这条路，不必等 CI。
-配合 branch protection，**约束在 CI 不可绕过**；`//nolint` 必须写理由（nolintlint）。
+reusable workflow 固定到域仓库 appkit 版本对应的完整 commit，不追随 `main`；
+GitHub Actions 本身固定完整 commit SHA，workflow 默认只有 `contents: read`。
+配合 main/release tag protection，**约束在 CI 不可绕过**；`//nolint` 必须写理由（nolintlint）。
+仓库 ruleset、紧急升级和回滚步骤见 [CI_SECURITY.md](CI_SECURITY.md)。
 
 两个检查器的版本由 `ruleset.GolangciLintVersion` / `ruleset.ArchLintVersion` 钉死，
 域仓库 `make lint` 从同一处渲染——本地跑的和 CI 跑的是同一个二进制，

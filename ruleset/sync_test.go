@@ -71,7 +71,8 @@ func TestSync_写入与Check通过(t *testing.T) {
 	dir := t.TempDir()
 	writeAppkitYML(t, dir, validAppkitYML)
 
-	paths, err := ruleset.Sync(dir, "v0.1.0")
+	const workflowRef = "0123456789abcdef0123456789abcdef01234567"
+	paths, err := ruleset.SyncPinned(dir, "v0.1.0", workflowRef)
 	if err != nil {
 		t.Fatalf("Sync: %v", err)
 	}
@@ -92,19 +93,19 @@ func TestSync_写入与Check通过(t *testing.T) {
 		}
 	}
 
-	if err := ruleset.Check(dir, "v0.1.0"); err != nil {
+	if err := ruleset.CheckPinned(dir, "v0.1.0", workflowRef); err != nil {
 		t.Errorf("刚写入即漂移: %v", err)
 	}
 	// 版本变化 = 生成头变化 = 漂移。
-	if err := ruleset.Check(dir, "v0.2.0"); err == nil {
+	if err := ruleset.CheckPinned(dir, "v0.2.0", workflowRef); err == nil {
 		t.Error("版本升级后 Check 应报漂移")
 	}
 
 	// Sync 幂等：重跑后内容不变。
-	if _, err := ruleset.Sync(dir, "v0.1.0"); err != nil {
+	if _, err := ruleset.SyncPinned(dir, "v0.1.0", workflowRef); err != nil {
 		t.Fatalf("重跑 Sync: %v", err)
 	}
-	if err := ruleset.Check(dir, "v0.1.0"); err != nil {
+	if err := ruleset.CheckPinned(dir, "v0.1.0", workflowRef); err != nil {
 		t.Errorf("重跑 Sync 后漂移: %v", err)
 	}
 }
@@ -146,11 +147,12 @@ func TestCheck_漂移检测(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
 			writeAppkitYML(t, dir, validAppkitYML)
-			if _, err := ruleset.Sync(dir, "v0.1.0"); err != nil {
+			const workflowRef = "0123456789abcdef0123456789abcdef01234567"
+			if _, err := ruleset.SyncPinned(dir, "v0.1.0", workflowRef); err != nil {
 				t.Fatal(err)
 			}
 			tt.tamper(t, dir)
-			err := ruleset.Check(dir, "v0.1.0")
+			err := ruleset.CheckPinned(dir, "v0.1.0", workflowRef)
 			if err == nil {
 				t.Fatal("want 漂移错误, got nil")
 			}
@@ -164,7 +166,7 @@ func TestCheck_漂移检测(t *testing.T) {
 }
 
 func TestCheck_缺少配置文件(t *testing.T) {
-	err := ruleset.Check(t.TempDir(), "v0.1.0")
+	err := ruleset.CheckPinned(t.TempDir(), "v0.1.0", "0123456789abcdef0123456789abcdef01234567")
 	if err == nil || !strings.Contains(err.Error(), ".appkit.yml") {
 		t.Errorf("应报 .appkit.yml 缺失, got %v", err)
 	}
