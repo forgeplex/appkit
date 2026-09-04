@@ -8,9 +8,9 @@
 | 路径 | 角色 |
 |---|---|
 | `greetapi/` | 契约包：`contract.yaml` + `codes.yaml` 是事实源，`appkit gen` 生成接口/DTO/wrapper/client/server/openapi 全套（`*.gen.go` 禁手改）。真实项目中这套文件住在独立合约仓库（psp-contracts）、以独立 module 发版，提供方与消费方都只 import 它 |
-| `greet/` | 提供方模块：`ProvideContract` + `greetapi.WrapService` 把实现包进契约边界进 Registry，`Mount GET /greet/{name}`；handler 里演示 apperr → `httpserver.WriteError` 统一出口 |
-| `gateway/` | 消费方模块：`Resolve[greetapi.Service]` 拿到已包边界的实现（本地 wrapper 或生成 client），handler 裸调即可，`Mount GET /hello/{name}` |
-| `main.go` | 组合根：flag `-target` → `config.Load` → `telemetry.Init` → `appkit.New(...).Run`；`appkit.Remote` 注册远程兜底 |
+| `greet/` | 提供方模块：`ProvideContract` + `greetapi.WrapService` 把实现包进契约边界进 Registry，`MountPublic GET /greet/{name}`；handler 里演示 apperr → `httpserver.WriteError` 统一出口 |
+| `gateway/` | 消费方模块：`Resolve[greetapi.Service]` 拿到已包边界的实现（本地 wrapper 或生成 client），handler 裸调即可，`MountPublic GET /hello/{name}` |
+| `main.go` | 组合根：flag `-target` → `config.Load` → `telemetry.Init` → `appkit.New(...).Run`；`appkit.Remote` 注册远程兜底；显式 `SecurityDisabled` 仅用于这个本地示例 |
 
 ## 跑法
 

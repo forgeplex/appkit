@@ -15,6 +15,19 @@
 4. **配置与部署**（`config/*.yaml`、`deploy/`）：同一镜像不同 `-target`
    即得单体 ↔ 微服务切换，部署形态是启动参数不是架构决策。
 
+## HTTP 身份边界
+
+- 每个监听进程必须显式配置 `security.mode`；bootstrap 仅在 `env=dev` 时允许
+  `disabled`，不能把它作为 staging/prod 的“临时内网方案”；
+- mode 是**每个部署实例**的暴露面，不是编译时常量：用户入口选
+  `user_facing`，服务入口最终选 `internal_service`，同时承载两类入口才选
+  `mixed`；
+- 当前 bootstrap 阶段只有 `user_facing` 可在配好 `AuthnPublicKey` 与
+  `AuthnIssuer` 后启动；服务 JWT 验证器落地前，`internal_service/mixed`
+  会有意 fail closed；
+- `/healthz`、`/readyz` 是隐式公开探针；pprof 不得挂在 `user_facing`，在
+  `internal_service/mixed` 下也必须经过已验证的服务身份。
+
 ## 跨域协作规则（编译器 + 运行时守卫强制）
 
 - 域仓库互不 require；跨域调用只依赖合约 module 的接口类型；

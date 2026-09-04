@@ -69,15 +69,16 @@ func TestDomainScaffold(t *testing.T) {
 
 	t.Run("运行配置与最小模式", func(t *testing.T) {
 		mustContain(t, "config/dev.yaml", readFile(t, dir, "config/dev.yaml"),
+			"security:", "mode: disabled", "env=dev", "staging/prod",
 			"database:", `url: ""`, "LEDGERD_DATABASE__URL", "fail closed", "debug:", "pprof: false")
 		// 总线/迁移器/遥测的装配已收进 bootstrap（生成物里不再出现，
 		// 也就改不坏）；main 只声明最小模式装什么。
 		mustContain(t, "main.go", readFile(t, dir, "cmd/ledgerd/main.go"),
-			"appkit.ModuleFunc(", "最小模式", "Minimal: minimal")
+			"appkit.ModuleFunc(", "最小模式", "Minimal: minimal", "reg.MountPublic(")
 		mustContain(t, "Makefile", readFile(t, dir, "Makefile"),
 			"run-minimal:", "-minimal", "正常启动必须有 database.url")
 		mustContain(t, "module.go", readFile(t, dir, "internal/module/module.go"),
-			"outbox.NewRelay(", `reg.Worker("outbox-relay"`)
+			"outbox.NewRelay(", `reg.Worker("outbox-relay"`, "reg.MountPublic(")
 	})
 
 	t.Run("lint 与 CI 配置已物化", func(t *testing.T) {
@@ -137,7 +138,7 @@ func TestDomainScaffold(t *testing.T) {
 			`Schema = "ledger"`, "reg.Migrations(Schema", "reg.Health(", "appkit.Provide(",
 			// 权限码声明从第一天就在骨架里：目录由各域自声明、框架汇总，
 			// 组合根不再手抄全目录。
-			"reg.Permissions(", `"ledger:read"`)
+			"reg.Permissions(", `"ledger:read"`, "reg.MountPublic(", "reg.MountPermission(")
 		sqlcYml := readFile(t, dir, "sqlc.yaml")
 		mustContain(t, "sqlc.yaml", sqlcYml,
 			"internal/postgres/sqlc", `schema: "db/migrations"`,
@@ -153,7 +154,8 @@ func TestDomainScaffold(t *testing.T) {
 		mustContain(t, "README.md", readFile(t, dir, "README.md"),
 			"appkit sync", "appkit dev", "make migrate", "MIGRATION_DRIFT",
 			"make schema", "db/SCHEMA.md",
-			"make lint")
+			"make lint", "security.mode: disabled", "user_facing",
+			"internal_service/mixed", "fail closed")
 		// 迁移参与 sha256 校验：换行必须跨平台一致，否则 Windows 上 checkout
 		// 就会触发误报的 MIGRATION_DRIFT。
 		mustContain(t, ".gitattributes", readFile(t, dir, ".gitattributes"),
@@ -165,6 +167,10 @@ func TestDomainScaffold(t *testing.T) {
 		// 否则代理会照旧手写 goroutine / ticker / 埋点。
 		mustContain(t, "AGENTS.md", readFile(t, dir, "AGENTS.md"),
 			"reg.Worker(", "job.Every(", "callctx.From(ctx)",
+			// 根路由必须显式分类；裸 Mount 在严格模式会拒绝启动。
+			"security.mode", "reg.MountPublic", "reg.MountAuthenticated",
+			"reg.MountPermission", "reg.MountInternalService",
+			"AuthnPublicKey", "AuthnIssuer", "internal_service/mixed", "fail closed",
 			// 出站 HTTP 的正解是装 Transport，不是逐调用点写 Inject——
 			// 规程指错机制，代理就会照着摊到每个调用点的那种写法写。
 			"callctx.Transport",
@@ -188,6 +194,13 @@ func TestDomainScaffold(t *testing.T) {
 		if agents := readFile(t, dir, "AGENTS.md"); strings.Contains(agents, "没有机检") ||
 			!strings.Contains(agents, "appkit-lint") {
 			t.Error("AGENTS.md 对金额规则的强制力描述与现状不符（appkit-lint 已在 make lint 与 CI）")
+		}
+		// 生成的根路由不依赖 dev 的 disabled 逃生舱：将来切严格模式也必须
+		// 已有明确分类。只检查 Go 生成物，AGENTS 中会有禁止裸 Mount 的说明。
+		for _, rel := range []string{"cmd/ledgerd/main.go", "internal/module/module.go"} {
+			if src := readFile(t, dir, rel); strings.Contains(src, "reg.Mount(") {
+				t.Errorf("%s 不得生成未分类的 reg.Mount", rel)
+			}
 		}
 	})
 }
@@ -272,8 +285,11 @@ func TestDomainPartitionedScaffold(t *testing.T) {
 			"outbox.Publish(ctx, pgtx.From(ctx, p.pool), schema, evt)",
 			`reg.Worker("outbox-relay/"+tenant`,
 			// 权限码是应用级目录，分区形态同样声明。
-			"reg.Permissions(", `"rbac:read"`,
+			"reg.Permissions(", `"rbac:read"`, "reg.MountPublic(", "reg.MountPermission(",
 		)
+		if strings.Contains(mod, "reg.Mount(") {
+			t.Fatal("分区域域不得生成未分类的 reg.Mount")
+		}
 		// 单形态的痕迹不得出现。
 		for _, gone := range []string{`Schema = "rbac"`, "pgtx.New(m.opts.Pool)", "outbox.NewPublisher("} {
 			if strings.Contains(mod, gone) {
@@ -347,8 +363,11 @@ func TestDomainTenantScaffold(t *testing.T) {
 			// Setup 期守卫必须在：迁移先于 Setup 应用，这里看到的是终态。
 			"pgtx.VerifyTenantRLS(ctx, m.opts.Pool, Schema)",
 			// 权限码声明与其他形态一致（目录是应用级的）。
-			"reg.Permissions(", `"crm:read"`,
+			"reg.Permissions(", `"crm:read"`, "reg.MountPublic(", "reg.MountPermission(",
 		)
+		if strings.Contains(mod, "reg.Mount(") {
+			t.Fatal("租户域不得生成未分类的 reg.Mount")
+		}
 		// 单形态的痕迹不得出现。
 		for _, gone := range []string{"pgtx.New(m.opts.Pool)", "pgtx.NewRouted("} {
 			if strings.Contains(mod, gone) {

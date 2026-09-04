@@ -45,7 +45,7 @@ func main() {
 func minimal(bootstrap.Deps) ([]appkit.Module, error) {
 	return []appkit.Module{
 		appkit.ModuleFunc("{{.Name}}", func(reg *appkit.Registry) error {
-			reg.Mount({{.Name}}http.PingPattern, http.HandlerFunc(
+			reg.MountPublic({{.Name}}http.PingPattern, http.HandlerFunc(
 				func(w http.ResponseWriter, _ *http.Request) {
 					_, _ = w.Write([]byte("pong (最小模式)\n"))
 				}))
