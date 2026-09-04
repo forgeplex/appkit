@@ -48,11 +48,13 @@ func TestSplitTargetRejectsImplicitDirectBus(t *testing.T) {
 }
 
 func TestSplitTargetDirectBusRequiresExplicitOptIn(t *testing.T) {
-	err := Run(context.Background(), Options{
-		Service:                    "bpsplitallow",
-		Modules:                    func(Deps) ([]appkit.Module, error) { return nil, nil },
-		AllowDirectBusForSplit: true,
-	}, RunOptions{Target: "gateway", ConfigFile: filepath.Join(t.TempDir(), "absent.yaml")})
+	options := Options{
+		Service: "bpsplitallow",
+		Modules: func(Deps) ([]appkit.Module, error) { return nil, nil },
+	}
+	options.AllowDirectBusForSplit = true
+	err := Run(context.Background(), options,
+		RunOptions{Target: "gateway", ConfigFile: filepath.Join(t.TempDir(), "absent.yaml")})
 	if err == nil || !strings.Contains(err.Error(), "未配置 database.url") {
 		t.Fatalf("显式 opt-in 应越过 Bus 守卫并继续正常校验，实际 %v", err)
 	}
