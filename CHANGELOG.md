@@ -2,6 +2,22 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.9.3（2026-09-06）
+
+v0.9.3 — optional sqlc schema snapshots and nested transaction isolation
+
+This patch adds an opt-in schema snapshot workflow for reusable domains and closes a nested-transaction isolation gap. It retains all v0.9.2 references, service authentication, strict HTTP boundaries, and version-pinned workflow behavior.
+
+- Add appkit schema-tool to install a self-contained generator into domain repositories. It replays trusted migrations in a newly created scratch database and produces db/schema.sql plus db/schema.lock.json for sqlc and review. The generator offers offline source checks and database replay checks; snapshots are not deployment backups.
+- Keep migration-based sqlc input as the scaffold default. Domains adopt snapshots explicitly. Existing multi-entry, multi-input, non-PostgreSQL, and legacy sqlc configurations are not subject to snapshot-only restrictions before adoption. Snapshot adoption remains strict, including YAML aliases, merges, relative paths, and partial artifact removal.
+- Share sqlc configuration validation between command-line checks and adopted-repository tests. Database and offline checks reject unsupported or reverted inputs before connecting; first generation still supports the documented migration-to-snapshot bootstrap.
+- Bind each pgtx.Do transaction scope to its exact transaction/savepoint handle, tenant mode and ID, read-all setting, and resolved route schema. Nested calls that rebind scope or substitute a transaction handle are rejected before opening a savepoint or running the callback. Same-scope nesting across pgtx.Transactor instances remains supported.
+- Preserve public API signatures. Security behavior is intentionally stricter: callers that manually inject a raw pgx.Tx with tx.With and then invoke pgtx.Do must instead let the outermost pgtx.Do create the transaction and pass its callback context to nested calls. Change tenant or route only between separate transactions.
+
+Validated with framework checks, lint-module tests, materialized-rule integration tests, whole-repository race tests on disposable PostgreSQL 18.6, four scaffold adoption/compilation paths against published v0.9.2, and the public API compatibility gate. No production or existing development database was migrated.
+
+Upgrade AppKit and appkit-lint together to v0.9.3 and run the version-pinned appkit sync. Existing domains do not need schema changes to upgrade. Install/adopt schema snapshots only where desired; the installer does not rewrite existing domain dependencies, migrations, sqlc configuration, or Makefiles.
+
 ## v0.9.2（2026-09-05）
 
 v0.9.2 — optional resource references for reusable domains
