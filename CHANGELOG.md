@@ -2,6 +2,47 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.9.0（2026-09-05）
+
+模块复用、Agent 工作流与显式安全边界
+
+面向多个独立 Go 项目复用模块，以及 Agent 可审查、可恢复的代码生成流程。
+本版整合 v0.7.2 之后的框架功能与安全修复；v0.8.0 历史版本号不复用。
+
+新增与修复：
+
+- 按 Go 类型与名称精确绑定实例；保留无名绑定，不跨名称回退。实例名称不是租户或授权边界。
+- plan/apply/replay、输入输出快照、冲突检查和恢复日志；支持规则、契约、事件、错误码、wrapper、脚手架与 schema 文档。
+- 独立 Partition 与 TenantID、多签发方用户验签、分区＋行级隔离、显式只读跨租户及五种脚手架。
+- 分区域 schema 逻辑模板、目录成员 guard、契约生成漂移与保守模型兼容检查。
+- 不可变 workflow SHA、显式离线 -workflow-ref；自动来源解析支持取消，在工作区锁外执行，不把下游 HEAD 当作框架来源。
+- 修复 SkipMigrations 配置传递，接入受管 Broker 的启动、停机排空与失败关闭；CI 的 Action、工具与数据库镜像固定来源。
+- 修复 CHANGELOG 生成器的 shell 变量边界，确保不同 shell 下保留完整版本标题，并增加真实 make/tag 回归。
+
+升级必读：
+
+- 默认启动行为改变。App.Run 必须声明 Security；bootstrap 必须配置 security.mode。严格模式拒绝旧 Mount 的未分类根路由，须按实际语义分类，不能把业务端点统一改为 Public。
+- 严格 HTTP 边界不再信任外部 Actor/ServicePrincipal、身份上下文及 unsigned partition/tenant/caller 头，须由已验证凭证重建身份。
+- 无数据库不再隐式降级；零依赖试跑仅允许 dev 显式 -minimal。
+- 拆分 target 默认拒绝隐式 DirectBus；须通过 NewBus 配置外部 Broker，或用 AllowDirectBusForSplit 明确承担仅进程内投递的例外。无订阅者返回 ErrNoSubscriber，outbox 保留事件重试，不再把无人消费确认为投递成功。
+- 曾借 TenantID 路由 schema 的项目须迁至 Partition，并检查调用方、事件生产/消费与组合根映射。
+- 旧 RLS 必须新增迁移：先用 TenantScopeSQL 刷新上下文函数，再为各表更新 TenantPolicySQL 两条策略；分区域使用对应 Bare 版本，勿改历史迁移。用非 superuser/BYPASSRLS 角色验收。
+
+已知边界：
+
+- 标准 service JWT 验证器尚未交付；bootstrap 的 internal_service/mixed 仍拒绝启动，不宣称已完成生产级服务间认证。
+- 跨租户能力只显式开放读取，须事先授权、在外层事务前设置且不跨契约/事件传播；没有“写全部”模式。
+- schema 规划会在临时数据库执行可信 SQL，不是沙箱；逻辑模板不检查运行分区。apply 不执行业务迁移、部署或下游升级。
+- 文件提交可恢复，但不是对所有外部读者原子可见的事务；计划摘要只绑定选定输入输出，不是完整仓库证明或制品签名。
+- 公开 API 相对 v0.7.2 的 apidiff 零 incompatible，仅证明声明兼容，不代表旧应用无需调整即可启动。
+
+验收：本地 make check、PostgreSQL 18.6 全仓 race、lint module、真实规则 E2E、五形态编译/check、真实 CLI 离线与超时回归均通过。四业务源码副本均编译及真实数据库 race 通过；仅 ledger 两项性能播种 skip。业务仓库原有 go.sum/规则漂移单列，不冒充所有业务工程门禁或生产升级已完成。
+
+详细说明：
+- [升级清单](https://github.com/forgeplex/appkit/blob/v0.9.0/docs/RELEASE_CANDIDATE.md)
+- [Agent 工作流](https://github.com/forgeplex/appkit/blob/v0.9.0/docs/AGENT_WORKFLOW.md)
+- [验收范围与限制](https://github.com/forgeplex/appkit/blob/v0.9.0/docs/FRAMEWORK_ACCEPTANCE.md)
+
 ## v0.7.2（2026-09-03）
 
 page 包：列表端点的分页机制件
