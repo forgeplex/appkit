@@ -4,12 +4,17 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgeplex/appkit"
@@ -25,7 +30,7 @@ import (
 // 为什么不用 pg_dump：它要求客户端版本 ≥ 服务端（CI runner 上的 client 可能低于
 // postgres:18），要额外装二进制，而关系图需要的外键结构无论如何都得查 catalog。
 // CLI 本来就已经链接了 pgx，这条路零新依赖。
-func Introspect(ctx context.Context, o Options) (Schema, error) {
+func Introspect(ctx context.Context, o Options) (result Schema, resultErr error) {
 	if o.DSN == "" {
 		return Schema{}, fmt.Errorf("需要一个 Postgres 连接串：设 TEST_DATABASE_URL 或传 -dsn" +
 			"（迁移会应用到由它派生的一次性临时库，不会动这个库本身）")
@@ -33,53 +38,150 @@ func Introspect(ctx context.Context, o Options) (Schema, error) {
 	if o.Schema == "" {
 		return Schema{}, fmt.Errorf("缺少 schema 名（.appkit.yml 的 domain）")
 	}
-	migDir := filepath.Join(o.Dir, filepath.FromSlash(migrationsDir))
-	if _, err := os.Stat(migDir); err != nil {
-		return Schema{}, fmt.Errorf("找不到迁移目录 %s: %w", migrationsDir, err)
+	if !schemaNameRE.MatchString(o.Schema) {
+		return Schema{}, fmt.Errorf("schema 名须匹配 %s", schemaNameRE)
+	}
+	source := o.Migrations
+	if source == nil {
+		migDir := filepath.Join(o.Dir, filepath.FromSlash(migrationsDir))
+		if info, err := os.Stat(migDir); err != nil {
+			return Schema{}, fmt.Errorf("找不到迁移目录 %s: %w", migrationsDir, err)
+		} else if !info.IsDir() {
+			return Schema{}, fmt.Errorf("%s 不是迁移目录", migrationsDir)
+		}
+		source = os.DirFS(migDir)
+	}
+	if _, err := fs.ReadDir(source, "."); err != nil {
+		return Schema{}, fmt.Errorf("读取迁移快照: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return Schema{}, err
 	}
 
 	cfg, err := pgxpool.ParseConfig(o.DSN)
 	if err != nil {
-		return Schema{}, fmt.Errorf("解析连接串: %w", err)
+		return Schema{}, connectionFailure("解析连接串", err)
 	}
 	admin, err := pgx.ConnectConfig(ctx, cfg.ConnConfig.Copy())
 	if err != nil {
-		return Schema{}, fmt.Errorf("连接数据库: %w", err)
+		return Schema{}, connectionFailure("连接数据库", err)
 	}
-	defer func() { _ = admin.Close(context.WithoutCancel(ctx)) }()
+	defer func() { resultErr = errors.Join(resultErr, closeAdmin(ctx, admin)) }()
 
 	tmp, err := tempDBName()
 	if err != nil {
 		return Schema{}, err
 	}
 	quoted := pgx.Identifier{tmp}.Sanitize()
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+quoted); err != nil {
-		return Schema{}, fmt.Errorf("创建临时库 %s: %w", tmp, err)
-	}
-	// 剥离取消信号：临时库必须尽力删掉，否则 Ctrl-C 会在服务器上留下垃圾库。
+	// CREATE may complete on the server even when the caller loses the response.
+	// Attempt cleanup for that uncertain outcome too, but never drop a database
+	// whose CREATE explicitly failed because that name was already present.
+	cleanup := true
 	defer func() {
-		_, _ = admin.Exec(context.WithoutCancel(ctx), "DROP DATABASE IF EXISTS "+quoted+" WITH (FORCE)")
+		if cleanup {
+			resultErr = errors.Join(resultErr, cleanupDatabase(ctx, tmp, func(cctx context.Context) (scratchAdmin, error) {
+				return pgx.ConnectConfig(cctx, cfg.ConnConfig.Copy())
+			}))
+		}
 	}()
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+quoted); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42P04" {
+			cleanup = false
+		}
+		return Schema{}, connectionFailure("创建临时库 "+tmp, err)
+	}
 
 	tmpCfg := cfg.Copy()
 	tmpCfg.ConnConfig.Database = tmp
 	pool, err := pgxpool.NewWithConfig(ctx, tmpCfg)
 	if err != nil {
-		return Schema{}, fmt.Errorf("连接临时库: %w", err)
+		return Schema{}, connectionFailure("连接临时库 "+tmp, err)
 	}
 	defer pool.Close()
 
 	// 复用生产的迁移 runner：产出因此是服务启动时同一条代码路径派生的，
 	// 而不是另写一遍 SQL 解析——那种副本迟早会和真实行为分叉。
-	set := appkit.MigrationSet{Schema: o.Schema, FS: os.DirFS(migDir), Module: o.Schema}
+	set := appkit.MigrationSet{Schema: o.Schema, FS: source, Module: o.Schema}
 	if err := pgmigrate.Runner(pool)(ctx, []appkit.MigrationSet{set}); err != nil {
-		return Schema{}, fmt.Errorf("应用 %s: %w", migrationsDir, err)
+		return Schema{}, fmt.Errorf("应用 %s: %w", migrationsDir, redactConnectionFailure("连接临时库 "+tmp, err))
 	}
-	return readCatalog(ctx, pool, o.Schema)
+	result, resultErr = readCatalog(ctx, pool, o.Schema)
+	resultErr = redactConnectionFailure("读取临时库 "+tmp+" 的结构", resultErr)
+	result.LogicalTemplate = o.Partitioned
+	return result, resultErr
+}
+
+var schemaNameRE = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
+
+const scratchCleanupTimeout = 5 * time.Second
+
+type scratchAdmin interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+	Close(context.Context) error
+}
+
+// cleanupDatabase gets a fresh connection: cancellation may have closed the
+// original admin connection. Cleanup ignores caller cancellation but has its own
+// fixed budget. Failures retain the generated database name for manual recovery.
+func cleanupDatabase(ctx context.Context, name string, connect func(context.Context) (scratchAdmin, error)) (resultErr error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scratchCleanupTimeout)
+	defer cancel()
+	admin, err := connect(ctx)
+	if err != nil {
+		return connectionFailure("清理临时库 "+name+"：连接管理库失败", err)
+	}
+	defer func() {
+		if err := admin.Close(ctx); err != nil {
+			resultErr = errors.Join(resultErr, connectionFailure("清理临时库 "+name+"：关闭管理连接失败", err))
+		}
+	}()
+	if _, err := admin.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
+		return connectionFailure("清理临时库 "+name+" 失败（可能需要人工删除）", err)
+	}
+	return nil
+}
+
+func closeAdmin(ctx context.Context, admin scratchAdmin) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), scratchCleanupTimeout)
+	defer cancel()
+	if err := admin.Close(ctx); err != nil {
+		return connectionFailure("关闭管理连接失败", err)
+	}
+	return nil
+}
+
+// Driver parse/connect errors can embed a complete DSN and password. Only safe
+// operation metadata, SQLSTATE and cancellation identity leave this boundary.
+func connectionFailure(operation string, err error) error {
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("%s: %w", operation, context.Canceled)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s: %w", operation, context.DeadlineExceeded)
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return fmt.Errorf("%s: PostgreSQL SQLSTATE %s", operation, pgErr.Code)
+	}
+	return fmt.Errorf("%s：失败（连接详情已隐藏）", operation)
+}
+
+// Pools connect lazily and can reconnect between queries. A successful admin
+// connection therefore does not make wrapped migration/catalog errors safe.
+// Strip driver connection details anywhere in their chains, while preserving
+// ordinary SQL diagnostics (including migration filenames and SQLSTATE).
+func redactConnectionFailure(operation string, err error) error {
+	var connectErr *pgconn.ConnectError
+	var parseErr *pgconn.ParseConfigError
+	if errors.As(err, &connectErr) || errors.As(err, &parseErr) {
+		return connectionFailure(operation, err)
+	}
+	return err
 }
 
 func tempDBName() (string, error) {
-	var b [6]byte
+	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", fmt.Errorf("生成临时库名: %w", err)
 	}

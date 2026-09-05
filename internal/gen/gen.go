@@ -22,11 +22,23 @@ var rePackage = regexp.MustCompile(`^[a-z][a-z0-9]*$`)
 
 // writeGo 格式化并写出生成的 Go 源码。格式化失败说明生成器自身有 bug。
 func writeGo(outPath string, src []byte) error {
+	formatted, err := formatGo(outPath, src)
+	if err != nil {
+		return err
+	}
+	return writeGenerated(outPath, formatted)
+}
+
+func formatGo(sourceName string, src []byte) ([]byte, error) {
 	formatted, err := format.Source(src)
 	if err != nil {
-		return fmt.Errorf("格式化生成代码失败（生成器 bug，目标 %s）: %w", outPath, err)
+		return nil, fmt.Errorf("格式化生成代码失败（生成器 bug，目标 %s）: %w", sourceName, err)
 	}
-	if err := os.WriteFile(outPath, formatted, 0o644); err != nil {
+	return formatted, nil
+}
+
+func writeGenerated(outPath string, data []byte) error {
+	if err := os.WriteFile(outPath, data, 0o644); err != nil {
 		return fmt.Errorf("写出 %s: %w", outPath, err)
 	}
 	return nil

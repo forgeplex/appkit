@@ -14,8 +14,8 @@ import (
 
 // Registry 收集模块对系统的全部贡献。Register 阶段只声明，装配阶段统一解析。
 type Registry struct {
-	bindings map[reflect.Type]*binding
-	remotes  map[reflect.Type]*binding
+	bindings map[bindingKey]*binding
+	remotes  map[bindingKey]*binding
 
 	mounts     []mountReg
 	setups     []namedHook
@@ -39,7 +39,20 @@ type Registry struct {
 	// current 是正在 Register/Setup 的模块名，用于归属与报错。
 	current string
 	// resolving 是解析栈，用于循环依赖检测与报错路径。
-	resolving []reflect.Type
+	resolving []bindingKey
+}
+
+// 空 name 保留给原有的按类型绑定；具名绑定与其完全隔离。
+type bindingKey struct {
+	typ  reflect.Type
+	name string
+}
+
+func (k bindingKey) String() string {
+	if k.name == "" {
+		return k.typ.String()
+	}
+	return fmt.Sprintf("%s[%q]", k.typ, k.name)
 }
 
 type binding struct {
@@ -92,8 +105,8 @@ type ConsumerReg struct {
 
 func newRegistry() *Registry {
 	return &Registry{
-		bindings:    make(map[reflect.Type]*binding),
-		remotes:     make(map[reflect.Type]*binding),
+		bindings:    make(map[bindingKey]*binding),
+		remotes:     make(map[bindingKey]*binding),
 		health:      health.NewRegistry(),
 		startStages: make(map[string]int),
 		workerErr:   make(chan error, 1),
@@ -157,11 +170,11 @@ func (r *Registry) Consumers() []ConsumerReg { return r.consumers }
 // Provide 注册 T 的本地实现（惰性构造，装配阶段统一实例化并缓存）。
 // 同一类型重复 Provide 在启动期报错——契约实现必须唯一。
 func Provide[T any](reg *Registry, ctor func(*Registry) (T, error)) {
-	t := typeOf[T]()
-	if prev, ok := reg.bindings[t]; ok {
-		panic(fmt.Sprintf("appkit: %s 已由模块 %q 提供，模块 %q 重复 Provide", t, prev.module, reg.current))
+	key := bindingKey{typ: typeOf[T]()}
+	if prev, ok := reg.bindings[key]; ok {
+		panic(fmt.Sprintf("appkit: %s 已由模块 %q 提供，模块 %q 重复 Provide", key, prev.module, reg.current))
 	}
-	reg.bindings[t] = &binding{
+	reg.bindings[key] = &binding{
 		module: reg.current,
 		ctor:   func(r *Registry) (any, error) { return ctor(r) },
 	}
@@ -194,7 +207,7 @@ func ProvideContract[T any](reg *Registry, ctor func(*Registry) (T, error), wrap
 // 都没有则报错并列出需要它的模块。循环依赖在这里被检测并报出完整路径。
 func Resolve[T any](reg *Registry) (T, error) {
 	var zero T
-	v, err := reg.resolve(typeOf[T]())
+	v, err := reg.resolve(bindingKey{typ: typeOf[T]()})
 	if err != nil {
 		return zero, err
 	}
@@ -211,52 +224,63 @@ func MustResolve[T any](reg *Registry) T {
 	return v
 }
 
-func (r *Registry) resolve(t reflect.Type) (any, error) {
-	b, ok := r.bindings[t]
+func (r *Registry) resolve(key bindingKey) (any, error) {
+	b, ok := r.bindings[key]
 	if !ok {
-		b, ok = r.remotes[t]
+		b, ok = r.remotes[key]
 	}
 	if !ok {
-		return nil, fmt.Errorf("appkit: 没有 %s 的实现（模块 %q 需要它）：目标模块不在 -target 集内且未注册 Remote 绑定", t, r.current)
+		if key.name != "" {
+			return nil, fmt.Errorf("appkit: 没有 %s 的实现（模块 %q 需要它）：未注册匹配的 ProvideNamed 或 RemoteNamed 绑定（不会回退到无名绑定）", key, r.current)
+		}
+		return nil, fmt.Errorf("appkit: 没有 %s 的实现（模块 %q 需要它）：目标模块不在 -target 集内且未注册 Remote 绑定", key, r.current)
 	}
 	if b.resolved {
 		return b.value, nil
 	}
 	if b.inflight {
-		return nil, fmt.Errorf("appkit: 依赖循环：%s", r.cyclePath(t))
+		return nil, fmt.Errorf("appkit: 依赖循环：%s", r.cyclePath(key))
 	}
 	b.inflight = true
-	r.resolving = append(r.resolving, t)
+	r.resolving = append(r.resolving, key)
 	v, err := b.ctor(r)
 	r.resolving = r.resolving[:len(r.resolving)-1]
 	b.inflight = false
 	if err != nil {
-		return nil, fmt.Errorf("appkit: 构造 %s（模块 %q）失败: %w", t, b.module, err)
+		return nil, fmt.Errorf("appkit: 构造 %s（模块 %q）失败: %w", key, b.module, err)
 	}
 	b.value = v
 	b.resolved = true
 	return v, nil
 }
 
-func (r *Registry) cyclePath(t reflect.Type) string {
+func (r *Registry) cyclePath(key bindingKey) string {
 	var b strings.Builder
 	for _, s := range r.resolving {
 		b.WriteString(s.String())
 		b.WriteString(" → ")
 	}
-	b.WriteString(t.String())
+	b.WriteString(key.String())
 	return b.String()
 }
 
 // resolveAll 强制实例化全部本地绑定：缺依赖、循环依赖、构造失败都在启动期暴露。
 func (r *Registry) resolveAll() error {
-	types := make([]reflect.Type, 0, len(r.bindings))
-	for t := range r.bindings {
-		types = append(types, t)
+	keys := make([]bindingKey, 0, len(r.bindings))
+	for key := range r.bindings {
+		keys = append(keys, key)
 	}
-	sort.Slice(types, func(i, j int) bool { return types[i].String() < types[j].String() })
-	for _, t := range types {
-		if _, err := r.resolve(t); err != nil {
+	sort.Slice(keys, func(i, j int) bool {
+		if a, b := keys[i].typ.String(), keys[j].typ.String(); a != b {
+			return a < b
+		}
+		if a, b := keys[i].typ.PkgPath(), keys[j].typ.PkgPath(); a != b {
+			return a < b
+		}
+		return keys[i].name < keys[j].name
+	})
+	for _, key := range keys {
+		if _, err := r.resolve(key); err != nil {
 			return err
 		}
 	}

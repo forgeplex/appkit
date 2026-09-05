@@ -15,7 +15,7 @@ func TestWithFromZeroValue(t *testing.T) {
 	if m := callctx.From(context.Background()); !m.IsZero() {
 		t.Fatalf("空 ctx 应返回零值: %+v", m)
 	}
-	want := callctx.Meta{RequestID: "r1", TenantID: "t1", Caller: "gateway"}
+	want := callctx.Meta{RequestID: "r1", Partition: "a", TenantID: "t1", Caller: "gateway"}
 	if got := callctx.From(callctx.With(context.Background(), want)); got != want {
 		t.Fatalf("取回不一致: %+v", got)
 	}
@@ -34,10 +34,15 @@ func TestMergeOnlyOverridesNonEmpty(t *testing.T) {
 	if got.RequestID != "r2" || got.Caller != "gateway" {
 		t.Fatalf("Merge 覆盖不符: %+v", got)
 	}
+	// 分区键与租户各走各的：补分区不动租户，补租户不动分区。
+	got = callctx.From(callctx.Merge(callctx.Merge(ctx, callctx.Meta{TenantID: "a1"}), callctx.Meta{Partition: "a"}))
+	if got.Partition != "a" || got.TenantID != "a1" {
+		t.Fatalf("分区与租户应各自保留: %+v", got)
+	}
 }
 
 func TestInjectExtractRoundTrip(t *testing.T) {
-	want := callctx.Meta{RequestID: "r1", TenantID: "acme", Caller: "gateway"}
+	want := callctx.Meta{RequestID: "r1", Partition: "a", TenantID: "acme", Caller: "gateway"}
 	h := http.Header{}
 	callctx.Inject(want, h.Set)
 	if got := callctx.Extract(h.Get); got != want {
@@ -52,7 +57,7 @@ func TestInjectExtractRoundTrip(t *testing.T) {
 }
 
 func TestMapRoundTripPreservesBusinessMeta(t *testing.T) {
-	want := callctx.Meta{RequestID: "r1", TenantID: "acme"}
+	want := callctx.Meta{RequestID: "r1", Partition: "a", TenantID: "acme"}
 	biz := map[string]string{"source": "csv-import"}
 	got := callctx.ToMap(want, biz)
 	if got["source"] != "csv-import" {
@@ -74,6 +79,10 @@ func TestLogAttrsSkipsEmpty(t *testing.T) {
 	attrs := callctx.Meta{RequestID: "r1", TenantID: "acme"}.LogAttrs()
 	if len(attrs) != 2 || attrs[0].Key != "request_id" || attrs[1].Key != "tenant_id" {
 		t.Fatalf("日志属性不符: %v", attrs)
+	}
+	attrs = callctx.Meta{Partition: "a", TenantID: "acme"}.LogAttrs()
+	if len(attrs) != 2 || attrs[0].Key != "partition" || attrs[1].Key != "tenant_id" {
+		t.Fatalf("分区日志属性不符: %v", attrs)
 	}
 }
 

@@ -7,6 +7,10 @@
 //  2. pgx / sqlc 只允许出现在 internal/postgres；
 //  3. internal/http 与 internal/inbox 不得 import internal/postgres——
 //     transport 必须经本包接口走业务逻辑，不能抄近路。
+//
+// 文件按功能名前置成簇：<功能>.go 放领域类型与不变量（纯函数），
+// <功能>_service.go 放该功能的用例（都挂在 *Service 上），<功能>_test.go
+// 是它的单测；本文件只留 Service 本体与跨功能公共件（AGENTS.md「文件怎么分」）。
 package {{.Name}}
 
 import (

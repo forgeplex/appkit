@@ -143,8 +143,29 @@ func NewRouted(pool *pgxpool.Pool, route func(ctx context.Context) (string, erro
 // 报错（见 TenantScopeSQL），而基础设施表（outbox/idem/audit——无
 // tenant_id 列、无策略）的操作不受影响。跨租户批处理逐租户 callctx.With
 // 后各开一次 Do；迁移文件内的跨租户回填在同一文件里先回填后挂策略。
+//
+// ctx 带 tx.WithReadAllTenants 标记时另落 GUC app.tenant_scope=all：
+// SELECT 放开全部租户的行（tenant_isolation_read_all 策略），写入仍只能
+// 落当前租户。标记须在最外层 Do 之前打——嵌套 Do 内切换模式报错，
+// 因为 SET LOCAL 的作用域是整个事务而不是 savepoint。
 func NewTenant(pool *pgxpool.Pool) *Transactor {
 	return &Transactor{pool: pool, tenant: true}
+}
+
+// NewRoutedTenant 构造「分区 + 行级」双层隔离的 Transactor：每次 Do 先按
+// route 把事务路由到分区 schema（NewRouted 的语义），再把租户身份落成
+// 事务级 GUC（NewTenant 的语义）。这是「运营平台 + 多商户、每个平台一套
+// 数据」的形态：分区键（callctx.Meta.Partition）决定落哪个 schema，
+// 租户（callctx.Meta.TenantID）决定看哪些行——两个维度各走各的字段，
+// route 读分区键、GUC 落租户，互不串。
+//
+// 分区内的迁移用无前缀 DDL（TenantScopeSQLBare / TenantPolicySQLBare），
+// 与分区域域的基础迁移同一纪律。
+func NewRoutedTenant(pool *pgxpool.Pool, route func(ctx context.Context) (string, error)) *Transactor {
+	if route == nil {
+		panic("pgtx: NewRoutedTenant 的 route 为 nil——不需要路由时用 NewTenant")
+	}
+	return &Transactor{pool: pool, route: &router{fn: route}, tenant: true}
 }
 
 // routeSchema 在事务开启后落位 search_path（嵌套幂等性见 beforeFn）。
@@ -175,19 +196,35 @@ func (t *Transactor) beforeFn(ctx context.Context, ptx pgx.Tx) error {
 	return t.setTenantGUC(ctx, ptx)
 }
 
+// scopeKey 记录本事务已落位的租户可见范围（true = 读全部），供嵌套 Do
+// 校验模式没有中途切换。
+type scopeKey struct{}
+
 // setTenantGUC 把 callctx 里的租户身份落成事务级 GUC（set_config 第三参
 // true：事务结束自动还原，连接归还池时不带走）。空租户不设——语义见
-// NewTenant。
+// NewTenant。ctx 带读全部标记时另落 app.tenant_scope=all。
+//
+// 嵌套 Do 内的模式必须与外层一致：SET LOCAL 的作用域是整个事务，
+// savepoint 里切成读全部、释放后外层剩下的查询也全放开了——这是静默
+// 扩权，直接拒绝。
 func (t *Transactor) setTenantGUC(ctx context.Context, ptx pgx.Tx) error {
 	if !t.tenant {
 		return nil
 	}
-	tenant := callctx.From(ctx).TenantID
-	if tenant == "" {
-		return nil
+	readAll := tx.ReadsAllTenants(ctx)
+	if applied, nested := ctx.Value(scopeKey{}).(bool); nested && applied != readAll {
+		return errors.New("pgtx: 嵌套事务内切换读全部租户模式——tx.WithReadAllTenants 必须在最外层 Do 之前打" +
+			"（SET LOCAL 延续到外层事务结束，savepoint 内切换等于静默扩权）")
 	}
-	if _, err := ptx.Exec(ctx, "SELECT set_config('"+tenantGUC+"', $1, true)", tenant); err != nil {
-		return fmt.Errorf("pgtx: 设置租户 GUC: %w", err)
+	if tenant := callctx.From(ctx).TenantID; tenant != "" {
+		if _, err := ptx.Exec(ctx, "SELECT set_config('"+tenantGUC+"', $1, true)", tenant); err != nil {
+			return fmt.Errorf("pgtx: 设置租户 GUC: %w", err)
+		}
+	}
+	if readAll {
+		if _, err := ptx.Exec(ctx, "SELECT set_config('"+tenantScopeGUC+"', 'all', true)"); err != nil {
+			return fmt.Errorf("pgtx: 设置读全部租户 GUC: %w", err)
+		}
 	}
 	return nil
 }
@@ -237,7 +274,12 @@ func (t *Transactor) Do(ctx context.Context, fn func(ctx context.Context) error)
 	if err := t.beforeFn(ctx, ptx); err != nil {
 		return err
 	}
-	if err := fn(tx.With(ctx, ptx)); err != nil {
+	fnCtx := tx.With(ctx, ptx)
+	if t.tenant {
+		// 记下本事务已落位的可见范围：嵌套 Do 据此拒绝中途切换读全部模式。
+		fnCtx = context.WithValue(fnCtx, scopeKey{}, tx.ReadsAllTenants(ctx))
+	}
+	if err := fn(fnCtx); err != nil {
 		return err
 	}
 	if err := ptx.Commit(ctx); err != nil {

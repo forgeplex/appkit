@@ -76,3 +76,18 @@ func TestStrip(t *testing.T) {
 		}
 	})
 }
+
+func TestReadAllTenantsMarker(t *testing.T) {
+	if tx.ReadsAllTenants(context.Background()) {
+		t.Fatal("裸 ctx 不应带读全部标记")
+	}
+	ctx := tx.WithReadAllTenants(context.Background())
+	if !tx.ReadsAllTenants(ctx) {
+		t.Fatal("WithReadAllTenants 之后应带标记")
+	}
+	// 标记随派生 ctx 存活（业务用例打标记后再 Do，Do 内派生的 ctx 仍见它）；
+	// Strip 只剥事务句柄，不动它。
+	if !tx.ReadsAllTenants(tx.Strip(tx.With(ctx, "fake-tx"))) {
+		t.Fatal("Strip 不应剥掉读全部标记")
+	}
+}

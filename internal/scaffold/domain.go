@@ -3,14 +3,12 @@ package scaffold
 import (
 	"fmt"
 	"io"
-	"path/filepath"
 	"strings"
 
 	"github.com/forgeplex/appkit/audit"
 	"github.com/forgeplex/appkit/idem"
 	"github.com/forgeplex/appkit/outbox"
 	"github.com/forgeplex/appkit/pgtx"
-	"github.com/forgeplex/appkit/ruleset"
 )
 
 // domainFiles 是域仓库骨架的模板清单（DESIGN §4 的 Go 惯用形态）。
@@ -28,6 +26,7 @@ var domainFiles = []fileSpec{
 	{tmpl: "service.go.tmpl", path: "internal/NAME/service.go"},
 	{tmpl: "store.go.tmpl", path: "internal/NAME/store.go"},
 	{tmpl: "errors.go.tmpl", path: "internal/NAME/errors.go"},
+	{tmpl: "permission.go.tmpl", path: "internal/NAME/permission.go"},
 	{tmpl: "postgres.go.tmpl", path: "internal/postgres/store.go"},
 	{tmpl: "handler.go.tmpl", path: "internal/http/handler.go"},
 	{tmpl: "consumer.go.tmpl", path: "internal/inbox/consumer.go"},
@@ -45,38 +44,12 @@ func Domain(o Options, out io.Writer) error {
 	if err := ensureFreshDir(o.Dir); err != nil {
 		return fmt.Errorf("new domain: %w", err)
 	}
-	d := newData(o, strings.ToUpper(o.Name)+"D")
-	files := domainFiles
-	if o.Partitioned {
-		// 分区域域的 module.go 形态差异大（Schemas 注入/路由/每分区 relay），
-		// 用专用模板而不是在一个模板里铺满 {{if}}。
-		files = swapTemplate(files, "module.go.tmpl", "module_partitioned.go.tmpl")
+	files, err := RenderDomain(o)
+	if err != nil {
+		return err
 	}
-	if o.Tenant {
-		// 同理：租户域的差别在 Transactor（NewTenant）与 Setup 期 RLS 校验。
-		files = swapTemplate(files, "module.go.tmpl", "module_tenant.go.tmpl")
-	}
-	if err := renderAll("domain", files, d, o.Dir); err != nil {
+	if err := writeRenderedFiles(o.Dir, files); err != nil {
 		return fmt.Errorf("new domain %s: %w", o.Name, err)
-	}
-	// 基础迁移在生成期调用库函数拼接——outbox/idem/audit 的库函数是
-	// 这四张基础设施表 DDL 的唯一事实源，模板里不落任何 DDL 副本。
-	sqlPath := filepath.Join(o.Dir, "db", "migrations", "0001_appkit_base.sql")
-	if err := writeFile(sqlPath, []byte(baseMigrationSQL(o))); err != nil {
-		return fmt.Errorf("new domain %s: %w", o.Name, err)
-	}
-	if o.Tenant {
-		// 租户域多给一张样例迁移：RLS 三件套的写法是模式教学，也让
-		// Setup 期的 VerifyTenantRLS 从第一天就有东西可验。
-		demo := filepath.Join(o.Dir, "db", "migrations", "0002_demo_notes.sql")
-		if err := writeFile(demo, []byte(tenantDemoSQL(o))); err != nil {
-			return fmt.Errorf("new domain %s: %w", o.Name, err)
-		}
-	}
-	// 生成即合规：lint / CI 配置直接物化，不留"忘了跑 sync"的窗口。
-	// 升级 appkit 后由 appkit sync 刷新，CI 的 sync --check 校验未漂移。
-	if _, err := ruleset.Sync(o.Dir, o.AppkitVersion); err != nil {
-		return fmt.Errorf("new domain %s: 物化规则集: %w", o.Name, err)
 	}
 	summarize(out, "域仓库", o.Dir, []string{
 		"appkit dev    # 生成 go.work 联调兄弟仓库；要吃本地未发布的 appkit 改动，把 appkit 也纳入",
@@ -102,7 +75,7 @@ func swapTemplate(files []fileSpec, from, to string) []fileSpec {
 // schema 本身由 pgmigrate 在应用迁移前创建。
 func baseMigrationSQL(o Options) string {
 	if o.Partitioned {
-		return baseMigrationSQLPartitioned()
+		return baseMigrationSQLPartitioned(o)
 	}
 	var b strings.Builder
 	b.WriteString("-- 0001_appkit_base.sql —— appkit 基础设施表（outbox/inbox/幂等/审计），每 schema 一套（DESIGN §8）。\n")
@@ -125,28 +98,40 @@ func baseMigrationSQL(o Options) string {
 }
 
 // tenantDemoSQL 是租户域的样例业务表迁移：tenant_id 列 + 租户打头索引 +
-// RLS 三件套（pgtx.TenantPolicySQL）。整张表可删，写法要照抄——这是
-// 「每个域的租户实现长得一样」的落点。
+// RLS 策略（pgtx.TenantPolicySQL）。整张表可删，写法要照抄——这是
+// 「每个域的租户实现长得一样」的落点。分区 + 行级的形态全文无前缀
+// （落位由分区路由），策略用 TenantPolicySQLBare。
 func tenantDemoSQL(o Options) string {
+	table := fmt.Sprintf("%q.notes", o.Name)
+	policy := pgtx.TenantPolicySQL(o.Name, "notes")
+	if o.Partitioned {
+		table = "notes"
+		policy = pgtx.TenantPolicySQLBare("notes")
+	}
 	var b strings.Builder
 	b.WriteString("-- 0002_demo_notes.sql —— 租户业务表的样例（可删；建真表时照抄这里的形态）。\n")
 	b.WriteString("-- 三件必做的事：\n")
 	b.WriteString("-- 1. tenant_id 列 NOT NULL——租户值来自 callctx.From(ctx).TenantID（authn 从\n")
 	b.WriteString("--    令牌 tid 焊入，业务代码不读头）；\n")
 	b.WriteString("-- 2. 以 tenant_id 打头的索引——RLS 过滤也走索引，全表扫描的隔离不是隔离；\n")
-	b.WriteString("-- 3. RLS 三件套（ENABLE + FORCE + 策略）——行级隔离在存储层强制：漏写 WHERE\n")
-	b.WriteString("--    的查询只会查不到别的租户的行，跨租户写入直接被拒，都不再是静默泄漏。\n")
-	b.WriteString("--    启动期 pgtx.VerifyTenantRLS 会校验：有 tenant_id 列却没挂三件套的表\n")
-	b.WriteString("--    会让服务拒绝启动（见 internal/module/module.go 的 Setup）。\n\n")
-	fmt.Fprintf(&b, "CREATE TABLE %q.notes (\n", o.Name)
+	b.WriteString("-- 3. RLS 策略（ENABLE + FORCE + 隔离策略 + 读全部策略）——行级隔离在存储层\n")
+	b.WriteString("--    强制：漏写 WHERE 的查询只会查不到别的租户的行，跨租户写入直接被拒，都不再\n")
+	b.WriteString("--    是静默泄漏；读全部策略只在用例显式 tx.WithReadAllTenants 时放开 SELECT。\n")
+	b.WriteString("--    启动期 pgtx.VerifyTenantRLS 会校验：有 tenant_id 列却没挂全策略的表\n")
+	b.WriteString("--    会让服务拒绝启动（见 internal/module/module.go 的 Setup）。\n")
+	if o.Partitioned {
+		b.WriteString("-- 分区 + 行级形态：本文件与全部迁移一样不带 schema 前缀，落位由分区路由。\n")
+	}
+	b.WriteString("\n")
+	fmt.Fprintf(&b, "CREATE TABLE %s (\n", table)
 	b.WriteString("    id        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n")
 	b.WriteString("    tenant_id text NOT NULL,\n")
 	b.WriteString("    body      text NOT NULL,\n")
 	b.WriteString("    created_at timestamptz NOT NULL DEFAULT now()\n")
 	b.WriteString(");\n")
-	fmt.Fprintf(&b, "CREATE INDEX notes_tenant_idx ON %q.notes (tenant_id, created_at);\n", o.Name)
-	fmt.Fprintf(&b, "COMMENT ON TABLE %q.notes IS '样例租户表——删除我之前，先照抄我的形态';\n\n", o.Name)
-	b.WriteString(pgtx.TenantPolicySQL(o.Name, "notes"))
+	fmt.Fprintf(&b, "CREATE INDEX notes_tenant_idx ON %s (tenant_id, created_at);\n", table)
+	fmt.Fprintf(&b, "COMMENT ON TABLE %s IS '样例租户表——删除我之前，先照抄我的形态';\n\n", table)
+	b.WriteString(policy)
 	return b.String()
 }
 
@@ -154,7 +139,7 @@ func tenantDemoSQL(o Options) string {
 // 落位由 pgmigrate 按分区经 SET LOCAL search_path 决定。不能写
 // CREATE SCHEMA——每个分区的 schema 名不同（组合根注入的映射决定），schema
 // 由 pgmigrate 应用时创建；不写前缀也让 sqlc 的静态分析与无前缀查询自洽。
-func baseMigrationSQLPartitioned() string {
+func baseMigrationSQLPartitioned(o Options) string {
 	var b strings.Builder
 	b.WriteString("-- 0001_appkit_base.sql —— appkit 基础设施表（outbox/inbox/幂等/审计），每分区一套（DESIGN §8）。\n")
 	b.WriteString("-- 分区域域：本文件全无前缀，落位由 pgmigrate 按分区经 search_path 决定；\n")
@@ -165,5 +150,10 @@ func baseMigrationSQLPartitioned() string {
 	b.WriteString(idem.MigrationSQLBare())
 	b.WriteString("\n")
 	b.WriteString(audit.MigrationSQLBare())
+	if o.Tenant {
+		// 分区内的租户策略函数：每个分区 schema 一份（无前缀，随 search_path 落位）。
+		b.WriteString("\n")
+		b.WriteString(pgtx.TenantScopeSQLBare())
+	}
 	return b.String()
 }

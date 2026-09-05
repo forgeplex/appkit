@@ -5,10 +5,10 @@
 // claims 布局是框架与鉴权提供方之间的契约（提供方按此签发，换提供方即换
 // 一个按此布局签发的实现，模块与框架零改动）：
 //
-//	访问令牌（Bearer）：iss（经 WithIssuer 校验）、sub=用户、exp 必填、
+//	访问令牌（Bearer）：iss（须是已配置的签发方）、sub=用户、exp 必填、
 //	                   tid=业务租户（可选）、perms=精确权限码快照。
-//	step-up（X-Step-Up）：iss、sub（须与访问令牌一致）、exp 必填、
-//	                   purpose="step-up"、iat=新鲜度判定依据。
+//	step-up（X-Step-Up）：iss（须与访问令牌同一签发方）、sub（须与访问令牌
+//	                   一致）、exp 必填、purpose="step-up"、iat=新鲜度判定依据。
 //
 // 提供方验「挑战动作」（MFA/TOTP 等）并签发 step-up 令牌；本包验「挑战
 // 证明」（签名、iss、sub 一致、purpose、exp）。
@@ -17,15 +17,20 @@
 //
 //	appkit.Middleware(authn.Middleware(pub, "rbac-demo"))
 //
-// issuer 此处为静态字符串；多分区部署（iss 随分区变化）需要按请求解析
-// issuer 的动态变体时再加，纯加法。
+// 多分区同进程（每个 rbac 分区一个 iss、可各配一把密钥）用 MultiIssuer，
+// 并顺手把签发方所属的分区键焊进 callctx：
+//
+//	appkit.Middleware(authn.MultiIssuer(map[string]authn.Issuer{
+//	    "rbac-a": {Key: pubA, Partition: "a"},
+//	    "rbac-b": {Key: pubB, Partition: "b"},
+//	}))
 package authn
 
 import (
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"net/http"
-	"slices"
 	"strings"
 	"time"
 
@@ -45,10 +50,23 @@ const stepUpPurpose = "step-up"
 
 // 证明畸形的判定性错误（进 401 的 cause，只用于日志归因）。
 var (
-	errEmptySubject = errors.New("令牌 sub 为空")
-	errWrongPurpose = errors.New("step-up 证明的 purpose 不是 step-up")
-	errNoIssuedAt   = errors.New("step-up 证明缺少 iat")
+	errEmptySubject   = errors.New("令牌 sub 为空")
+	errWrongPurpose   = errors.New("step-up 证明的 purpose 不是 step-up")
+	errNoIssuedAt     = errors.New("step-up 证明缺少 iat")
+	errUnknownIssuer  = errors.New("令牌 iss 不是已配置的签发方")
+	errIssuerMismatch = errors.New("step-up 证明与访问令牌不是同一签发方")
 )
+
+// Issuer 是一个签发方的验签规格。
+type Issuer struct {
+	// Key 是该签发方的 EdDSA 验签公钥。
+	Key ed25519.PublicKey
+	// Partition 是该签发方所属的分区键（rbac 分区 "a" 的签发方 iss=rbac-a
+	// 对应 "a"）。非空时验签后焊进 callctx.Meta.Partition——认证请求的分区
+	// 以令牌为准，入站 X-Partition 头带来的值被覆盖；空则不动 callctx 里的
+	// 分区（单分区部署或不用分区的系统）。
+	Partition string
+}
 
 // accessClaims 是访问令牌的验签布局。
 type accessClaims struct {
@@ -74,11 +92,46 @@ type stepUpClaims struct {
 // 租户身份在此焊进 callctx：认证请求以令牌 tid 为准（覆盖或清零入站
 // X-Tenant-Id 头带来的值——该头只在内部东西向可信，外部入口可伪造）。
 // 域代码与存储层（RLS）统一从 callctx.From(ctx).TenantID 取租户。
+//
+// 单签发方形态；多签发方（多分区同进程）见 MultiIssuer。
 func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Handler {
+	return MultiIssuer(map[string]Issuer{issuer: {Key: pub}})
+}
+
+// MultiIssuer 是 Middleware 的多签发方形态：按令牌 iss 选验签公钥，iss 不在
+// 表里即 401；step-up 证明必须与访问令牌出自同一签发方。签发方带 Partition
+// 时验签后把分区键焊进 callctx.Meta.Partition（与租户同一信任模型：令牌
+// 说了算，头值只在未认证的内部东西向存活）。
+//
+// 表为空、iss 为空、公钥缺失都是装配错误，直接 panic。
+func MultiIssuer(issuers map[string]Issuer) func(http.Handler) http.Handler {
+	if len(issuers) == 0 {
+		panic("authn: MultiIssuer 的签发方表为空")
+	}
+	for iss, is := range issuers {
+		if iss == "" {
+			panic("authn: 签发方 iss 为空")
+		}
+		if len(is.Key) != ed25519.PublicKeySize {
+			panic(fmt.Sprintf("authn: 签发方 %q 的公钥不是 Ed25519 公钥", iss))
+		}
+	}
 	parse := []jwt.ParserOption{
 		jwt.WithValidMethods([]string{jwt.SigningMethodEdDSA.Alg()}),
-		jwt.WithIssuer(issuer),
 		jwt.WithExpirationRequired(),
+	}
+	// keyFor 按未验签的 iss 选公钥：签名随后用这把钥验，iss 伪造只会拿到
+	// 别家的公钥而验不过。
+	keyFor := func(tok *jwt.Token) (any, error) {
+		iss, err := tok.Claims.GetIssuer()
+		if err != nil {
+			return nil, err
+		}
+		is, ok := issuers[iss]
+		if !ok {
+			return nil, fmt.Errorf("%w: %q", errUnknownIssuer, iss)
+		}
+		return is.Key, nil
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -88,8 +141,7 @@ func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Ha
 				return
 			}
 			var ac accessClaims
-			if _, err := jwt.ParseWithClaims(raw, &ac,
-				func(*jwt.Token) (any, error) { return pub, nil }, parse...); err != nil {
+			if _, err := jwt.ParseWithClaims(raw, &ac, keyFor, parse...); err != nil {
 				writeInvalid(w, err)
 				return
 			}
@@ -97,13 +149,14 @@ func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Ha
 				writeInvalid(w, errEmptySubject)
 				return
 			}
+			issuer := issuers[ac.Issuer]
 			actor := appkit.Actor{
 				UserID:   ac.Subject,
 				TenantID: ac.TenantID,
 				Perms:    ac.Perms,
 			}
 			if sup := r.Header.Get(HeaderStepUp); sup != "" {
-				at, err := parseStepUp(pub, parse, sup, ac.Subject)
+				at, err := parseStepUp(issuer.Key, parse, sup, ac.Issuer, ac.Subject)
 				if err != nil {
 					writeInvalid(w, err)
 					return
@@ -113,8 +166,12 @@ func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Ha
 			// 租户身份焊进 callctx：令牌说了算。tid 有值则覆盖入站头带来的
 			// 租户，无值则清零——「无租户令牌 + 伪造的 X-Tenant-Id」不能
 			// 成立。未认证路径不进这里，头值存活（内部东西向的合法形态）。
+			// 分区键同理，但只在签发方配了分区时才动它。
 			meta := callctx.From(r.Context())
 			meta.TenantID = actor.TenantID
+			if issuer.Partition != "" {
+				meta.Partition = issuer.Partition
+			}
 			ctx := callctx.With(appkit.WithActor(r.Context(), actor), meta)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
@@ -122,12 +179,18 @@ func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Ha
 }
 
 // parseStepUp 验证 step-up 证明并返回其 iat（新鲜度判定在 Require 侧）。
-// sub 经 jwt.WithSubject 钉死与访问令牌一致——别人的证明不能替我过关。
-func parseStepUp(pub ed25519.PublicKey, parse []jwt.ParserOption, raw, subject string) (time.Time, error) {
+// iss 钉死与访问令牌同一签发方、sub 经 jwt.WithSubject 钉死与访问令牌
+// 一致——别家签的、别人的证明都不能替我过关。
+func parseStepUp(pub ed25519.PublicKey, parse []jwt.ParserOption, raw, issuer, subject string) (time.Time, error) {
 	var sc stepUpClaims
+	opts := append(append([]jwt.ParserOption{}, parse...), jwt.WithIssuer(issuer), jwt.WithSubject(subject))
 	if _, err := jwt.ParseWithClaims(raw, &sc,
-		func(*jwt.Token) (any, error) { return pub, nil },
-		append(slices.Clone(parse), jwt.WithSubject(subject))...); err != nil {
+		func(tok *jwt.Token) (any, error) {
+			if iss, _ := tok.Claims.GetIssuer(); iss != issuer {
+				return nil, errIssuerMismatch
+			}
+			return pub, nil
+		}, opts...); err != nil {
 		return time.Time{}, err
 	}
 	if sc.Purpose != stepUpPurpose {

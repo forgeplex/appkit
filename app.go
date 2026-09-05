@@ -27,7 +27,7 @@ type appConfig struct {
 	logger          *slog.Logger
 	shutdownTimeout time.Duration
 	drainDelay      time.Duration
-	remotes         []func(*Registry)
+	remotes         []func(*Registry) error
 	migrator        func(ctx context.Context, sets []MigrationSet) error
 	skipMigrations  bool
 	bus             Subscriber
@@ -85,12 +85,13 @@ func DrainDelay(d time.Duration) Option {
 // 用合约仓库生成的 client（实现同一接口）满足消费方。
 func Remote[T any](ctor func(*Registry) (T, error)) Option {
 	return func(c *appConfig) {
-		c.remotes = append(c.remotes, func(reg *Registry) {
-			t := typeOf[T]()
-			reg.remotes[t] = &binding{
+		c.remotes = append(c.remotes, func(reg *Registry) error {
+			key := bindingKey{typ: typeOf[T]()}
+			reg.remotes[key] = &binding{
 				module: "remote",
 				ctor:   func(r *Registry) (any, error) { return ctor(r) },
 			}
+			return nil
 		})
 	}
 }
@@ -176,7 +177,9 @@ func moduleNames(ms []Module) string {
 // register 执行声明阶段：应用 Remote 绑定、逐个调用 Module.Register。
 func (a *App) register(enabled []Module) error {
 	for _, r := range a.cfg.remotes {
-		r(a.reg)
+		if err := r(a.reg); err != nil {
+			return err
+		}
 	}
 	for _, m := range enabled {
 		if err := a.registerModule(m); err != nil {

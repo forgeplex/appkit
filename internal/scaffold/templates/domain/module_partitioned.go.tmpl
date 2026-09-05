@@ -3,7 +3,7 @@
 // 从组合根注入，到此为止，不再向业务包扩散。
 //
 // 分区域域（partitioned）：一套代码、N 份数据分区，schema 由调用方确定
-// （DESIGN §8）。落位三件套——组合根注入 Schemas 映射（租户 → schema），
+// （DESIGN §8）。落位三件套——组合根注入 Schemas 映射（分区键 → schema），
 // 每次 tx.Do 开启事务后 SET LOCAL search_path 到该分区，无前缀查询与迁移
 // 据此解析。
 package module
@@ -37,8 +37,9 @@ type Options struct {
 	// 实现）。非 nil 时每个分区一个 outbox relay：本域事件自动外发。
 	// 组合根应把同一个实例传给全部模块并注入 appkit.Bus(bus)。
 	Bus outbox.Bus
-	// Schemas 是分区映射：租户身份（callctx.Meta.TenantID，经 X-Tenant-Id 头
-	// 与事件 meta 传播）到本域的数据分区 schema。定义放组合根自己的配置文件
+	// Schemas 是分区映射：分区键（callctx.Meta.Partition，认证请求由
+	// authn.MultiIssuer 按令牌签发方焊入，内部东西向经 X-Partition 头与
+	// 事件 meta 传播）到本域的数据分区 schema。定义放组合根自己的配置文件
 	// （koanf 原生支持 map[string]string），由组合根读取后注入——本仓库不
 	// 暗读全局配置。三体系形态示例：
 	//   {"merchant": "rbac_merchant", "ops": "rbac_ops", "agent": "rbac_agent"}
@@ -62,15 +63,15 @@ type mod struct {
 
 func (m *mod) Name() string { return "{{.Name}}" }
 
-// routePartition 从调用的租户身份解析本次落位的分区 schema。查无分区必须
+// routePartition 从调用的分区键解析本次落位的分区 schema。查无分区必须
 // 响亮失败（422）：静默落到默认 search_path 上只会让最里面那条查询报
 // 「表不存在」，错误原因离真正的错处隔了三层。
 func routePartition(ctx context.Context, schemas map[string]string) (string, error) {
-	tenant := callctx.From(ctx).TenantID
-	schema, ok := schemas[tenant]
+	partition := callctx.From(ctx).Partition
+	schema, ok := schemas[partition]
 	if !ok {
 		return "", apperr.InvalidArgument(
-			"未知分区 %q——请求未携带 X-Tenant-Id，或组合根未注入该分区映射", tenant)
+			"未知分区 %q——令牌签发方未配置分区（authn.MultiIssuer）、请求未携带 X-Partition，或组合根未注入该分区映射", partition)
 	}
 	return schema, nil
 }
@@ -121,16 +122,14 @@ func (m *mod) Register(reg *appkit.Registry) error {
 	// 权限码声明（应用级目录，与数据分区无关）：汇总进全应用目录，鉴权
 	// 提供方（如 rbac）据此同步落库。端点绑码用 reg.Require；验签中间件
 	// 是组合根职责，见 docs/GUIDE.md 鉴权章节。
-	reg.Permissions(appkit.PermissionDecl{
-		Code: "{{.Name}}:read", Name: "读取", Category: "{{.Name}}",
-	})
+	reg.Permissions({{.Name}}.PermissionCatalog()...)
 
 	reg.Setup(func(context.Context) error {
 		svc := appkit.MustResolve[*{{.Name}}.Service](reg)
 		m.handler = {{.Name}}http.NewPingHandler(m.opts.Log, svc)
 		// 消费外域事件样例（声明后组合根必须以 appkit.Bus 注入总线）。
 		// 分区域域的 dedup 表（inbox）随分区一套：消费者按「这个 topic 的事件
-		// 落在哪个分区」登记，handler 内按事件 meta 的租户身份路由（callctx
+		// 落在哪个分区」登记，handler 内按事件 meta 的分区键路由（callctx
 		// 已沿事件传播）：
 		// reg.Consumer("other.something.v1",
 		//     outbox.Inbox(m.opts.Pool, m.opts.Schemas["tenant"], inbox.Consumer, inbox.NewHandler(svc)))
@@ -149,9 +148,9 @@ func (m *mod) Register(reg *appkit.Registry) error {
 	// 关停等它退出、超预算不吊死、崩了掀翻进程而不是让探针继续绿着——
 	// 都在框架里，这里只交一个函数。
 	if m.opts.Bus != nil {
-		for tenant, schema := range m.opts.Schemas {
+		for partition, schema := range m.opts.Schemas {
 			relay := outbox.NewRelay(m.opts.Pool, schema, m.opts.Bus)
-			reg.Worker("outbox-relay/"+tenant, relay.Run)
+			reg.Worker("outbox-relay/"+partition, relay.Run)
 		}
 	} else {
 		m.opts.Log.Warn("{{.Name}}: 未注入 Bus，outbox relay 未启动——本域事件只落表不外发")

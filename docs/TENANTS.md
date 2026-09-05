@@ -41,11 +41,14 @@
 example 的单分区形态（`partitionKey = "demo"` → schema `rbac_demo`）就是
 这个最小例：一个分区内一个管理员租户起步，商户租户随业务逐个开。
 
-**③ 分区键 ≠ 业务租户。** `callctx` 里这两个维度各走各的：分区键决定
-事务路由到哪个 schema，业务租户决定行落在哪个 `tenant_id`。混用会有
-真实事故——example 早期验证码邮件死信，就是 rbac 的分区键 `demo` 经
-outbox 事件 meta → relay → `callctx` 传播，被 email 域当成业务租户查渠道
-（`tenant_id = 'demo'` 零匹配）。判例见第 7 节③。
+**③ 分区键 ≠ 业务租户。** `callctx.Meta` 里这两个维度是两个字段：
+`Partition`（分区键）决定事务路由到哪个 schema，`TenantID`（业务租户）
+决定行落在哪个 `tenant_id`；各自的头（`X-Partition` / `X-Tenant-Id`）、各自
+的事件 meta 键，认证请求都以令牌为准（`authn.MultiIssuer` 按签发方焊分区，
+`tid` 焊租户）。它们曾经共用一个字段，混用有真实事故——example 早期验证码
+邮件死信，就是 rbac 的分区键 `demo` 经 outbox 事件 meta → relay → `callctx`
+传播，被 email 域当成业务租户查渠道（`tenant_id = 'demo'` 零匹配）。判例见
+第 7 节③。
 
 ## 2. 域选形态：一张表定终身
 
@@ -83,15 +86,22 @@ func (s *Service) AllOrders(ctx context.Context, f AdminFilter, page Page) ([]Ad
 
 （示意。真实判例看 rbac 域：它的管理端点与登录端点就是同一域内不同用例面。）
 
-三条纪律：
+四条纪律：
 
 1. **My\* 永远不带租户参数**——租户从 `callctx.From(ctx).TenantID` 取，
    SQL 恒带 `WHERE tenant_id = $1`。漏写谓词由 RLS 兜底（GUIDE §3.2
    机制三：查不到别家行，写不进别家 tenant_id）。
-2. **All\* 的门是权限码，不是身份**。handler 上绑 `order:read-all` 这类
+2. **All\* 的门是权限码，不是身份**。handler 上绑 `order:read_all` 这类
    域声明的码；谁持码由组合根第 4 节决定。域从头到尾不知道「运营」
    是谁——换一个组合、把同一域卖给纯单租户系统，All\* 用例零改动。
-3. **两份 DTO 天然解决字段裁剪**。「运营界面显示 10 个字段、商户界面
+3. **All\* 的读走读全部模式，写走显式目标**。跨租户读在用例里
+   `ctx = tx.WithReadAllTenants(ctx)` 再 `Do`——RLS 只对 SELECT 放开全部行
+   （GUIDE §3.2），一条 SQL 跨商户分页；代商户写（补单、退款、重置）
+   必须显式指定目标商户并 `callctx.With(ctx, callctx.Meta{TenantID: 目标})`
+   切过去，行落在**商户**名下。忘了切的失败形态是行落在平台名下且 RLS
+   抓不住（行与 GUC 一致地错），所以 All\* 写路径三件缺一不可：码 +
+   显式目标 + 切换。
+4. **两份 DTO 天然解决字段裁剪**。「运营界面显示 10 个字段、商户界面
    显示 5 个」若是**商户不该知道**（成本价、风控分），裁剪发生在两份
    DTO 的序列化里，前端不渲染不算数；若只是**页面排版**，商户端少编
    几个字段即可。判断口诀：商户打开 devtools 看到 API 响应里多出来的
@@ -122,7 +132,7 @@ const (
 func PermissionCatalog() []appkit.PermissionDecl { return files.PermissionCatalog() }
 ```
 
-跨租户码（如 `order:read-all`）与普通码同机制，只是授予面不同——
+跨租户码（如 `order:read_all`）与普通码同机制，只是授予面不同——
 建议在 Description 里写明跨租户语义，管理界面读得到。
 
 **② 授予（组合根，SystemRoles）。** 「谁持哪些码」是部署面决策，落
@@ -150,9 +160,12 @@ Partitions: map[string]rbac.PartitionSpec{
 
 **④ 判定（两个门）。** 域内端点用 `reg.Require(code, handler)` 绑码
 （demo.go 有一字不差的判定矩阵：未认证 401 / 无码 403 / 有码 200，
-挑战码还须新鲜 step-up 证明）；框架侧由组合根挂 `authn.Middleware` 验签。
+挑战码还须新鲜 step-up 证明）；框架侧由组合根挂 `authn.Middleware` 验签
+（多分区同进程用 `authn.MultiIssuer`，一并把分区键焊进 callctx）。
 files / ledger 域的 HTTP 面尚未绑码（判定归组合根/网关的部署现状）——
-新域从第一天就绑，域内判定与框架机制并存互补。
+新域从第一天就绑，域内判定与框架机制并存互补。跨租户码只开门，不开
+数据：数据面的放开是用例里的 `tx.WithReadAllTenants`（第 3 节纪律 3），
+两者缺一都拿不到别家的行。
 
 ## 5. 组合根：从单组合到双组合
 
@@ -189,6 +202,15 @@ apps/
 形态；反过来两个组合先各跑一个小单体也完全可以。**部署形态是启动参数，
 不是架构决策**——这句话的根基是域仓库对组合方式一无所知。
 
+**再上一层：N 个平台。** 产品要卖给多个互相独立的运营方（白标 PSP：
+平台 a 有自己的运营与商户 a1/a2，平台 b 有 b1……），每个平台就是一个
+**分区**：rbac 每平台一个分区（iss=`rbac-a` / `rbac-b`），业务域用
+`-partitioned -tenant` 双层形态（GUIDE §3.3）——平台一套 schema，平台内
+商户分行，运营是分区内 `tenant_id = platform` 的普通用户，读全部的边界是
+本平台的 schema。组合根注入 `Partitions`/`Schemas` 映射与
+`authn.MultiIssuer`，加一个平台 = 每个分区域加一条映射 + 重启。判据：
+平台是部署期决定的；平台要运行时入驻、数量无上界，这个形态不合适。
+
 ## 6. 能力域的租户语义是现成的
 
 拼系统时先查货架，别重造：
@@ -214,8 +236,12 @@ apps/
 
 **③ 事件链路会传播租户身份。** outbox 事件带发布时的 callctx meta，
 relay 投递时还原成 `callctx`——下游域 `tenantOf(ctx)` 取到的是**发布方
-当时的租户**。验证码邮件死信判例：发布方分区键被下游当业务租户。跨域
-事件翻译器（组合根）是修正租户语义的正确位置，别让下游域猜。
+当时的租户**。验证码邮件死信判例：发布方分区键被下游当业务租户——根因
+是分区键与租户曾共用 `Meta.TenantID` 一个字段，现已拆成 `Partition` /
+`TenantID` 两个（分区域改读 `Partition` 后这类事故在类型上就不成立）。
+语义仍可能错（发布方的租户不是下游该用的租户）：跨域事件翻译器（组合根）
+是修正租户语义的正确位置，别让下游域猜。读全部标记不进事件 meta——
+运营的跨租户读不会经事件链路泄到下游域。
 
 **④ 域仓库 appkit 版本要对齐。** MVS 钻石下，组合根能用的新 API 需要
 各域仓库先升：files 钉在 v0.5.3 时组合根看不到 `PermissionDecl`。升级
@@ -237,7 +263,8 @@ relay 投递时还原成 `callctx`——下游域 `tenantOf(ctx)` 取到的是**
 | 运营平台是什么 | 一个普通租户，差别只在权限授予 | §1① |
 | 商户怎么隔离 | 租户域：tenant_id 列 + RLS | §2 / GUIDE §3.2 |
 | 什么时候开新分区 | 数据互不相关 / 合规要求，与前端数量无关 | §1② |
-| 跨租户管理怎么写 | All\* 用例 + 域声明跨租户码 + 组合根授予 | §3 / §4 |
+| 跨租户管理怎么写 | All\* 用例 + 域声明跨租户码 + 组合根授予；读用 `tx.WithReadAllTenants`，写显式切目标租户 | §3 / §4 |
+| N 个平台各自独立 | 平台 = 分区（`-partitioned -tenant` 双层），`authn.MultiIssuer` 按 iss 焊分区键 | §5 / GUIDE §3.3 |
 | 字段 10 vs 5 | 不该知道 → 双 DTO；纯排版 → 前端裁 | §3③ |
 | 运营/商户何时拆组合根 | 前端团队分头 / 网络隔离；拆时同库同分区 | §5 |
 | 平台发信、商户收信 | email 全局渠道兜底，零配置 | §6 |

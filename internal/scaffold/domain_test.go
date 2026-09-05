@@ -25,6 +25,7 @@ var domainWantFiles = []string{
 	"internal/ledger/service.go",
 	"internal/ledger/store.go",
 	"internal/ledger/errors.go",
+	"internal/ledger/permission.go",
 	"internal/postgres/store.go",
 	"internal/http/handler.go",
 	"internal/inbox/consumer.go",
@@ -135,7 +136,9 @@ func TestDomainScaffold(t *testing.T) {
 			`Schema = "ledger"`, "reg.Migrations(Schema", "reg.Health(", "appkit.Provide(",
 			// 权限码声明从第一天就在骨架里：目录由各域自声明、框架汇总，
 			// 组合根不再手抄全目录。
-			"reg.Permissions(", `"ledger:read"`)
+			"reg.Permissions(ledger.PermissionCatalog()...)")
+		mustContain(t, "permission.go", readFile(t, dir, "internal/ledger/permission.go"), `PermRead = "ledger:read"`)
+		mustContain(t, "ledger.go", readFile(t, dir, "ledger.go"), "func PermissionCatalog()")
 		sqlcYml := readFile(t, dir, "sqlc.yaml")
 		mustContain(t, "sqlc.yaml", sqlcYml,
 			"internal/postgres/sqlc", `schema: "db/migrations"`,
@@ -179,6 +182,12 @@ func TestDomainScaffold(t *testing.T) {
 			// 幂等的两个注入口：不写进规程，代理就只会裸套中间件，
 			// "80"/"80.00" 的重试撞 422、多租户手拼前缀这些问题一个都躲不掉。
 			"idem.WithCanonicalizer", "idem.WithKeyScope",
+			// 文件组织是约定级（没有 lint 落点），规程是它唯一的载体：
+			// 不写「功能名前置」代理就按层起名（service_xxx.go），一个功能的
+			// 两半在目录里隔开；不写「子包嵌套在业务包下」代理就拆成平级包
+			// （internal/<功能>），静默逃出 depguard / arch-lint / archcheck 的
+			// internal/<domain>/** 圈定；不写「不按层拆」DDD 楼阁就会回魂。
+			"<功能>_service.go", "internal/ledger/<功能>/", "不按层拆", "不拆成平级包",
 			"make lint")
 		// 规程里不许出现假的强制力：appkit-lint 已接进 make lint 与 CI，
 		// 规程就不许再说"没有机检"（反向同样成立——哪天机检撤了，这句
@@ -261,16 +270,18 @@ func TestDomainPartitionedScaffold(t *testing.T) {
 		mustContain(t, "module.go", mod,
 			"Schemas map[string]string",
 			"pgtx.NewRouted(",
-			"callctx.From(ctx).TenantID",
+			// 分区键走自己的字段，不再借用租户字段。
+			"callctx.From(ctx).Partition",
 			"routePartition(",
 			`apperr.InvalidArgument(`,
 			"outbox.Publish(ctx, pgtx.From(ctx, p.pool), schema, evt)",
-			`reg.Worker("outbox-relay/"+tenant`,
+			`reg.Worker("outbox-relay/"+partition`,
 			// 权限码是应用级目录，分区形态同样声明。
-			"reg.Permissions(", `"rbac:read"`,
+			"reg.Permissions(rbac.PermissionCatalog()...)",
 		)
-		// 单形态的痕迹不得出现。
-		for _, gone := range []string{`Schema = "rbac"`, "pgtx.New(m.opts.Pool)", "outbox.NewPublisher("} {
+		// 单形态的痕迹不得出现；分区键也不许再从租户字段取。
+		for _, gone := range []string{`Schema = "rbac"`, "pgtx.New(m.opts.Pool)", "outbox.NewPublisher(",
+			"callctx.From(ctx).TenantID", "pgtx.NewRoutedTenant("} {
 			if strings.Contains(mod, gone) {
 				t.Errorf("分区域域的 module.go 不应出现 %q", gone)
 			}
@@ -294,8 +305,8 @@ func TestDomainPartitionedScaffold(t *testing.T) {
 		agents := readFile(t, dir, "AGENTS.md")
 		mustContain(t, "AGENTS.md", agents,
 			"分区域域", "SET LOCAL search_path", "不带 schema 前缀",
-			// 命令清单里不许列出 make schema；提它的地方只能是「不适用」的说明。
-			"make schema` 不适用本形态")
+			// 分区产物是逻辑模板，不枚举或检查运行时分区。
+			"make schema", "logical-template", "未枚举或检查运行时分区")
 		mustContain(t, "README.md", readFile(t, dir, "README.md"),
 			"-partitioned", "分区域域")
 	})
@@ -342,7 +353,7 @@ func TestDomainTenantScaffold(t *testing.T) {
 			// Setup 期守卫必须在：迁移先于 Setup 应用，这里看到的是终态。
 			"pgtx.VerifyTenantRLS(ctx, m.opts.Pool, Schema)",
 			// 权限码声明与其他形态一致（目录是应用级的）。
-			"reg.Permissions(", `"crm:read"`,
+			"reg.Permissions(crm.PermissionCatalog()...)",
 		)
 		// 单形态的痕迹不得出现。
 		for _, gone := range []string{"pgtx.New(m.opts.Pool)", "pgtx.NewRouted("} {
@@ -361,6 +372,7 @@ func TestDomainTenantScaffold(t *testing.T) {
 			`ALTER TABLE "crm"."notes" ENABLE ROW LEVEL SECURITY`,
 			`ALTER TABLE "crm"."notes" FORCE ROW LEVEL SECURITY`,
 			`CREATE POLICY tenant_isolation ON "crm"."notes"`,
+			`CREATE POLICY tenant_isolation_read_all ON "crm"."notes" FOR SELECT`,
 			// 教学注释必须点到 verify——建真表照抄的读者得知道漏挂的后果。
 			"VerifyTenantRLS",
 		)
@@ -368,8 +380,8 @@ func TestDomainTenantScaffold(t *testing.T) {
 
 	t.Run("规程翻转", func(t *testing.T) {
 		mustContain(t, "AGENTS.md", readFile(t, dir, "AGENTS.md"),
-			"租户域", "RLS 三件套", "callctx.From(ctx).TenantID",
-			// 建表纪律要指向样例，否则代理建新表会漏挂三件套。
+			"租户域", "RLS 策略", "callctx.From(ctx).TenantID", "tx.WithReadAllTenants",
+			// 建表纪律要指向样例，否则代理建新表会漏挂策略。
 			"0002_demo_notes.sql")
 		mustContain(t, "README.md", readFile(t, dir, "README.md"),
 			"-tenant", "租户域", "BYPASSRLS")
@@ -388,12 +400,82 @@ func TestDomainTenantCompiles(t *testing.T) {
 	buildGenerated(t, dir)
 }
 
-// TestDomainFormFlagsMutuallyExclusive 锁住形态互斥：行级隔离与 schema 隔离
-// 不组合，同时给两个 flag 必须当场报错而不是生成一个四不像。
-func TestDomainFormFlagsMutuallyExclusive(t *testing.T) {
-	err := Domain(Options{Name: "crm", Dir: filepath.Join(t.TempDir(), "crm"),
-		Partitioned: true, Tenant: true}, nil)
-	if err == nil || !strings.Contains(err.Error(), "互斥") {
-		t.Fatalf("-tenant 与 -partitioned 同给应报互斥错误，实际 %v", err)
+// TestDomainPartitionedTenantScaffold 断言「分区 + 行级」双层形态：无前缀
+// 迁移里带策略函数与租户样例表（Bare 形态）、NewRoutedTenant 路由、逐分区
+// RLS 校验、跨租户码声明——单形态的痕迹（带前缀策略、NewTenant/NewRouted）
+// 不出现。
+func TestDomainPartitionedTenantScaffold(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "order")
+	if err := Domain(Options{Name: "order", Dir: dir, AppkitVersion: "(devel)",
+		Partitioned: true, Tenant: true}, nil); err != nil {
+		t.Fatalf("Domain: %v", err)
 	}
+
+	assertRendered(t, dir)
+	assertGoParses(t, dir)
+	assertGofmt(t, dir)
+
+	t.Run("迁移全无前缀且带策略", func(t *testing.T) {
+		base := readFile(t, dir, "db/migrations/0001_appkit_base.sql")
+		mustContain(t, "0001_appkit_base.sql", base,
+			`CREATE TABLE IF NOT EXISTS outbox`,
+			"CREATE OR REPLACE FUNCTION appkit_current_tenant()",
+			"CREATE OR REPLACE FUNCTION appkit_read_all_tenants()")
+		demo := readFile(t, dir, "db/migrations/0002_demo_notes.sql")
+		mustContain(t, "0002_demo_notes.sql", demo,
+			"CREATE TABLE notes (",
+			"tenant_id text NOT NULL",
+			"CREATE INDEX notes_tenant_idx ON notes (tenant_id, created_at)",
+			`ALTER TABLE "notes" FORCE ROW LEVEL SECURITY`,
+			`CREATE POLICY tenant_isolation ON "notes"`,
+			`CREATE POLICY tenant_isolation_read_all ON "notes" FOR SELECT`,
+			"USING (appkit_read_all_tenants())")
+		for _, f := range []string{base, demo} {
+			if strings.Contains(f, "CREATE SCHEMA") || strings.Contains(f, `"order".`) {
+				t.Errorf("双层形态的迁移不得出现定死的 schema：\n%s", f)
+			}
+		}
+	})
+
+	t.Run("双层装配", func(t *testing.T) {
+		mod := readFile(t, dir, "internal/module/module.go")
+		mustContain(t, "module.go", mod,
+			"Schemas map[string]string",
+			"pgtx.NewRoutedTenant(",
+			"callctx.From(ctx).Partition",
+			// 逐分区校验：每个 schema 各自要过。
+			"pgtx.VerifyTenantRLS(ctx, m.opts.Pool, schema)",
+			`reg.Worker("outbox-relay/"+partition`,
+			"reg.Permissions(order.PermissionCatalog()...)", "tx.WithReadAllTenants",
+		)
+		mustContain(t, "permission.go", readFile(t, dir, "internal/order/permission.go"),
+			`PermRead = "order:read"`, `PermReadAll = "order:read_all"`, "tx.WithReadAllTenants", "只在本分区内")
+		for _, gone := range []string{"pgtx.NewTenant(", "pgtx.NewRouted(", "pgtx.New(m.opts.Pool)",
+			`Schema = "order"`, "callctx.From(ctx).TenantID"} {
+			if strings.Contains(mod, gone) {
+				t.Errorf("双层形态的 module.go 不应出现 %q", gone)
+			}
+		}
+	})
+
+	t.Run("规程与 README", func(t *testing.T) {
+		mustContain(t, "AGENTS.md", readFile(t, dir, "AGENTS.md"),
+			"分区域域", "每个分区内", "pgtx.TenantPolicySQLBare", "pgtx.NewRoutedTenant",
+			"tx.WithReadAllTenants", "只在本分区内")
+		mustContain(t, "README.md", readFile(t, dir, "README.md"),
+			"-partitioned -tenant", "每个分区内再按行隔离", "本分区全部租户")
+		mustContain(t, ".appkit.yml", readFile(t, dir, ".appkit.yml"), "partitioned: true")
+	})
+}
+
+// TestDomainPartitionedTenantCompiles 编译双层形态生成仓库（同 TestDomainCompiles）。
+func TestDomainPartitionedTenantCompiles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short 模式跳过编译")
+	}
+	dir := filepath.Join(t.TempDir(), "order")
+	if err := Domain(Options{Name: "order", Dir: dir, Partitioned: true, Tenant: true}, nil); err != nil {
+		t.Fatalf("Domain: %v", err)
+	}
+	buildGenerated(t, dir)
 }

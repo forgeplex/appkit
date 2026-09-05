@@ -3,7 +3,7 @@
 
 GO ?= go
 
-.PHONY: check fmt vet build test test-db test-lint test-rules changelog tag all
+.PHONY: check fmt vet build test test-db test-db-local test-downstream-local test-acceptance test-lint test-rules changelog tag all
 
 # 完成的定义（AGENTS.md）：这条全绿，且动了公开 API 时 apidiff 相对最新 tag 零 incompatible。
 check: fmt vet build test
@@ -30,6 +30,20 @@ test:
 test-db:
 	@test -n "$(TEST_DATABASE_URL)" || { echo "需要 TEST_DATABASE_URL"; exit 1; }
 	TEST_DATABASE_URL='$(TEST_DATABASE_URL)' $(GO) test -race -count=1 ./...
+
+# 隔离的临时 PostgreSQL 集群；不读取现有 TEST_DATABASE_URL，也不启动系统服务。
+# 需要完整的本地 server 安装：APPKIT_POSTGRES_BIN=/path/to/bin make test-db-local
+test-db-local:
+	bash scripts/test-db-local.sh
+
+# 只在复制的现有项目源码中验收，不修改业务仓库。项目测试须先人工审查，非执行沙箱。
+# APPKIT_APPS_ROOT 默认 ../apps；TOOLS 及依赖须已就绪；失败保留副本和日志。
+test-downstream-local:
+	bash scripts/test-downstream-local.sh
+
+# 四个真实 Go module 的跨项目复用/兼容升级验收（包括子进程 race）。
+test-acceptance:
+	$(GO) test -race -count=1 -v ./internal/acceptance
 
 # lint/ 是独立嵌套 module（自带 go.mod），不在 ./... 覆盖范围内。
 test-lint:

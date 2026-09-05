@@ -76,13 +76,11 @@ func (m *mod) Register(reg *appkit.Registry) error {
 	reg.Migrations(Schema, m.migrations)
 
 	// 权限码声明：汇总进全应用目录，鉴权提供方（如 rbac）据此把目录同步
-	// 落库。端点绑码用 reg.Require("{{.Name}}:read", handler)——判定语义
+	// 落库。端点绑码用 reg.Require({{.Name}}.PermRead, handler)——判定语义
 	// 统一在框架（401/403/step-up），模块不各自实现；高危码在声明里带
 	// Challenge: true。验签中间件（authn.Middleware）是组合根的部署面
 	// 决策，见 docs/GUIDE.md 鉴权章节。
-	reg.Permissions(appkit.PermissionDecl{
-		Code: "{{.Name}}:read", Name: "读取", Category: "{{.Name}}",
-	})
+	reg.Permissions({{.Name}}.PermissionCatalog()...)
 
 	reg.Setup(func(ctx context.Context) error {
 		// 迁移已应用（Setup 晚于迁移），此时校验租户隔离的完整性：

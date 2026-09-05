@@ -8,11 +8,16 @@ import (
 
 	"github.com/forgeplex/appkit"
 
+	"{{.Module}}/internal/{{.Name}}"
 	"{{.Module}}/internal/module"
 )
 
 // Options 是装配期依赖，由组合根（cmd/{{.Name}}d 或组合仓库）注入。
 type Options = module.Options
+
+// PermissionCatalog 透出本域权限码目录（定义在 internal/{{.Name}}/permission.go），
+// 组合根组角色时合入——引用目录，不手抄字符串。
+func PermissionCatalog() []appkit.PermissionDecl { return {{.Name}}.PermissionCatalog() }
 
 //go:embed db/migrations/*.sql
 var migrationsFS embed.FS

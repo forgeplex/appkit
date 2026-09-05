@@ -1,0 +1,153 @@
+package consumer_test
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"strconv"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"example.test/contracts/sample"
+	"example.test/reusable"
+	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
+	"github.com/forgeplex/appkit/tx"
+)
+
+const project = "{{ .Project }}"
+const selectedName = "{{ .Selected }}"
+
+// A removed public DTO must fail actual compilation in each consumer package.
+var _ = sample.Marker{Value: project}
+
+func TestReusedModule(t *testing.T) {
+	for _, mode := range []string{"embedded", "http"} {
+		t.Run(mode, func(t *testing.T) {
+			wantRevision, err := strconv.ParseInt(os.Getenv("FIXTURE_REVISION"), 10, 64)
+			if err != nil { t.Fatal(err) }
+			primary, primaryProbe := reusable.Module("primary")
+			backup, backupProbe := reusable.Module("backup")
+			var hits atomic.Int64
+			serve := func(probe *reusable.Service) *httptest.Server {
+				inner := sample.NewHTTPHandler(sample.WrapService(probe, reusable.BoundaryTimeout))
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					hits.Add(1)
+					inner.ServeHTTP(w, r)
+				}))
+				t.Cleanup(server.Close)
+				return server
+			}
+			primaryServer, backupServer := serve(primaryProbe), serve(backupProbe)
+			selectedProbe, otherName := primaryProbe, "backup"
+			if selectedName == "backup" { selectedProbe, otherName = backupProbe, "primary" }
+			var selected, other sample.Service
+			ready := make(chan struct{})
+			consumer := appkit.ModuleFunc("consumer", func(reg *appkit.Registry) error {
+				reg.Setup(func(context.Context) error {
+					var err error
+					selected, err = appkit.ResolveNamed[sample.Service](reg, selectedName)
+					if err != nil { return err }
+					other, err = appkit.ResolveNamed[sample.Service](reg, otherName)
+					if err != nil { return err }
+					if _, err := appkit.Resolve[sample.Service](reg); err == nil {
+						return fmt.Errorf("named instances unexpectedly supplied an unnamed binding")
+					}
+					return nil
+				})
+				reg.OnStart(appkit.StageServer+1, func(context.Context) error { close(ready); return nil })
+				return nil
+			})
+			target := "all"
+			if mode == "http" { target = "consumer" }
+			app := appkit.New([]appkit.Module{primary, backup, consumer},
+				appkit.Target(target), appkit.HTTPAddr("127.0.0.1:0"),
+				appkit.Logger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+				appkit.RemoteNamed[sample.Service]("primary", func(*appkit.Registry) (sample.Service, error) {
+					return sample.NewClient(primaryServer.URL, project, nil), nil
+				}),
+				appkit.RemoteNamed[sample.Service]("backup", func(*appkit.Registry) (sample.Service, error) {
+					return sample.NewClient(backupServer.URL, project, nil), nil
+				}),
+			)
+			start(t, app, ready)
+			meta := callctx.Meta{RequestID: "request-" + project, Partition: "partition-a", TenantID: "tenant-b", Caller: project}
+			ctx := callctx.With(context.WithValue(context.Background(), reusable.SecretKey{}, "private"), meta)
+			ctx = tx.WithReadAllTenants(ctx)
+			reply, err := selected.Echo(ctx, sample.EchoRequest{Payload: "hello"})
+			if err != nil { t.Fatal(err) }
+			if reply.Message != selectedName + ":hello" || reply.Revision != wantRevision {
+				t.Fatalf("wrong instance/upgrade: %+v; want %s revision %d", reply, selectedName, wantRevision)
+			}
+			if reply.RequestID != meta.RequestID || reply.Partition != meta.Partition || reply.TenantID != meta.TenantID || reply.Caller != project {
+				t.Fatalf("context whitelist lost: %+v", reply)
+			}
+			if reply.Forbidden || !reply.HasDeadline { t.Fatalf("boundary guard missing: %+v", reply) }
+			otherReply, err := other.Echo(ctx, sample.EchoRequest{Payload: "other"})
+			if err != nil || otherReply.Message != otherName + ":other" { t.Fatalf("instances mixed: %+v, %v", otherReply, err) }
+			if err := selected.Ping(ctx); err != nil { t.Fatal(err) }
+
+			beforeCalls, beforeHits := selectedProbe.Calls.Load(), hits.Load()
+			_, err = selected.Echo(tx.With(ctx, struct{}{}), sample.EchoRequest{Payload: "forbidden"})
+			assertCode(t, err, apperr.CodeTxBoundary)
+			cancelled, cancel := context.WithCancel(ctx)
+			cancel()
+			_, err = selected.Echo(cancelled, sample.EchoRequest{Payload: "cancelled"})
+			assertCode(t, err, apperr.CodeUnavailable)
+			if selectedProbe.Calls.Load() != beforeCalls || hits.Load() != beforeHits {
+				t.Fatal("guarded calls reached implementation or network")
+			}
+			_, err = selected.Echo(ctx, sample.EchoRequest{Payload: "fail"})
+			assertCode(t, err, apperr.CodeInternal)
+			_, err = selected.Echo(ctx, sample.EchoRequest{Payload: "coded"})
+			assertCode(t, err, "FIXTURE_REJECTED")
+			// The wrapper's own timeout applies even without an upstream deadline.
+			_, err = selected.Echo(ctx, sample.EchoRequest{Payload: "wait"})
+			assertCode(t, err, apperr.CodeUnavailable)
+			// A shorter caller deadline also cancels this cooperative implementation.
+			short, stop := context.WithTimeout(ctx, 20*time.Millisecond)
+			defer stop()
+			_, err = selected.Echo(short, sample.EchoRequest{Payload: "wait"})
+			assertCode(t, err, apperr.CodeUnavailable)
+			if mode == "embedded" && hits.Load() != 0 { t.Fatal("local instance fell through to remote") }
+			if mode == "http" && hits.Load() == 0 { t.Fatal("remote mode never crossed real HTTP") }
+			t.Logf("%s selected %s via %s, shared revision %d", project, selectedName, mode, reply.Revision)
+		})
+	}
+}
+
+func assertCode(t *testing.T, err error, want string) {
+	t.Helper()
+	if !apperr.Is(err, want) { t.Fatalf("error %v; want code %s", err, want) }
+}
+
+func start(t *testing.T, app *appkit.App, ready <-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- app.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil { t.Errorf("application shutdown: %v", err) }
+		case <-time.After(5*time.Second):
+			t.Error("application did not stop")
+		}
+	})
+	select {
+	case <-ready:
+	case err := <-done:
+		// Leave the completion available to cleanup even on startup failure.
+		done <- err
+		t.Fatalf("application failed before readiness: %v", err)
+	case <-time.After(5*time.Second):
+		t.Fatal("application did not become ready")
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -40,7 +41,18 @@ func LoadAppConfig(dir string) (AppConfig, error) {
 	}
 	defer f.Close()
 
-	dec := yaml.NewDecoder(f)
+	return parseAppConfig(f, path)
+}
+
+// ParseAppConfig 解析并校验已经读入内存的 .appkit.yml，规则与 LoadAppConfig
+// 相同。它不读取文件，供需要将校验结果绑定到同一份配置快照的调用方使用。
+// 错误中的来源名为 .appkit.yml；文件路径信息由调用方补充。
+func ParseAppConfig(data []byte) (AppConfig, error) {
+	return parseAppConfig(bytes.NewReader(data), appConfigName)
+}
+
+func parseAppConfig(r io.Reader, path string) (AppConfig, error) {
+	dec := yaml.NewDecoder(r)
 	dec.KnownFields(true) // 未知字段直接报错，防手误
 	var c AppConfig
 	if err := dec.Decode(&c); err != nil {

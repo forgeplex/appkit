@@ -1,0 +1,44 @@
+version: 1
+package: sample
+system: probe
+types:
+{{- if not .RemoveMarker }}
+  - name: Marker
+    doc: A structural compatibility sentinel used directly by both consumers.
+    fields:
+      - {name: value, type: string}
+{{- end }}
+{{- if .Additive }}
+  - name: AdditionalMarker
+    doc: An additive standalone DTO does not change the existing service interface.
+    fields:
+      - {name: value, type: string}
+{{- end }}
+methods:
+  - name: Echo
+    path: /echo
+    doc: Reports fixture identity and the boundary context it observed.
+    request:
+      - {name: payload, type: string}
+{{- if .Additive }}
+      - {name: tag, type: string}
+{{- end }}
+    response:
+      - {name: message, type: string}
+      - {name: revision, type: int64}
+      - {name: request_id, type: string}
+      - {name: partition, type: string}
+      - {name: tenant_id, type: string}
+      - {name: caller, type: string}
+      - {name: forbidden, type: bool}
+      - {name: has_deadline, type: bool}
+{{- if .Additive }}
+      - {name: capability, type: string}
+{{- end }}
+  - name: Ping
+    path: /ping
+    doc: A second method whose signature is deliberately broken in a negative test.
+{{- if .BreakSignature }}
+    request:
+      - {name: mode, type: string}
+{{- end }}

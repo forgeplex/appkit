@@ -5,6 +5,8 @@ forgeplex 的 Go 后端运行时框架：任何业务域拿来即用；用工具
 
 **使用手册：[docs/GUIDE.md](docs/GUIDE.md)**（从零构建一个系统的完整步骤，以 SSO 为例）。
 **设计文档：[docs/DESIGN.md](docs/DESIGN.md)**（仓库拓扑、约束分级、组合机制、请求路径）。
+**模块复用与 Agent 流程：[docs/AGENT_WORKFLOW.md](docs/AGENT_WORKFLOW.md)**（AppKit 主运行时、命名实例、plan/apply 与恢复边界）。
+**可复用框架验收：[docs/FRAMEWORK_ACCEPTANCE.md](docs/FRAMEWORK_ACCEPTANCE.md)**（真实多 module 复用/升级、数据库隔离与可重复执行的门禁）。
 
 ## 包一览
 
@@ -40,8 +42,13 @@ go run github.com/forgeplex/appkit/cmd/appkit help
 | `appkit dev` | go.work 多仓本地联调（幂等） |
 | `appkit sync [--check]` | 物化/校验 lint 配置与 CI 引用（漂移即 CI 失败） |
 | `appkit check` | 架构检查：域间依赖铁律、import 方向矩阵、SQL 跨 schema、迁移编号 |
-| `appkit schema [-check]` | 从 `db/migrations` 派生 `db/SCHEMA.md` + `db/schema/`（表清单、ER 图、每表 DDL），要连 DB |
+| `appkit schema [-check]` | 从迁移派生 schema 文档；分区域生成 logical-template；需要临时数据库 |
 | `appkit gen events\|errors\|wrap` | 从 yaml 生成事件/错误码；从接口生成 contract.Call 拦截 wrapper |
+| `appkit gen contract [-check]` | 从契约 YAML 生成五份产物，或只读检查生成漂移 |
+| `appkit plan sync\|contract\|events\|errors\|wrap\|new` | 输出带输入/输出前置条件的规范 JSON 文件变更计划，不写目标 |
+| `appkit plan schema -allow-temp-db` | 在临时库执行可信迁移，输出绑定目录快照的文档计划；apply 不再连 DB |
+| `appkit apply -plan <file>` | 应用已审查计划，拒绝漂移，支持故障恢复与幂等重放 |
+| `appkit contract-check -base <yaml> -candidate <yaml>` | 保守比较 AppKit 契约模型，JSON 列出不兼容点，不写文件 |
 
 ## 快速开始
 

@@ -7,8 +7,9 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 
 ## 分区域域（partitioned）——先读这段再动手
 
-本域一套代码、N 份数据分区：schema 由调用方确定（租户身份经 X-Tenant-Id
-头传播，组合根注入「租户 → schema」映射，见 `internal/module/module.go`）。
+本域一套代码、N 份数据分区：schema 由调用方确定（分区键由 authn.MultiIssuer
+按令牌签发方焊入 callctx、内部东西向经 X-Partition 头传播，组合根注入
+「分区键 → schema」映射，见 `internal/module/module.go`）。
 因此本仓库的 SQL 纪律与单 schema 域**恰好相反**：
 
 1. `db/migrations/` 与 `db/queries/` 一律**不带 schema 前缀**——落位由
@@ -18,24 +19,29 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
    `pgtx.From` 落在默认 search_path 上，无前缀表不存在即报错；
 3. 分区不是本仓库的知识：加分区去组合根改映射 + 重启，迁移自动建
    schema，本仓库零改动；
-4. `make schema` 不适用本形态（`appkit schema` 会明确报错）。
+4. `make schema` 自动生成 **logical-template（逻辑模板）**：无前缀迁移只在
+   一次性临时库的代表 schema `{{.Name}}` 回放一遍，未枚举或检查运行时分区。
 {{- end}}
 {{- if .Tenant}}
 
 ## 租户域（tenant）——先读这段再动手
 
-本域单 schema、行级隔离：全部租户的数据共表，`tenant_id` 列 + RLS 策略
-在存储层隔开。三条纪律：
+本域{{if .Partitioned}}每个分区内{{else}}单 schema、{{end}}行级隔离：全部租户的数据共表，`tenant_id` 列 + RLS 策略
+在存储层隔开。四条纪律：
 
 1. **建带租户的表照抄 `db/migrations/0002` 的形态**：`tenant_id text NOT NULL`
-   列 + 以 tenant_id 打头的索引 + RLS 三件套（`pgtx.TenantPolicySQL` 的
-   输出——ENABLE + FORCE + 策略）。漏挂三件套的表服务会拒绝启动
+   列 + 以 tenant_id 打头的索引 + RLS 策略（`pgtx.TenantPolicySQL{{if .Partitioned}}Bare{{end}}` 的
+   输出——ENABLE + FORCE + 隔离策略 + 读全部策略）。漏挂的表服务会拒绝启动
    （`pgtx.VerifyTenantRLS`，见 module.go 的 Setup）；
 2. **业务查询照旧经 `tx.Do`**（骨架的既有形态就是）——租户身份由
-   `pgtx.NewTenant` 的事务自动落成 GUC；绕开事务直查业务表会被策略函数
+   `pgtx.New{{if .Partitioned}}Routed{{end}}Tenant` 的事务自动落成 GUC；绕开事务直查业务表会被策略函数
    响亮拒绝（`app.tenant_id 未设置`），这是特性不是故障；
 3. **租户身份只从 `callctx.From(ctx).TenantID` 取**——authn 已从令牌 tid
-   焊入，业务代码读请求头即伪造面。
+   焊入，业务代码读请求头即伪造面；
+4. **跨租户读只有一个入口**：管理面用例先过跨租户权限码（`reg.Require`），
+   再 `ctx = tx.WithReadAllTenants(ctx)` 后 `Do`——只放开 SELECT{{if .Partitioned}}、只在本分区内{{end}}，
+   写入仍只落当前租户；代某租户写要显式 `callctx.With` 切到目标租户。
+   标记必须在最外层 Do 之前打，嵌套内切换会被拒。
 
 隔离在存储层强制的含义：SQL 里漏写租户 WHERE，结果是查不到别的租户的行
 / 跨租户写入被拒，而不是静默泄漏。
@@ -45,16 +51,14 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 
 | 路径 | 职责 | 你会经常改吗 |
 |---|---|---|
-| `internal/{{.Name}}/` | ★ 业务包：领域类型、不变量、用例编排、所需接口 | 是，主战场 |
+| `internal/{{.Name}}/` | ★ 业务包：领域类型、不变量、用例编排、所需接口；文件按功能名前置成簇（见「文件怎么分」） | 是，主战场 |
 | `internal/postgres/` | Store 实现；**全仓唯一允许 import pgx/sqlc 的包** | 是 |
 | `internal/postgres/sqlc/` | sqlc 生成物 | **禁止手改**（make gen 重新生成） |
-| `internal/http/` | handler：只做 DTO ↔ 领域类型映射 | 是 |
+| `internal/http/` | handler：只做 DTO ↔ 领域类型映射；每个资源一个文件 | 是 |
 | `internal/inbox/` | 外域事件消费者 | 偶尔 |
 | `internal/module/module.go` | 唯一 wiring 落点（Provide/Mount/Migrations/Health） | 每加路由/用例改一行 |
 | `db/migrations/` | 迁移；`0001_appkit_base.sql` 是框架基础表 | 新增文件，**不改旧文件** |
-{{- if not .Partitioned}}
-| `db/SCHEMA.md`、`db/schema/` | 表结构总览 + ER 图 + 每表详情，从迁移派生 | **禁止手改**（make schema 重新生成） |
-{{- end}}
+| `db/SCHEMA.md`、`db/schema/` | {{if .Partitioned}}逻辑模板总览{{else}}表结构总览{{end}} + ER 图 + 每表详情，从迁移派生 | **禁止手改**（make schema 重新生成） |
 | `db/queries/` | SQL 唯一存在地（sqlc 源） | 是 |
 | `{{.Name}}.go`、`cmd/` | 导出面与部署入口 | 几乎不 |
 | `.golangci.yml`、`.go-arch-lint.yml`、`.github/` | appkit sync 物化的规则 | **禁止手改**（appkit sync 刷新） |
@@ -76,20 +80,17 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
    改动会让服务以 `MIGRATION_DRIFT` 拒绝启动，改表结构永远新开文件。
 {{- if .Tenant}}
    带租户数据的表照抄 `0002_demo_notes.sql` 的形态（tenant_id 列 + 租户打头
-   索引 + RLS 三件套），漏挂三件套服务会拒绝启动。
+   索引 + RLS 策略），漏挂策略服务会拒绝启动。
 {{- end}}
-{{- if .Partitioned}}
-   建表时在同一个迁移里写 `COMMENT ON TABLE users IS '…'`——表的用途
-   属于 schema 设计，写在迁移里才会跟着表一起演进，写在外部文档里必腐。
-   （schema 文档暂不支持分区域形态，COMMENT 就是当前的自描述手段。）
-{{- else}}
-   动手前先读 `db/schema/<表>.sql` 看这张表**现在**长什么样——迁移是追加日志，
+   动手前先读 `db/schema/<表>.sql` 看这张表{{if .Partitioned}}的**逻辑模板**{{else}}**现在**{{end}}长什么样——迁移是追加日志，
    一张表的真实形状散在 N 个文件里，别在脑子里重放整条历史。
-   建表时在同一个迁移里写 `COMMENT ON TABLE {{.Name}}.users IS '…'`——表的用途
+   建表时在同一个迁移里写 `COMMENT ON TABLE {{if not .Partitioned}}{{.Name}}.{{end}}users IS '…'`——表的用途
    属于 schema 设计，写在迁移里才会跟着表一起演进，写在外部文档里必腐；缺了会在
    `db/SCHEMA.md` 里被标 ⚠，CI 的 `appkit schema -check` 会逐表打 ::warning
    注解（不阻断合并，但 review 与 PR 里都看得见）。
    写完跑 `make schema` 重新生成 schema 文档，产出一并提交。
+{{- if .Partitioned}}
+   产物标为 logical-template，不证明任何运行时分区的当前结构或租户数据隔离行为。
 {{- end}}
 2. **SQL** `db/queries/xxx.sql`：sqlc 注释语法（`-- name: InsertUser :exec`），
    {{- if .Partitioned}}表名不带 schema 前缀{{else}}表名带 `{{.Name}}.` 前缀{{end}}。然后 `make gen`。
@@ -97,7 +98,8 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
    - 领域类型 + 校验（纯函数，错误用 `apperr`）；
    - `store.go` 的 Store 接口加方法（签名只出现领域类型）;
    - `errors.go` 加错误模板（`apperr.New("{{.Upper}}_XXX", 状态码, 消息)`）；
-   - `service.go` 加用例方法，**标准形态**：
+   - `<功能>_service.go` 加用例方法（挂在同一个 `*Service` 上；`service.go` 只放
+     Service 本体与公共件），**标准形态**：
      ```go
      func (s *Service) CreateUser(ctx context.Context, in CreateUser) (User, error) {
          if err := in.validate(); err != nil { return User{}, err }  // ① 不变量
@@ -113,10 +115,43 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
    `sqlc.New(pgtx.From(ctx, s.pool)).InsertUser(...)`——`pgtx.From` 自动感知
    事务，不要传递任何事务对象。唯一约束冲突（pgconn.PgError 23505）在这里
    翻译成域错误；除此之外本包不做业务判断。
-5. **handler** `internal/http/`：解码 → 调 Service → 编码；错误一律
-   `httpserver.WriteError(log, w, err)`（自动 RFC 9457）。
+5. **handler** `internal/http/<功能>.go`：解码 → 调 Service → 编码；错误一律
+   `httpserver.WriteError(log, w, err)`（自动 RFC 9457）。一个资源的全部端点与
+   请求体类型放同一个文件，`handler.go` 只留公共件（decode/write）。
 6. **挂路由** `internal/module/module.go`：Setup 里构造 handler，
    Register 里 `reg.Mount("POST /users", ...)`（照 ping 的现有样式）。
+
+## 文件怎么分（按功能，不按层）
+
+目录里的文件以**功能名词（单数）前置**，让 `ls` 按功能成簇——读者找一个功能
+只看一簇文件，不用在按层排的列表里来回跳：
+
+- 业务包 `internal/{{.Name}}/`：`<功能>.go` 放领域类型 + 不变量（纯函数），
+  `<功能>_service.go` 放该功能的用例方法（都挂在同一个 `*Service` 上），
+  `<功能>_test.go` 是它的单测。`service.go` 只留 Service 结构体、构造函数与
+  跨功能公共件；`store.go` / `errors.go` / `events.go` 全包共享，保持单文件。
+  不要按层起名（`service_xxx.go` 会让一个功能的两半在目录里隔开）。
+- transport `internal/http/`：`<功能>.go` 放该资源的全部端点与请求体类型；
+  `handler.go` 只留公共件（decode/write）；出站 DTO 集中在 `dto.go`（跨功能
+  复用）。测试同样按功能拆 `<功能>_test.go`，夹具留在 `handler_test.go`。
+- `internal/postgres/` 与 `db/queries/`：按**表**分文件，文件名 = 表名
+  （复数，与 sqlc 生成的 `<表>.sql.go` 一一对应）：`users.sql` →
+  `sqlc/users.sql.go` → `postgres/users.go`。
+- 一个文件超过 ~400 行、或一个功能自己攒出 4 个以上文件，是该拆的信号。
+
+**域真的大了再拆子包，且只有一种拆法**：按功能拆成 `internal/{{.Name}}/<功能>/`
+（嵌套在业务包之下），父包只留跨功能共享的词汇（错误模板、事件、共用值对象）。
+每个子包声明自己那张窄 Store 接口（接口放消费方），`internal/postgres` 一个
+结构体同时实现全部窄接口。两条禁令：
+
+1. **不按层拆**：不要 `internal/{{.Name}}/model`、`/service`、`/repo`——包名读不出
+   内容、`model.User` 必然 stutter，且没解决任何阅读问题（找一个功能仍要跨三个
+   目录）；
+2. **不拆成平级包**：`internal/<功能>` 与 `internal/{{.Name}}` 平级会逃出「业务包
+   零 infra import」的机检（depguard / go-arch-lint / appkit check 都按
+   `internal/{{.Name}}/**` 圈定业务包），在里面 import `net/http` 不会有任何告警。
+
+这一节是约定级（文件组织没有可靠的 lint 落点），靠 review 与本规程维持。
 
 ## 惯用法（别自己发明）
 
@@ -157,9 +192,7 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 
 ```sh
 make gen        # sqlc 生成（改了 db/queries 后必跑）
-{{- if not .Partitioned}}
-make schema     # 重新生成 db/SCHEMA.md 与 db/schema/（改了迁移后必跑，需 docker）
-{{- end}}
+make schema     # 重新生成 db/SCHEMA.md 与 db/schema/（{{if .Partitioned}}logical-template；{{end}}改了迁移后必跑，需 docker）
 make run        # 本地起服（config/dev.yaml；database.url 留空 = 无 DB 最小模式）
 make dev-db     # 一次性本地 Postgres（与 dev.yaml 匹配）
 make migrate    # 只应用迁移然后退出（生产上跑在 initContainer/Job 里）
@@ -188,12 +221,10 @@ spy），把跨边界元数据也纳进来——那条走请求头，返回值�
 
 ## 完成的定义
 
-`make gen`（如改过 SQL）{{if not .Partitioned}}与 `make schema`（如改过迁移）{{end}}之后，
+`make gen`（如改过 SQL）与 `make schema`（如改过迁移）之后，
 **`make check && make lint && make test` 全绿**才算完成
 （这三条就是 CI 跑的那几条，本地绿基本等于 CI 绿）。
-{{- if not .Partitioned}}
-schema 文档漂移由 CI 单独一步 `appkit schema -check` 拦，忘了重新生成会红。
-{{- end}}
+采用 schema 文档后，漂移由 CI 单独一步 `appkit schema -check` 拦，忘了重新生成会红。
 不要用 `//nolint` 绕过检查（必须写理由且 review 会拒）；不要修改生成物、
 已应用的迁移、`.golangci.yml` 等物化配置来让检查通过——那是在破坏约束本身，
 正确做法永远是让代码符合约束。

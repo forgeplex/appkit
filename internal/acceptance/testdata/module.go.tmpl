@@ -1,0 +1,63 @@
+package reusable
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"time"
+
+	"example.test/contracts/sample"
+	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
+	"github.com/forgeplex/appkit/tx"
+)
+
+// Revision changes in the one shared implementation module during acceptance.
+const Revision int64 = {{ .Revision }}
+const BoundaryTimeout = 150 * time.Millisecond
+
+type SecretKey struct{}
+
+type Service struct {
+	Instance string
+	Calls atomic.Int64
+}
+
+var _ sample.Service = (*Service)(nil)
+
+func (s *Service) Echo(ctx context.Context, req sample.EchoRequest) (sample.EchoReply, error) {
+	s.Calls.Add(1)
+	switch req.Payload {
+	case "fail":
+		return sample.EchoReply{}, errors.New("private fixture cause")
+	case "coded":
+		return sample.EchoReply{}, apperr.New("FIXTURE_REJECTED", 409, "rejected")
+	case "wait":
+		<-ctx.Done() // This fixture cooperates with cancellation; no preemption claim.
+		return sample.EchoReply{}, ctx.Err()
+	}
+	meta := callctx.From(ctx)
+	_, deadline := ctx.Deadline()
+	return sample.EchoReply{
+		Message: s.Instance + ":" + req.Payload, Revision: Revision,
+		RequestID: meta.RequestID, Partition: meta.Partition, TenantID: meta.TenantID, Caller: meta.Caller,
+		Forbidden: ctx.Value(SecretKey{}) != nil || tx.ReadsAllTenants(ctx) || tx.HasTx(ctx),
+		HasDeadline: deadline,
+	}, nil
+}
+
+func (s *Service) Ping(context.Context) error { return nil }
+
+// Module is the reusable module itself, not a source copied into each consumer.
+// The returned probe is a fixture observation handle, not a contract dependency.
+func Module(instance string) (appkit.Module, *Service) {
+	s := &Service{Instance: instance}
+	return appkit.ModuleFunc("probe-" + instance, func(reg *appkit.Registry) error {
+		appkit.ProvideContractNamed[sample.Service](reg, instance,
+			func(*appkit.Registry) (sample.Service, error) { return s, nil },
+			func(inner sample.Service) sample.Service { return sample.WrapService(inner, BoundaryTimeout) },
+		)
+		return nil
+	}), s
+}

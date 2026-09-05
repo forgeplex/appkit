@@ -43,6 +43,17 @@ func Render(s Schema) (map[string]string, error) {
 		return nil, err
 	}
 	out[docFile] = overview
+	if s.LogicalTemplate {
+		for name, content := range out {
+			if strings.HasSuffix(name, ".sql") {
+				out[name] = strings.Replace(content, sqlHeader, sqlHeader+
+					fmt.Sprintf("-- logical-template：分区逻辑模板；%s 是代表 schema，未检查运行时分区。\n", s.Name), 1)
+			} else {
+				out[name] = strings.Replace(content, mdHeader, mdHeader+
+					fmt.Sprintf("\n> 逻辑模板（logical-template）：无前缀迁移仅在一次性临时库的代表 schema `%s` 回放一遍；未枚举或检查任何运行时分区。\n", s.Name), 1)
+			}
+		}
+	}
 	return out, nil
 }
 

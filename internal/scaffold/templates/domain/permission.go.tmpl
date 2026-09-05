@@ -1,0 +1,26 @@
+package {{.Name}}
+
+import "github.com/forgeplex/appkit"
+
+// 本域的权限码：端点绑码（reg.Require）与组合根组角色都引用这里的常量，
+// 不手抄字符串。目录是应用级的（与数据分区无关）：Register 期经
+// reg.Permissions 汇总进全应用目录，鉴权提供方（如 rbac）据此同步落库。
+const (
+	PermRead = "{{.Name}}:read"
+{{- if .Tenant}}
+	// PermReadAll 是跨租户读（运营面）：持码的用例先过 reg.Require，再
+	// tx.WithReadAllTenants 放开 SELECT{{if .Partitioned}}（只在本分区内）{{end}}；写入仍只落当前租户。
+	PermReadAll = "{{.Name}}:read_all"
+{{- end}}
+)
+
+// PermissionCatalog 透出本域权限码目录，组合根组角色时合入。
+func PermissionCatalog() []appkit.PermissionDecl {
+	return []appkit.PermissionDecl{
+		{Code: PermRead, Name: "读取", Category: "{{.Name}}"},
+{{- if .Tenant}}
+		{Code: PermReadAll, Name: "跨租户读取", Category: "{{.Name}}",
+			Description: "读{{if .Partitioned}}本分区内{{end}}全部租户的数据（运营面）"},
+{{- end}}
+	}
+}
