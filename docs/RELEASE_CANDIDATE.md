@@ -1,11 +1,11 @@
-# 模块复用版本：发布候选与升级清单
+# v0.9.0 模块复用版本：升级清单
 
-状态：本地候选，尚未发布。建议版本 **v0.9.0**，待确认；历史上撤回的 v0.8.0
-不可重新使用。本文件是升级说明草案，不是 annotated tag message 或 CHANGELOG 的替代。
-正式发布时仍按 AGENTS.md 以 annotated tag 正文为事实源。
+本文件对应已确认的 **v0.9.0** 发布范围；历史上撤回的 v0.8.0 不可重新使用。
+实际发布状态以 GitHub 的 tag / Release 为准。本文件不是 annotated tag message
+或 CHANGELOG 的替代；按 AGENTS.md 以 annotated tag 正文为版本说明的事实源。
 
-候选将本地模块复用/Agent 工作流与远端 main 的安全修复整合。远端基线是
-`6c02802464fe3ad574a77ffb7b919dfdd070ee2c`。原本地工作区不被覆盖，候选保存在
+本版将本地模块复用/Agent 工作流与远端 main 的安全修复整合。整合时的远端基线是
+`6c02802464fe3ad574a77ffb7b919dfdd070ee2c`。原本地工作区没有被覆盖，候选分支为
 `codex/appkit-reuse-release`。本地验收记录见 [FRAMEWORK_ACCEPTANCE.md](FRAMEWORK_ACCEPTANCE.md)。
 
 ## 本版内容
@@ -47,13 +47,17 @@
 8. **规则分发**：升级依赖后运行 `appkit sync` 并审查完整 workflow SHA。
    devel 工具不得用下游 HEAD 作为框架版本；离线时显式给已核验的
    `-workflow-ref`。模块缓存可被版本解析更新，但目标仓库只在实际写入时变化。
+9. **事件投递**：DirectBus 无订阅者返回 `ErrNoSubscriber`，outbox 保留事件重试，
+   不再把无人消费算作成功。拆分 target 默认拒绝隐式 DirectBus，须用 `NewBus`
+   配置外部 broker，或仅在确知单进程语义的场景显式 `AllowDirectBusForSplit`。
+   托管 Bus 会在消费者注册后启动、停机排空；不要依赖旧的静默丢弃行为。
 
 公开 API 的 apidiff 零 incompatible 仅证明声明兼容，**不证明默认启动行为
 不变**。四业务项目的 build/test 通过也不是已执行上述应用装配或数据升级。
 
-## 尚未执行的发布动作
+## 发布流程
 
-版本和完整发布范围确认后，通过受保护 PR 合并，等待 required `ci` 成功。
+通过受保护 PR 合并，等待 required `ci` 成功。
 main 禁止直接覆盖/force-push；不绕过 required checks。选择已通过验收的合并
 提交，按仓库规程同时创建主 annotated tag 与对应 `lint/` tag；生成 CHANGELOG
 镜像也通过正常 PR，随后推送允许创建的 tags，GitHub Release 正文与 tag 一致。

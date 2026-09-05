@@ -178,4 +178,5 @@ RBAC 的 `internal/postgres` 包 18 项全部通过。
 消费方绑定 manifest、完整 catalog/resolver、签名制品、沙箱及状态迁移平台不属于
 当前基线的前置条件。业务数据升级演练、生产发布仍需各项目自己的验收。
 框架整合保存在本地候选分支 `codex/appkit-reuse-release`，原工作区不被覆盖。
-未推送、打 tag 或发布版本；正式发布仍需版本/范围确认、受保护 PR 与远端 CI。
+上述本地验收结束时尚未推送或发布。之后已确认 v0.9.0 的版本与范围；正式发布
+通过受保护 PR 与远端 CI，最终状态以 GitHub tag / Release 为准。

@@ -71,7 +71,7 @@ tag:
 	@! git rev-parse -q --verify "refs/tags/lint/$(VERSION)" >/dev/null || { echo "tag lint/$(VERSION) 已存在"; exit 1; }
 	git tag -a $(VERSION) -F '$(MSG)'
 	git tag "lint/$(VERSION)"
-	@echo "已打 $(VERSION) + lint/$(VERSION)；推送：git push origin main $(VERSION) lint/$(VERSION)"
+	@echo "已打 $(VERSION) + lint/$(VERSION)；CHANGELOG PR 合并后推送：git push --atomic origin $(VERSION) lint/$(VERSION)"
 
 # 重生成 CHANGELOG.md：内容 = 各版本 annotated tag message 的镜像，按版本倒序。
 # tag 是事实源，本文件禁手改——发版三件套之一（顺序见 AGENTS.md「发版」：
