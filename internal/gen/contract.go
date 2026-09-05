@@ -295,6 +295,11 @@ func resolveType(f *fieldDef, named map[string]bool) (string, error) {
 		}
 		return "[]" + elem, nil
 	}
+	// refs is opt-in for contracts. Do not add it to goTypes: that table is
+	// also consumed by the separate events generator.
+	if t == "refs" {
+		return "refs.Values", nil
+	}
 	if goType, ok := goTypes[t]; ok {
 		return goType, nil
 	}
@@ -302,9 +307,9 @@ func resolveType(f *fieldDef, named map[string]bool) (string, error) {
 		return t, nil
 	}
 	if named == nil {
-		return "", fmt.Errorf("类型 %q 不支持（命名 DTO 的字段仅允许 string|int64|bool|decimal|timestamp 及其数组，嵌套封顶一层）", t)
+		return "", fmt.Errorf("类型 %q 不支持（命名 DTO 的字段仅允许 string|int64|bool|decimal|timestamp|refs 及其数组，嵌套封顶一层）", t)
 	}
-	return "", fmt.Errorf("类型 %q 不支持（仅允许 string|int64|bool|decimal|timestamp、其数组、或 types 段声明的命名 DTO）", t)
+	return "", fmt.Errorf("类型 %q 不支持（仅允许 string|int64|bool|decimal|timestamp|refs、其数组、或 types 段声明的命名 DTO）", t)
 }
 
 // usesTime 报告生成物是否需要 import time。
@@ -325,6 +330,50 @@ func (d *contractDoc) usesTime() bool {
 	for _, m := range d.Methods {
 		if has(m.Request) || has(m.Response) {
 			return true
+		}
+	}
+	return false
+}
+
+func (d *contractDoc) usesRefs() bool {
+	for _, t := range d.Types {
+		if d.fieldsUseRefs(t.Fields) {
+			return true
+		}
+	}
+	for _, m := range d.Methods {
+		if d.fieldsUseRefs(m.Request) || d.fieldsUseRefs(m.Response) {
+			return true
+		}
+	}
+	return false
+}
+
+// scalarType mirrors resolveType's recursive array handling.
+func scalarType(typeName string) string {
+	for strings.HasPrefix(typeName, "[]") {
+		typeName = typeName[2:]
+	}
+	return typeName
+}
+
+// fieldsUseRefs includes named DTOs, whose own fields cannot reference another
+// named DTO. Both direct values and arbitrarily nested array forms are covered.
+func (d *contractDoc) fieldsUseRefs(fields []fieldDef) bool {
+	for _, f := range fields {
+		base := scalarType(f.Type)
+		if base == "refs" {
+			return true
+		}
+		for _, typ := range d.Types {
+			if typ.Name != base {
+				continue
+			}
+			for _, nested := range typ.Fields {
+				if scalarType(nested.Type) == "refs" {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -354,7 +403,13 @@ func renderService(doc *contractDoc) []byte {
 	var b bytes.Buffer
 	b.WriteString(header)
 	fmt.Fprintf(&b, "package %s\n\n", doc.Package)
-	if doc.usesTime() {
+	if doc.usesRefs() {
+		b.WriteString("import (\n\t\"context\"\n")
+		if doc.usesTime() {
+			b.WriteString("\t\"time\"\n")
+		}
+		b.WriteString("\n\t\"github.com/forgeplex/appkit/refs\"\n)\n\n")
+	} else if doc.usesTime() {
 		b.WriteString("import (\n\t\"context\"\n\t\"time\"\n)\n\n")
 	} else {
 		b.WriteString("import \"context\"\n\n")

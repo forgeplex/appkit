@@ -122,6 +122,8 @@ appkit/                          # module github.com/forgeplex/appkit
 ├── money/                       # Money(decimal + currency) 领域值对象，不落库；
 │                                #   NUMERIC 持久化走 decimal.Decimal（pgx 原生
 │                                #   编解码，pgxmoney 已废弃）；全系统禁 float 金额
+├── refs/                        # 可选的资源引用值与版本化定义：严格 JSON、必填/
+│                                #   格式/不可变校验；不含身份、跨域查验或持久化
 ├── page/                        # 列表端点的分页机制件：?limit 解析校验（畸形 422
 │                                #   不静默裁剪）、游标不透明编解码（JSON→base64url）、
 │                                #   items+next_cursor 信封、limit+1 多取一行判
@@ -624,6 +626,8 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 权限判定语义统一（集合包含 + step-up 新鲜度） | `MountPermission` / `reg.Require` 共用唯一判定实现，401/403/STEP_UP 矩阵在框架；业务域不再各写一份会漂移的判定 | ★ API 设计级 |
 | 验签只在 authn 一处、模块不自解凭证 | 组合根挂链 + 脚手架注释教学 | ▲ 提高绕过成本：模块仍可自解 Authorization 头绕过，无机制挡 |
 | 列表端点分页形态统一（limit 解析/游标编码/响应信封） | `page` 包：`Parse` 值域校验（畸形 422，不静默裁剪）+ 游标不透明编解码（JSON→base64url）+ `List` 信封 + `Trim` 的 limit+1 多取一行技巧；机制归框架，排序键与 keyset SQL 归域 | 约定级：用不用在域，自写手翻页无机检——形态统一靠采纳与 review |
+| 可选资源引用有统一值格式与结构规则 | `refs.Values` 私有 map + 防御性复制 + 严格平面 JSON；`refs.Schema` 校验声明键、格式、必填与完整快照更新；契约生成器 opt-in `refs` 类型输出 Values 与 OpenAPI 对象 | ▲ API/生成级：采用 Values 的 JSON 入口强制值格式；资源 Schema 必须由业务显式调用，绕过校验的原生存储写入不受保护。不强加 BaseModel 或业务列 |
+| 引用不等于身份，不隐含跨域归属与并发保证 | refs 不进 callctx/claims；Target 只是类型语义；归属与授权经业务契约验证，持久化须版本检查或等效原子约束 | ▲ 边界设计级 + 用例纪律：框架不自动证明目标存在、父子关系、跨域一致性或 Schema 版本兼容；见 [REFS.md](REFS.md) |
 | 业务包 / transport 文件按功能成簇、子包只嵌套在业务包下 | 脚手架 AGENTS.md「文件怎么分」+ §4；三条方向性约束的机检（depguard / go-arch-lint / archcheck）都按 `internal/<domain>/**` 圈定业务包，嵌套子包自动纳入 | 约定级：文件命名与「不按层拆」没有 lint 落点；「不拆平级包」的后果（逃出机检）是靠规程点名的，不是工具拦的——文件行数检查器不存在，别假装有 |
 
 逃生舱（防止约束被政治性推翻）：带理由的 `//nolint`（nolintlint 强制）、
@@ -632,6 +636,13 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
 
 ## 8. 数据与运维约定
 
+- **跨域引用是可选资源契约，不是全局 metadata**：同一通用域可在不同项目显式
+  注入不同的版本化 `refs.Spec`，但同一资源身份/版本的生产者与消费者必须共享
+  同一份定义，不能在各组合根静默改写语义。Schema 不访问其他域，不自动解析
+  merchant → account → channel 等层级。`ValidateFilter` 只验证部分等值筛选条件，
+  不生成 SQL、不保证索引或访问权限。需要 JSONB 时，迁移、参数化查询、热点
+  原生列/表达式索引仍由资源自己的存储适配器维护；本轮没有 Scanner/Valuer、
+  自动 DDL 或查询编译器。完整用法和边界见 [REFS.md](REFS.md)。
 - **每域一或多个 Postgres schema**（单体单库多 schema；拆分后可平移为多库），独立迁移历史表；
   连接池按数据库共享而非按模块独占（防连接数爆炸）。默认形态是每域恰好一个
   （schema 名 = 域名）；「多个」只以分区域域这一种受控形态出现，见下条。

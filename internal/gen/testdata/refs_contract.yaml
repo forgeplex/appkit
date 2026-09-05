@@ -1,0 +1,48 @@
+version: 1
+package: refsfixture
+system: order
+types:
+  - name: Entry
+    fields:
+      - {name: refs, type: refs}
+      - {name: history, type: "[]refs"}
+methods:
+  - name: Exchange
+    path: /exchange
+    doc: Echo reference values without claiming resource ownership validation.
+    request:
+      - {name: refs, type: refs}
+      - {name: links, type: refs}
+      - {name: batches, type: "[][]refs"}
+      - {name: entry, type: Entry}
+      - {name: entries, type: "[]Entry"}
+    response:
+      - {name: refs, type: refs}
+      - {name: batches, type: "[][]refs"}
+      - {name: entry, type: Entry}
+      - {name: entries, type: "[]Entry"}
+  - name: Load
+    path: /load
+    doc: Return a reference collection without a request DTO.
+    response:
+      - {name: refs, type: refs}
+  - name: Store
+    path: /store
+    doc: Accept a reference collection without a response DTO.
+    request:
+      - {name: refs, type: refs}
+  - name: Nested
+    path: /nested
+    doc: Accept references only inside a named DTO array.
+    request:
+      - {name: entries, type: "[]Entry"}
+  - name: Ping
+    path: /ping
+    doc: Liveness without request or response.
+  - name: Legacy
+    path: /legacy
+    doc: Unchanged decoding on a route that does not accept references.
+    request:
+      - {name: scope, type: string}
+    response:
+      - {name: scope, type: string}

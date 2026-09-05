@@ -1309,3 +1309,33 @@ schema 文档使用 `appkit plan schema -allow-temp-db`：临时库执行需显�
 保持实例名与 tenant / partition / merchant 身份分离。
 
 完整可执行示例、JSON 协议、退出码和恢复限制见 [AGENT_WORKFLOW.md](AGENT_WORKFLOW.md)。
+
+## 可选业务引用：refs
+
+需要跨产品复用的资源可以显式声明 `Refs refs.Values`：PSP 的订单保存
+merchant、merchant account、channel group、channel 四个具名引用，另一种订单可以只引用 store。
+框架不生成所有模型共用的 BaseModel，不自动给所有表加列，也不把引用加入 `callctx`。
+
+在资源的共享契约中用 `refs.Spec{Domain, Resource, Version, Definitions}` 定义允许的键、
+目标资源、ID 格式、必填和不可变规则，经 `refs.NewSchema` 构造后由组合根选择并注入。
+不能在同一资源契约版本下让不同应用悄悄使用互不兼容的定义。
+
+域写入口使用 `Schema.DecodeJSON`（或 `Validate`）校验完整值；更新使用
+`ValidateUpdate(before, after)` 校验两个完整快照；查询用 `ValidateFilter` 校验部分条件。
+这些都只做值与规则校验：业务适配器仍须经契约确认账户属于商户及调用者有权使用，
+契约查询放在本地写事务之前；写入订单、refs 和 outbox 在同一域事务内完成。
+并发更新须配行锁或数据库版本检查，不能靠内存中的 immutable 校验防止覆盖。
+
+契约 YAML 的显式 `type: refs` 生成 `refs.Values`，不强制所有 DTO 带 refs。
+JSONB 存储适配、组合查询 SQL、索引迁移和真实归属契约仍由域实现，本轮不自动提供；
+引用筛选也不替代可信 tenant / partition 与 RLS。该新增能力不在已发布的 v0.9.1 中。
+
+在 AppKit 仓库根目录可以直接验证：
+
+```sh
+go run ./examples/refsorder
+go test ./refs ./examples/refsorder
+```
+
+示例只使用内存值和明确标注的授权/归属测试桩，无需数据库、服务或业务密钥。
+完整 API、版本约定、JSONB 查询说明和范围边界见 [REFS.md](REFS.md)。
