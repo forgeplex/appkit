@@ -2,6 +2,22 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.9.2（2026-09-05）
+
+v0.9.2 — optional resource references for reusable domains
+
+This release adds an opt-in refs capability so reusable domains can represent project-specific external references without importing another domain or forcing merchant fields into every resource.
+
+- Add refs.Values: detached single-valued reference snapshots, deterministic JSON, bounded inputs, and strict rejection of duplicate keys, null values, malformed Unicode and ambiguous JSON.
+- Add versioned refs.Spec and refs.Schema: declared reference roles, explicit opaque/UUID ID formats, required references, immutable updates and partial-filter validation. Validation is structural; target existence, ownership, authorization and concurrency control remain explicit domain responsibilities.
+- Add contract.yaml type: refs, generating refs.Values in requests, replies, named DTOs and arrays, plus OpenAPI object schemas. Requests containing refs use bounded, unambiguous JSON decoding. Contracts without refs retain their existing generated output.
+- Add a runnable order example for PSP merchant/account/channel references and a separate no-merchant project, with API, storage and security guidance.
+- Preserve public API compatibility with v0.9.1. No database migration, automatic BaseModel field, identity propagation, JSONB driver adapter, SQL/index generator or event-YAML refs type is introduced.
+
+Verified with full framework checks, race tests against disposable PostgreSQL, lint and materialized-rule integration tests, generated HTTP round trips, fuzz testing and the public API compatibility gate.
+
+Upgrade AppKit and the appkit-lint module together to v0.9.2, then run the version-pinned appkit sync to refresh generated CI/rules. Existing domains can upgrade without adding refs to their tables; adopt resource schemas only where the domain needs extensible references.
+
 ## v0.9.1（2026-09-05）
 
 服务身份、安全远程契约与业务接入收尾
