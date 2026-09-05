@@ -65,6 +65,8 @@ CI 都会校验未漂移（改松规则不会让检查变绿）。CI 先验漂�
 `make schema-sqlc` 使用 `TEST_DATABASE_URL` 指定的一次性测试服务器，在新随机库
 回放迁移，生成 `db/schema.sql` 和 `db/schema.lock.json`；不迁移连接串指向的库。
 首次生成后，手动将 `sqlc.yaml` 的 `schema` 改为 `db/schema.sql` 并提交两个产物。
+切换配置后才能继续生成或检查：仅支持一个 PostgreSQL SQL 项和一个快照输入；
+`make schema-check` 与离线 `-check-source` 都会在连接数据库前验证这个配置。
 以后改迁移先 `make schema-sqlc`，再 `make gen`；`make schema-check` 重放核验。
 `make schema` 仍只生成文档和 ER 图，不能替代快照生成。
 

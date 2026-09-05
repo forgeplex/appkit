@@ -1314,6 +1314,7 @@ API，可在仍依赖 v0.9.2 的域中运行，不需要 pg_dump。
 ```sh
 # 在域仓库中；分区域加 -partitioned，固定 schema 域不加
 go run ./internal/postgres/schematool -domain invoice -partitioned
+# 首次生成后，先将 sqlc.yaml 唯一 PostgreSQL schema 输入改为 db/schema.sql
 go run ./internal/postgres/schematool -domain invoice -partitioned -check-source
 go run ./internal/postgres/schematool -domain invoice -partitioned -check
 ```
@@ -1330,6 +1331,9 @@ go run ./internal/postgres/schematool -domain invoice -partitioned -check
 是代码生成/阅读输入，不是部署脚本或完整备份。不支持的特性会明确报错。
 采用快照时仅支持一个 PostgreSQL SQL 项与一个 `db/schema.sql` 输入；未采用快照时
 不会把这些约束施加给已有多输入配置。
+显式生成仅在首次无快照/lock 时允许从单个 `db/migrations` 输入起步；生成后须先
+切换 sqlc 配置再运行后续命令。`-check`、`-check-source` 与采用后的普通测试共用
+sqlc 配置校验；配置改回迁移、多输入或非 PostgreSQL 会在连接数据库前失败。
 分区域使用 sqlc 默认的 `public` 作为编译期代表 schema，不改变 prefixless 运行时
 查询或路由。普通测试校验源/快照哈希，带 TEST_DATABASE_URL 的测试还会重放数据库
 逐字比对；仅修改哈希并不能通过数据库验收。删除一半产物不能关闭检查。

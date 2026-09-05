@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -16,7 +15,6 @@ import (
 
 	"github.com/forgeplex/appkit/ruleset"
 	"github.com/jackc/pgx/v5/pgconn"
-	yaml "go.yaml.in/yaml/v3"
 )
 
 // This test is copied with the tool into internal/postgres/schematool. It makes
@@ -51,28 +49,12 @@ func verifyRepositorySnapshot(ctx context.Context, dir, dsn string) (bool, error
 	if err != nil {
 		return true, err
 	}
-	sqlc, err := readRepoFile(dir, "sqlc.yaml")
+	_, adopted, err := readSQLCState(dir)
 	if err != nil {
 		return true, err
-	}
-	document, err := decodeSQLCConfig(sqlc)
-	if err != nil {
-		return true, err
-	}
-	adopted := usesSnapshotSQLC(document)
-	for _, path := range []string{snapshotPath, lockPath} {
-		_, err := os.Lstat(filepath.Join(dir, path))
-		if err == nil {
-			adopted = true
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			return true, err
-		}
 	}
 	if !adopted {
 		return false, nil
-	}
-	if err := requireSnapshotSQLC(sqlc); err != nil {
-		return true, err
 	}
 	// checkSource validates the lock's domain and partitioned mode against the
 	// same public config parser used by the CLI, not values trusted from the lock.
@@ -85,89 +67,6 @@ func verifyRepositorySnapshot(ctx context.Context, dir, dsn string) (bool, error
 		}
 	}
 	return true, nil
-}
-
-// The snapshot gate deliberately covers one PostgreSQL schema input. Decode
-// YAML normally so comments, aliases and unrelated nested "schema" fields do
-// not change which path sqlc actually uses.
-func requireSnapshotSQLC(config []byte) error {
-	path, err := sqlcSchemaPath(config)
-	if err != nil {
-		return err
-	}
-	if path != snapshotPath {
-		return errors.New("snapshot sqlc.yaml must use schema: db/schema.sql")
-	}
-	return nil
-}
-
-func sqlcSchemaPath(config []byte) (string, error) {
-	document, err := decodeSQLCConfig(config)
-	if err != nil {
-		return "", err
-	}
-	if document["version"] != "2" && document["version"] != 2 {
-		return "", errors.New("schema snapshot requires sqlc configuration version 2")
-	}
-	entries, ok := document["sql"].([]any)
-	if !ok || len(entries) != 1 {
-		return "", errors.New("schema snapshot requires exactly one sqlc SQL entry")
-	}
-	entry, ok := entries[0].(map[string]any)
-	if !ok || entry["engine"] != "postgresql" {
-		return "", errors.New("schema snapshot requires a PostgreSQL sqlc SQL entry")
-	}
-	input := entry["schema"]
-	if paths, ok := input.([]any); ok {
-		if len(paths) != 1 {
-			return "", errors.New("schema snapshot requires exactly one sqlc schema input")
-		}
-		input = paths[0]
-	}
-	path, ok := input.(string)
-	if !ok || path == "" {
-		return "", errors.New("sqlc schema input must be one nonempty string path")
-	}
-	return path, nil
-}
-
-func decodeSQLCConfig(config []byte) (map[string]any, error) {
-	// Decode the entire document, including unknown metadata, so the official
-	// decoder rejects duplicate keys and resolves aliases/merges before adoption
-	// is detected. Snapshot-specific shape restrictions apply only after adoption.
-	decoder := yaml.NewDecoder(bytes.NewReader(config))
-	var document map[string]any
-	if err := decoder.Decode(&document); err != nil {
-		return nil, fmt.Errorf("invalid sqlc.yaml: %w", err)
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		return nil, errors.New("sqlc.yaml must contain exactly one YAML document")
-	}
-	return document, nil
-}
-
-func usesSnapshotSQLC(document map[string]any) bool {
-	// Inspect every actual SQL input, including legacy packages, without treating
-	// comments or unrelated metadata as adoption. A snapshot in an unsupported
-	// configuration must still activate the strict gate instead of bypassing it.
-	for _, key := range []string{"sql", "packages"} {
-		entries, _ := document[key].([]any)
-		for _, value := range entries {
-			entry, _ := value.(map[string]any)
-			inputs, ok := entry["schema"].([]any)
-			if !ok {
-				inputs = []any{entry["schema"]}
-			}
-			for _, input := range inputs {
-				name, ok := input.(string)
-				if ok && filepath.ToSlash(filepath.Clean(name)) == snapshotPath {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
 
 func TestCommandArguments(t *testing.T) {
@@ -201,6 +100,104 @@ func TestCommandArguments(t *testing.T) {
 		if err == nil || strings.Contains(err.Error(), "hidden-secret") {
 			t.Fatalf("expected redacted error, got %v", err)
 		}
+	}
+}
+
+func TestCommandRejectsInvalidSnapshotSQLCBeforeDatabase(t *testing.T) {
+	t.Setenv("TEST_DATABASE_URL", "postgres://hidden-secret@%zz/invalid")
+	for _, config := range []string{
+		"version: 2\nsql: [{engine: postgresql, schema: db/migrations}]\n",
+		"version: 2\nsql: [{engine: postgresql, schema: [db/schema.sql, db/migrations]}]\n",
+		"version: 2\nsql: [{engine: postgresql, schema: db/migrations}, {engine: postgresql, schema: db/schema.sql}]\n",
+		"version: 2\nsql: [{engine: sqlite, schema: db/schema.sql}]\n",
+		"version: 2\ninputs: &inputs [db/migrations, db/schema.sql]\nsql: [{engine: postgresql, schema: *inputs}]\n",
+		"version: 2\ndefaults: &entry {engine: postgresql, schema: db/schema.sql}\nsql: [{engine: postgresql, schema: db/migrations}, {<<: *entry}]\n",
+		"version: 2\nsql: [{engine: postgresql, schema: db/schema.sql}]\nmetadata: {key: 1, key: 2}\n",
+		"version: 2\nsql: [{engine: postgresql, schema: db/schema.sql}]\n---\nnull\n",
+	} {
+		for _, mode := range []string{"generate", "-check", "-check-source"} {
+			t.Run(mode+"/"+config, func(t *testing.T) {
+				dir := schemaToolFixture(t)
+				writeOfflineSnapshot(t, dir)
+				writeSchemaTestFile(t, dir, "sqlc.yaml", config)
+				before := map[string][]byte{
+					snapshotPath: readSchemaTestFile(t, dir, snapshotPath),
+					lockPath:     readSchemaTestFile(t, dir, lockPath),
+				}
+				want := requireSnapshotSQLC([]byte(config))
+				if want == nil {
+					t.Fatal("fixture must fail strict SQLC validation")
+				}
+				args := []string{"-dir", dir, "-domain", "demo", "-partitioned"}
+				if mode != "generate" {
+					args = append(args, mode)
+				}
+				if err := command(args); err == nil || err.Error() != want.Error() {
+					t.Fatalf("command must report SQLC configuration before database access: got %v, want %v", err, want)
+				}
+				assertSchemaOutputs(t, dir, before)
+			})
+		}
+	}
+}
+
+func TestCommandSQLCBootstrap(t *testing.T) {
+	t.Setenv("TEST_DATABASE_URL", "postgres://hidden-secret@%zz/invalid")
+	for _, config := range []string{
+		"version: 2\nsql: [{engine: postgresql, schema: db/migrations}]\n",
+		"version: 2\ndefaults: &entry {engine: postgresql, schema: db/migrations}\nsql: [*entry]\n",
+	} {
+		for _, artifact := range []string{"", snapshotPath, lockPath} {
+			for _, mode := range []string{"generate", "-check", "-check-source"} {
+				t.Run(mode+"/"+artifact+"/"+config, func(t *testing.T) {
+					dir := schemaToolFixture(t)
+					writeSchemaTestFile(t, dir, "sqlc.yaml", config)
+					if artifact != "" {
+						writeSchemaTestFile(t, dir, artifact, "existing artifact")
+					}
+					args := []string{"-dir", dir, "-domain", "demo", "-partitioned"}
+					if mode != "generate" {
+						args = append(args, mode)
+					}
+					err := command(args)
+					if artifact == "" && mode == "generate" {
+						// The invalid DSN proves first generation passed validation,
+						// without needing a server or creating any snapshot files.
+						if err == nil || !strings.Contains(err.Error(), "parse test database connection") {
+							t.Fatalf("first migration-based generation did not reach database setup: %v", err)
+						}
+					} else if want := requireSnapshotSQLC([]byte(config)); err == nil || err.Error() != want.Error() {
+						t.Fatalf("non-bootstrap command bypassed strict configuration: %v", err)
+					}
+					if strings.Contains(err.Error(), "hidden-secret") {
+						t.Fatal("database connection details leaked")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestUnadoptedRepositoryTestsSkipButGenerationValidatesSQLC(t *testing.T) {
+	t.Setenv("TEST_DATABASE_URL", "postgres://hidden-secret@%zz/invalid")
+	for _, config := range []string{
+		"version: 2\nsql: [{engine: postgresql, schema: [db/migrations, db/shared]}]\n",
+		"version: 2\nsql: [{engine: postgresql, schema: db/migrations}, {engine: mysql, schema: db/mysql}]\n",
+		"version: 2\nsql: [{engine: sqlite, schema: db/migrations}]\n",
+		"version: 1\npackages: [{engine: postgresql, schema: db/migrations}]\n",
+		"version: 2\nsql: [{engine: postgresql, schema: db/legacy.sql}]\n",
+	} {
+		t.Run(config, func(t *testing.T) {
+			dir := schemaToolFixture(t)
+			writeSchemaTestFile(t, dir, "sqlc.yaml", config)
+			if adopted, err := verifyRepositorySnapshot(context.Background(), dir, os.Getenv("TEST_DATABASE_URL")); adopted || err != nil {
+				t.Fatalf("unadopted repository tests must skip: adopted=%v, err=%v", adopted, err)
+			}
+			want := requireSnapshotSQLC([]byte(config))
+			if err := command([]string{"-dir", dir, "-domain", "demo", "-partitioned"}); err == nil || err.Error() != want.Error() {
+				t.Fatalf("explicit generation must reject unsupported input before database access: got %v, want %v", err, want)
+			}
+		})
 	}
 }
 

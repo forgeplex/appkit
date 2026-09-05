@@ -63,6 +63,21 @@ func TestSchemaToolScaffoldDatabaseAdoption(t *testing.T) {
 					t.Fatalf("tool did not produce nonempty %s: %v", path, err)
 				}
 			}
+			// Artifacts activate the snapshot contract even before sqlc is switched.
+			// Both real CLI check paths must reject the old config before parsing
+			// this deliberately invalid DSN or attempting any database connection.
+			for _, flag := range []string{"-check", "-check-source"} {
+				args := append(append([]string(nil), generate...), flag, "-dsn", "postgres://hidden-secret@%zz/invalid")
+				ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+				cmd := exec.CommandContext(ctx, goCommand, args...)
+				cmd.Dir, cmd.Env = dir, env
+				cmd.WaitDelay = 5 * time.Second
+				output, err := cmd.CombinedOutput()
+				cancel()
+				if err == nil || !strings.Contains(string(output), "schema: db/schema.sql") || strings.Contains(string(output), "hidden-secret") {
+					t.Fatalf("%s did not reject migration input before connecting: %v\n%s", flag, err, output)
+				}
+			}
 			if strings.Count(initialConfig, `schema: "db/migrations"`) != 1 {
 				t.Fatal("ambiguous sqlc input in generated repository")
 			}

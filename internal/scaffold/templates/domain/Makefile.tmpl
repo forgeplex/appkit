@@ -53,6 +53,7 @@ schema: check-tool-version dev-db
 
 # 可选 sqlc 快照：TEST_DATABASE_URL 只作为临时库管理连接，不迁移现有库。
 # 首次生成后手动把 sqlc.yaml 的 schema 改为 db/schema.sql 并提交快照和 lock。
+# 切换后才能继续生成/检查；schema-check 在连接数据库前验证 sqlc 快照配置。
 # 与上面的 schema 文档生成不同；安装工具不改变默认 sqlc 输入。
 schema-sqlc:
 	$(GO) run ./internal/postgres/schematool -domain {{.Name}}{{if .Partitioned}} -partitioned{{end}}
