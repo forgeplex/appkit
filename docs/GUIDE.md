@@ -664,7 +664,7 @@ app := appkit.New(
     // target 之外的域落到远程绑定：注入生成的 HTTP client（实现同一契约接口，
     // 错误经 apperr.FromProblem 重建——错误码身份跨网络不变）。
     // appkit.Remote[identityv1.Service](func(*appkit.Registry) (identityv1.Service, error) {
-    //     return identityv1.NewClient(cfg.Endpoints.Identity, "sso", nil), nil
+    //     return identityv1.NewSecureClient(cfg.Endpoints.Identity, secureIdentityOptions)
     // }),
 )
 return app.Run(ctx)
@@ -850,14 +850,14 @@ go tool pprof -http=:6060 http://127.0.0.1:8080/debug/pprof/heap
 go tool pprof -http=:6060 "http://127.0.0.1:8080/debug/pprof/profile?seconds=30"
 ```
 
-当前 HTTP 安全第一阶段里，bootstrap 对 `internal_service` / `mixed`
-仍 fail-closed，等待服务 JWT 验证配置落地；因此线上 pprof 也刻意不可用。
-不要为了打开 pprof 把生产改成 `disabled`。
+bootstrap 的 `internal_service` / `mixed` 需要有效服务验签器。上述 pprof 请求
+还须由受信工具附带有效的 `X-Service-Authorization`，单纯端口转发不能绕过
+认证；令牌不要放入会被记录的 URL。不要为了打开 pprof 把生产改成 `disabled`。
 
 ### 附：跨服务的 request id 是怎么串起来的
 
 `contract` 的 ctx 防火墙会剥掉 ctx 里的一切值（进程内调用不该比跨网络调用能多传
-东西），但 `callctx.Meta` 的三个字段例外——request id、tenant id、caller。
+东西），但 `callctx.Meta` 的四个字段例外——request id、partition、tenant id、caller。
 它们在已建立信任的边界内这样流转：
 
 - HTTP 入站：严格模式只保留用于追踪的 request id；unsigned tenant/caller
@@ -869,8 +869,10 @@ go tool pprof -http=:6060 "http://127.0.0.1:8080/debug/pprof/profile?seconds=30"
 `NewClient` 里把传入的 `http.Client` 复制一份、焊上
 `callctx.Transport{Caller: caller}` 再发请求——"忘了装 Transport"的静默
 失效形态不存在。`caller` 参数填**自己**的服务名；但它与 tenant header
-只是传播候选，不是身份证明。严格入站不直接信它们。当前 request id 能端到端
-串联；跨服务的 caller/租户委托要等服务 JWT 验证器从已签名 claims 重建。
+只是传播候选，不是身份证明。严格入站不直接信它们。生产服务调用使用
+`NewSecureClient`，经显式 provider 签发短期服务 JWT；只有 request id 明文传播，
+caller/租户/分区由接收端 ServiceVerifier 从授权后的签名声明重建。
+配置示例与限制见 [服务认证](SERVICE_AUTH.md)。
 
 生成的 server `serve` 仍会把请求头里的 callctx 合并回 ctx，但在正常
 `App.Run` 严格模式下，它收到的已是信任边界清洗后的头。裸挂生成 handler
@@ -896,6 +898,11 @@ apptest.Conform(t,
 
 两个绑定共用同一个 spy，比的就是"同一个实现、两种到达方式"。远程那条漏了
 `Transport`，request id 与租户到不了实现，这项当场红。
+
+上面是无认证的契约传输单测。真实签名绑定使用 `NewSecureClient`，并可改用
+`apptest.ConformWithMeta(t, bindings, cases, meta)` 给每次调用设置合法的业务
+TenantID/Partition 与非空 RequestID；凭证 provider 和接收端须独立授权这些值。
+该入口同时检查分区传播，不要求用户 Actor 穿越契约边界。
 
 两处容易踩的：它**不比 `Caller`**——出站 client 本就应该把它改写成自己的服务名，
 跨形态不一致恰恰是对的；它只跑在**声明了 `Idempotent` 且期望成功**的用例上——
@@ -1003,8 +1010,8 @@ security:
 |---|---|---|
 | `disabled` | bootstrap 本地开发，或直接构造 App 的测试；保留旧 `Mount` 行为 | bootstrap 仅 `env=dev` 可用 |
 | `user_facing` | 面向用户的公开、已认证、权限路由 | 需精确 32 字节 Ed25519 公钥 + issuer，自动挂用户令牌验签 |
-| `internal_service` | 公开探针 + 服务身份路由 | 第一阶段暂无服务 JWT 配置，fail-closed 拒绝启动 |
-| `mixed` | 同一进程同时有用户与服务路由 | 同上，服务 JWT 机制落地前拒绝启动 |
+| `internal_service` | 公开探针 + 服务身份路由 | 需要 security.service 或 SecurityOptions.ServiceVerifier，缺失/无效则拒绝启动 |
+| `mixed` | 同一进程同时有用户与服务路由 | 同时需要用户和服务验签配置，两份凭证的委托范围不能冲突 |
 
 严格模式（除 `disabled` 外）要求每个根路由选四类之一：
 
@@ -1026,8 +1033,8 @@ reg.MountInternalService("POST /internal/reconcile", reconcileHandler)
 `reg.Mount` 属未分类路由，启动当场失败。
 
 严格模式还在**所有可配中间件的最外层**放一道身份信任边界。它先清空
-ctx 里预置的 `Actor` / `ServicePrincipal` 以及 `callctx` 的 tenant/caller，
-再删掉未签名的 `X-Tenant-Id` / `X-Caller` / `X-Merchant-Id`。Request ID
+ctx 里预置的 `Actor` / `ServicePrincipal` 以及 `callctx` 的 partition/tenant/caller，
+再删掉未签名的 `X-Partition` / `X-Tenant-Id` / `X-Caller` / `X-Merchant-Id`。Request ID
 只用于追踪，会保留。边界内的验签中间件才能从凭证重建可信主体和租户范围；
 调整中间件顺序也无法把这道边界挪到内层。组合根自己配的 Middleware
 仍是受信代码：它可以注入验过的 principal，也能因错写而短路路由守卫；

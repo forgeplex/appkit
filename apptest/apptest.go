@@ -102,6 +102,37 @@ type Case[S any] struct {
 // 少于两个绑定会直接失败：只跑一个形态的不叫一致性测试。
 func Conform[S any](t *testing.T, bindings []Binding[S], cases []Case[S]) {
 	t.Helper()
+	conform(t, bindings, cases, probeMeta)
+}
+
+// ConformWithMeta runs the same boundary checks with explicit, domain-valid
+// metadata on every call. Use it for authenticated bindings whose tenant or
+// partition identifiers must match signed claims and request DTOs. RequestID
+// must be nonempty so loss of metadata cannot pass unnoticed. TenantID and
+// Partition may be empty for domains without those dimensions.
+//
+// The metadata is not proof of authorization: the remote credential provider
+// and recipient must authorize it independently. Caller may change per hop and
+// is not compared. Conform's existing signature and default probes are unchanged.
+func ConformWithMeta[S any](t *testing.T, bindings []Binding[S], cases []Case[S], meta callctx.Meta) {
+	t.Helper()
+	if meta.RequestID == "" {
+		t.Fatal("ConformWithMeta requires a nonempty RequestID sentinel")
+	}
+	configured := make([]Case[S], len(cases))
+	for i, c := range cases {
+		configured[i] = c
+		if c.Do != nil {
+			configured[i].Do = func(ctx context.Context, svc S) (any, error) {
+				return c.Do(callctx.With(ctx, meta), svc)
+			}
+		}
+	}
+	conform(t, bindings, configured, meta)
+}
+
+func conform[S any](t *testing.T, bindings []Binding[S], cases []Case[S], meta callctx.Meta) {
+	t.Helper()
 	if len(bindings) < 2 {
 		t.Fatalf("Conform 需要至少两个绑定（如 local + remote），got %d——"+
 			"只跑一个形态证明不了两种形态一致", len(bindings))
@@ -139,7 +170,7 @@ func Conform[S any](t *testing.T, bindings []Binding[S], cases []Case[S]) {
 			checkTxGuard(t, bindings, c)
 			checkCanceled(t, bindings, c)
 			checkIdempotent(t, bindings, c)
-			if checkMetaPropagation(t, bindings, c) {
+			if checkMetaPropagationWith(t, bindings, c, meta) {
 				metaChecked = true
 			}
 		})
@@ -303,17 +334,22 @@ var probeMeta = callctx.Meta{
 //     测试框架擅自替人多跑一次有副作用的调用，比不做这项检查危险得多。
 func checkMetaPropagation[S any](t *testing.T, bindings []Binding[S], c Case[S]) bool {
 	t.Helper()
+	return checkMetaPropagationWith(t, bindings, c, probeMeta)
+}
+
+func checkMetaPropagationWith[S any](t *testing.T, bindings []Binding[S], c Case[S], meta callctx.Meta) bool {
+	t.Helper()
 	if c.WantCode != "" || !c.Idempotent || bindings[0].SeenMeta == nil {
 		return false
 	}
 	t.Run("跨边界元数据传播", func(t *testing.T) {
-		ctx := callctx.With(t.Context(), probeMeta)
+		ctx := callctx.With(t.Context(), meta)
 		for _, b := range bindings {
 			if _, err := c.Do(ctx, b.Service); err != nil {
 				t.Errorf("[%s] 期望成功的用例却失败了，无从判断元数据传没传到: %v", b.Name, err)
 				continue
 			}
-			if msg := metaDiff(b.Name, probeMeta, b.SeenMeta()); msg != "" {
+			if msg := metaDiff(b.Name, meta, b.SeenMeta()); msg != "" {
 				t.Error(msg)
 			}
 		}
@@ -323,20 +359,20 @@ func checkMetaPropagation[S any](t *testing.T, bindings []Binding[S], c Case[S])
 
 // metaDiff 比对服务端实际看到的白名单与注入的期望，不符时返回给人看的原因。
 //
-// 只比 RequestID 与 TenantID：这两个是纯透传，跨形态必须一模一样。**不比 Caller**
+// 比 RequestID、Partition 与 TenantID：跨形态必须一模一样。**不比 Caller**
 // ——它的语义是「谁调的我」，出站 client 本就应该改写成自己的服务名（见
 // callctx.Transport 的 Caller 字段），跨形态不一致恰恰是对的。拿它当断言会把正确
 // 接好的 client 判红，而一条会误报的规则很快就没人看了。
 func metaDiff(binding string, want, got callctx.Meta) string {
-	if got.RequestID == want.RequestID && got.TenantID == want.TenantID {
+	if got.RequestID == want.RequestID && got.Partition == want.Partition && got.TenantID == want.TenantID {
 		return ""
 	}
 	return fmt.Sprintf(
-		"[%s] 服务端看到的白名单 = {request_id:%q tenant_id:%q}, want {%q %q}——"+
-			"元数据没穿过这层绑定，出站 client 是否漏了 callctx.Transport？"+
+		"[%s] 服务端看到的白名单 = {request_id:%q partition:%q tenant_id:%q}, want {%q %q %q}——"+
+			"元数据没穿过这层绑定，出站传播与服务凭证是否正确授权了范围？"+
 			"（这种失效很安静：进程内绑定拿得到租户、远程拿不到，业务照跑，"+
 			"直到真拆分部署那天下游按租户选错了数据边界）",
-		binding, got.RequestID, got.TenantID, want.RequestID, want.TenantID)
+		binding, got.RequestID, got.Partition, got.TenantID, want.RequestID, want.Partition, want.TenantID)
 }
 
 // checkIdempotent 连调两次比对结果。只对显式声明幂等的用例做。

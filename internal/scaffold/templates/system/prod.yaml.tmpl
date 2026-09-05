@@ -3,8 +3,8 @@ addr: ":8080"
 env: prod
 security:
   # 必须按该部署的暴露面显式选择严格模式，留空会在监听端口前失败；不能以
-  # disabled 绕过生产身份边界。当前 bootstrap 阶段可完整配置 user_facing；
-  # internal_service/mixed 在服务 JWT 验证器落地前仍会 fail closed。
+  # disabled 绕过生产身份边界。user_facing 需要用户公钥与 issuer；
+  # internal_service/mixed 需要 security.service 或 ServiceVerifier，缺失时 fail closed。
   mode: ""
 database:
   # 生产库地址含密钥，走 {{.EnvPrefix}}_DATABASE__URL 环境变量注入，此处留空。
@@ -14,5 +14,5 @@ log:
   format: json
 debug:
   # pprof 排障端点默认关闭；user_facing 模式禁止启用。internal_service/mixed
-  # 下端点必须由已验证的服务身份保护（当前 bootstrap 尚未开放这两种模式）。
+  # 下端点必须由已验证的服务身份保护。
   pprof: false

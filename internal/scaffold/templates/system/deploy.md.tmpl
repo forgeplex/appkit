@@ -6,12 +6,13 @@
 ## 上线前的 HTTP 安全配置
 
 `config/prod.yaml` 故意把 `security.mode` 留空：服务会在监听前 fail closed，
-部署者必须按该 Deployment 的暴露面显式设置。当前 bootstrap 阶段可用
+部署者必须按该 Deployment 的暴露面显式设置。
 `user_facing`，并须在组合根装配 `AuthnPublicKey` 与 `AuthnIssuer`；
-`internal_service/mixed` 要等服务 JWT 验证器落地，不能拿“仅内网可达”代替
-身份验证。`-migrate` 不监听 HTTP，因此不要求 security.mode。
+`internal_service/mixed` 还须配置 `security.service` 或注入 ServiceVerifier，
+验证服务 JWT 的签发方、公钥、主体、接收方与委托范围，不能拿“仅内网可达”
+代替身份验证。`-migrate` 不监听 HTTP，因此不要求 security.mode。
 
-pprof 不允许出现在 `user_facing` 模式；未来在 `internal_service/mixed` 开启时
+pprof 不允许出现在 `user_facing` 模式；在 `internal_service/mixed` 开启时
 也必须经过已验证的服务身份。
 
 ## 单体（推荐起步）

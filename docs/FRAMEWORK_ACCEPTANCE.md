@@ -164,6 +164,76 @@ RBAC 的 `internal/postgres` 包 18 项全部通过。
 迁移要求见 [RELEASE_CANDIDATE.md](RELEASE_CANDIDATE.md)。本次没有替业务项目
 完成这些应用升级，更未上线或做生产数据迁移。
 
+## v0.9.1 服务身份与业务接入收尾（2026-09-05）
+
+本轮范围经确认是**框架与业务接入代码、隔离验收、框架版本发布**，不部署，
+不连接或迁移现有业务数据库。上面的 v0.9.0 记录保留原时点结论，不代表本轮仍
+缺少服务身份或仍受旧工具依赖问题阻塞。
+
+### 框架
+
+- `ServiceVerifier` / `ServiceSigner` 实现短期 Ed25519 服务 JWT：静态可信
+  issuer/kid/subject、单一 audience、必填 exp/iat、用途隔离与显式委托策略。
+  非空 tenant/merchant/partition 不能靠请求头或默认策略获得授权。
+- bootstrap 支持声明式接收端公钥/精确委托规则及组合根注入，多用户签发方与
+  internal/mixed 的配置在基础设施和模块装配前验证。迁移专用路径完全跳过
+  HTTP 安全配置读取，连畸形的 HTTP 安全时长也不会干扰数据库专用命令。
+- 生成 `NewSecureClient` 保留原 `NewClient` 签名；安全入口强制 HTTPS、
+  origin、显式凭证 provider，拒绝重定向、不安全 TLS、cookie jar 与 trailers。
+  每跳凭证重新取得，不转发用户或上一跳凭证。根边界的不可信头快照仅供冲突
+  检查，不进入可信身份，也不穿过 ctx 防火墙。
+- 真实 generated client → TLS 终止代理 → 严格 `App.Run` → 分类内部路由 →
+  generated handler/wrapper，验证服务凭证及本地/远程契约语义；不能拿旧的
+  无认证四 module 传输夹具替代这条身份链证据。
+- `ConformWithMeta` 使用合法业务租户/分区跑全部一致性检查，并检查 Partition
+  传播；不改变原 `Conform` 签名。签名委托策略仍独立于测试元数据。
+- 两类 Makefile 模板以固定版本独立工具 module 执行 CLI，保留业务 GOFLAGS；
+  实测含额外 CLI 依赖的本地模块代理，证明不会写业务 go.mod/go.sum。显式
+  本地 CLI 覆盖、真实 `make dev` 与五种脚手架编译/check 也通过。
+
+最终框架通过 `make check`、隔离 PostgreSQL 18.6 上的全仓 DB race、独立 lint
+module、真实规则检查器 E2E（0 skip）、go mod tidy 无漂移。相对 v0.9.0 的
+module 级 apidiff 零 incompatible；使用 CI 固定的 e88cd73687aa 修订（本地缓存
+中的同修订 canonical pseudo-version），不更换比较工具或忽略不兼容输出。
+DB 实例均为临时 Unix socket 集群，运行后停止并清理。
+
+### 四个现有项目的代码升级
+
+- email / notification 内部路由要求已验证服务主体及非空租户，请求 tenant 必须
+  与签名范围一致；公开 ping、追踪和 webhook 保持各自真实语义。email webhook
+  验 HMAC 后以渠道与回执 ID 联合定位消息，并保留归属复核。
+- RBAC 的 schema 路由改用 Partition，TenantID 仍是业务租户；内部契约验证
+  服务范围，真实 TLS 契约对拍使用标准安全客户端。公开登录 realm 只选择已
+  配置命名空间，不授予租户/用户/服务身份，不能覆盖已签名分区。受保护路由
+  先认证及执行原领域权限语义，再查幂等缓存；支持原有通配及 view/read 权限。
+- ledger 先验证 Actor 与原权限，再在每次缓存重放前复核资源归属；幂等 scope
+  由版本化、逐字段编码的 partition/tenant/user/ledger ID 组成。回归覆盖跨
+  租户/用户、合法重放、权限撤销、资源归属变动和删除。旧 scope 缓存不回退
+  读取，后续业务上线需协调旧请求重试窗口，详见业务安全升级文档。
+- 四个业务 Makefile 的 CLI 依赖隔离及物化规则漂移已修复；临时 v0.9.0 工具
+  基线上的 `GOWORK=off GOFLAGS=-mod=readonly make check` 均通过。框架候选
+  build/race 使用副本中的本地 replace；业务最终发布依赖与规则来源应在
+  v0.9.1 两个模块 tag 可解析后同步，并另行执行最终只读 check/lint。
+
+没有改历史迁移 SQL，没有将共享 provider、后台任务或 ledger ID 机械改成
+RLS tenant。业务原有未提交内容保留；email 仍无 Git 仓库。业务代码本地更新
+不等于业务仓库已提交、发布或部署。
+
+最终源码副本均 build 通过，并在各自隔离 PostgreSQL 18.6 数据库运行 race：
+
+| 项目 | pass（test/subtest） | skip | fail |
+|---|---:|---:|---:|
+| email | 135 | 0 | 0 |
+| notification | 78 | 0 | 0 |
+| rbac | 376 | 0 | 0 |
+| ledger | 504 | 2（仅性能播种） | 0 |
+
+RBAC/ledger 最终证据在 `/tmp/appkit-downstream.VLb9wr0E`；email/notification
+在回执联合查询与错误包装修复后重新完整运行，最终证据在
+`/tmp/appkit-downstream.HB1U1Lcx`。两组副本的 Go/SQL 文件均逐字节核对当前
+业务源码一致，RBAC 原有 seed.go 修改的 SHA-256 保持不变。不能把表中的
+父子测试事件算作独立顶层用例，也不能把 ledger 的性能播种 skip 算作功能通过。
+
 ## 有意保持的边界
 
 兼容检查针对 AppKit 的 contract.yaml 生成模型与这组消费方式，不能证明业务语义、

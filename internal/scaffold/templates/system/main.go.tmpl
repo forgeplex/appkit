@@ -32,10 +32,15 @@ func main() {
 		//
 		// AppOptions: func(bootstrap.Deps) []appkit.Option {
 		// 	return []appkit.Option{
-		// 		appkit.Remote(ledgerv1.NewClient),
-		// 		appkit.Remote(authv1.NewClient),
+		// 		appkit.Remote[ledgerv1.Service](func(*appkit.Registry) (ledgerv1.Service, error) {
+		// 			return ledgerv1.NewSecureClient(endpoint, secureOptions)
+		// 		}),
 		// 	}
 		// },
+		// endpoint 必须为 HTTPS；secureOptions 是 contract.SecureClientOptions，
+		// 显式提供 Audience 与授权后签发短期服务 JWT 的 Credentials。
+		// 接收端配置 security.service，契约入口使用 MountInternalService。
+		// 用户 Authorization 不自动转发，TenantID/Partition 由签名委托重建。
 		//
 		// 拆分部署换 NATS/Kafka 总线时（同一接口，业务代码不改）：
 		// NewBus: func() bootstrap.EventBus { return natsbus.New(...) },

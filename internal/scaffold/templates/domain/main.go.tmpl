@@ -35,9 +35,17 @@ func main() {
 		// 提供方在 -target 内就走进程内直调，不在就走这里的 client——
 		// 消费方代码两种形态下完全一致。
 		//
-		// AppOptions: func(d bootstrap.Deps) []appkit.Option {
-		// 	return []appkit.Option{appkit.Remote(otherv1.NewClient)}
+		// AppOptions: func(bootstrap.Deps) []appkit.Option {
+		// 	return []appkit.Option{
+		// 		appkit.Remote[otherv1.Service](func(*appkit.Registry) (otherv1.Service, error) {
+		// 			return otherv1.NewSecureClient(endpoint, secureOptions)
+		// 		}),
+		// 	}
 		// },
+		// endpoint 必须为 HTTPS；secureOptions 是 contract.SecureClientOptions，
+		// 显式提供 Audience 与授权后签发短期服务 JWT 的 Credentials。
+		// 接收端配置 security.service，契约入口使用 MountInternalService。
+		// 用户 Authorization 不自动转发，TenantID/Partition 由签名委托重建。
 	})
 }
 

@@ -7,6 +7,7 @@ forgeplex 的 Go 后端运行时框架：任何业务域拿来即用；用工具
 **设计文档：[docs/DESIGN.md](docs/DESIGN.md)**（仓库拓扑、约束分级、组合机制、请求路径）。
 **模块复用与 Agent 流程：[docs/AGENT_WORKFLOW.md](docs/AGENT_WORKFLOW.md)**（AppKit 主运行时、命名实例、plan/apply 与恢复边界）。
 **可复用框架验收：[docs/FRAMEWORK_ACCEPTANCE.md](docs/FRAMEWORK_ACCEPTANCE.md)**（真实多 module 复用/升级、数据库隔离与可重复执行的门禁）。
+**服务认证：[docs/SERVICE_AUTH.md](docs/SERVICE_AUTH.md)**（短期服务 JWT、显式委托、bootstrap 配置与 HTTPS 契约客户端）。
 
 ## 包一览
 

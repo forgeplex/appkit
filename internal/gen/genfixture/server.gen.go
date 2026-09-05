@@ -14,7 +14,10 @@ import (
 // JSON decode，错误经 apperr.WriteProblem，成功 200 JSON。与 client.gen.go
 // 由同一份 contract.yaml 生成，编解码约定只有一份。装配形态：
 //
-//	mux.Handle("/", genfixture.NewHTTPHandler(genfixture.WrapService(impl, 0)))
+//	reg.MountInternalService("/", genfixture.NewHTTPHandler(genfixture.WrapService(impl, 0)))
+//
+// 生产必须配置严格 App 服务认证链并分类挂载；本 handler 只做编解码，
+// 不验凭证。裸 handler 的 unsigned tenant/partition/caller 头不构成授权。
 func NewHTTPHandler(svc Service) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /greet", func(w http.ResponseWriter, r *http.Request) {
@@ -73,9 +76,9 @@ func NewHTTPHandler(svc Service) http.Handler {
 	return serve(mux)
 }
 
-// serve 是入站白名单的兜底：挂在 httpserver.RequestID 中间件链后时是
-// 幂等重放（请求头与 ctx 本就是同一份事实），裸挂时把请求头里的
-// callctx.Meta 搬进 ctx——契约 handler 挂在哪，元数据都到得了实现。
+// serve 保留 legacy/dev 的白名单传输行为，不是认证边界。严格 App 在最外层
+// 清掉 unsigned 身份头，并由服务验证器重建 ctx；生产须挂 MountInternalService。
+// 裸挂时从头提取的 callctx.Meta 仍不可信，不可据此授权。
 // request id 的生成与响应回写仍是外层中间件的职责，这里不越权。
 func serve(mux *http.ServeMux) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -74,6 +75,7 @@ type accessClaims struct {
 	jwt.RegisteredClaims
 	TenantID string   `json:"tid,omitempty"`
 	Perms    []string `json:"perms"`
+	Purpose  string   `json:"purpose,omitempty"`
 }
 
 // stepUpClaims 是 step-up 证明的验签布局。
@@ -111,6 +113,7 @@ func MultiIssuer(issuers map[string]Issuer) func(http.Handler) http.Handler {
 	if len(issuers) == 0 {
 		panic("authn: MultiIssuer 的签发方表为空")
 	}
+	snapshot := make(map[string]Issuer, len(issuers))
 	for iss, is := range issuers {
 		if iss == "" {
 			panic("authn: 签发方 iss 为空")
@@ -118,7 +121,10 @@ func MultiIssuer(issuers map[string]Issuer) func(http.Handler) http.Handler {
 		if len(is.Key) != ed25519.PublicKeySize {
 			panic(fmt.Sprintf("authn: 签发方 %q 的公钥不是 Ed25519 公钥", iss))
 		}
+		is.Key = slices.Clone(is.Key)
+		snapshot[iss] = is
 	}
+	issuers = snapshot
 	parse := []jwt.ParserOption{
 		jwt.WithValidMethods([]string{jwt.SigningMethodEdDSA.Alg()}),
 		jwt.WithExpirationRequired(),
@@ -126,6 +132,9 @@ func MultiIssuer(issuers map[string]Issuer) func(http.Handler) http.Handler {
 	// keyFor 按未验签的 iss 选公钥：签名随后用这把钥验，iss 伪造只会拿到
 	// 别家的公钥而验不过。
 	keyFor := func(tok *jwt.Token) (any, error) {
+		if tok.Header["typ"] == serviceTokenType {
+			return nil, errors.New("service JWT cannot authenticate a user")
+		}
 		iss, err := tok.Claims.GetIssuer()
 		if err != nil {
 			return nil, err
@@ -144,6 +153,11 @@ func MultiIssuer(issuers map[string]Issuer) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
+			values := headerValues(r.Header, "Authorization")
+			if len(values) > 1 {
+				writeInvalid(w, errors.New("multiple user authorization headers"))
+				return
+			}
 			raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if !ok {
 				next.ServeHTTP(w, r)
@@ -158,7 +172,16 @@ func MultiIssuer(issuers map[string]Issuer) func(http.Handler) http.Handler {
 				writeInvalid(w, errEmptySubject)
 				return
 			}
+			if ac.Purpose != "" && ac.Purpose != "access" {
+				writeInvalid(w, errors.New("wrong user access token purpose"))
+				return
+			}
 			issuer := issuers[ac.Issuer]
+			if scope, ok := r.Context().Value(serviceScopeKey{}).(ServiceDelegation); ok &&
+				(scope.TenantID != ac.TenantID || scope.Partition != issuer.Partition) {
+				writeInvalid(w, errors.New("user and service identity scopes conflict"))
+				return
+			}
 			actor := appkit.Actor{
 				UserID:   ac.Subject,
 				TenantID: ac.TenantID,
@@ -194,6 +217,9 @@ func parseStepUp(pub ed25519.PublicKey, parse []jwt.ParserOption, raw, issuer, s
 	opts := append(append([]jwt.ParserOption{}, parse...), jwt.WithIssuer(issuer), jwt.WithSubject(subject))
 	if _, err := jwt.ParseWithClaims(raw, &sc,
 		func(tok *jwt.Token) (any, error) {
+			if tok.Header["typ"] == serviceTokenType {
+				return nil, errors.New("service JWT cannot be a step-up proof")
+			}
 			if iss, _ := tok.Claims.GetIssuer(); iss != issuer {
 				return nil, errIssuerMismatch
 			}
