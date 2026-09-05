@@ -79,11 +79,11 @@ tag:
 # --list 'v[0-9]*' 排除 lint/vX.Y.Z 路标 tag——它们不是版本叙事，且是轻量 tag，
 # git cat-file tag 读不出 message。
 changelog:
-	@{ echo '# Changelog'; echo; \
-	   echo '按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。'; echo; \
+	@{ printf '%s\n\n' '# Changelog'; \
+	   printf '%s\n\n' '按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。'; \
 	   for t in $$(git tag --list 'v[0-9]*' --sort=-v:refname); do \
-	     echo "## $$t（$$(git log -1 --format=%cs $$t^{})）"; echo; \
-	     git cat-file tag $$t | sed '1,/^$$/d'; echo; \
+	     printf '## %s（%s）\n\n' "$${t}" "$$(git log -1 --format=%cs "$${t}^{}")"; \
+	     git cat-file tag "$${t}" | sed '1,/^$$/d'; printf '\n'; \
 	   done; \
 	 } > CHANGELOG.md
 
