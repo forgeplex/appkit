@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -54,8 +55,27 @@ func TestWorkflowResolutionDoesNotHoldWorkspaceLock(t *testing.T) {
 				t.Fatal(err)
 			}
 			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
 			done := make(chan error, 1)
+			joined := false
+			// Register after Setenv so cancellation and joining run before its
+			// cleanup restores the subprocess environment, including on Fatal.
+			t.Cleanup(func() {
+				cancel()
+				if joined {
+					return
+				}
+				select {
+				case <-done:
+					joined = true
+				case <-time.After(3 * time.Second):
+					t.Error("resolver did not exit during fixture cleanup")
+					// Do not restore process-global environment while the
+					// resolver is still alive. Even a broken cancellation path
+					// has a finite fake-command lifetime (sleep 30 above).
+					<-done
+					joined = true
+				}
+			})
 			go func() {
 				var err error
 				if operation == "sync" {
@@ -65,16 +85,34 @@ func TestWorkflowResolutionDoesNotHoldWorkspaceLock(t *testing.T) {
 				}
 				done <- err
 			}()
-			deadline := time.Now().Add(3 * time.Second)
+			// Process/fixture startup has its own budget: a loaded full-suite
+			// runner may take time to start the shell. This does not relax the
+			// one-second lock assertion or three-second cancellation assertion.
+			startupCtx, stopStartup := context.WithTimeout(t.Context(), 15*time.Second)
+			defer stopStartup()
+			poll := time.NewTicker(5 * time.Millisecond)
+			defer poll.Stop()
+		readyLoop:
 			for {
-				if _, err := os.Stat(ready); err == nil {
-					break
+				select {
+				case err := <-done:
+					joined = true
+					var exit *exec.ExitError
+					if errors.As(err, &exit) {
+						t.Fatalf("resolver exited before readiness: %v; stderr: %s", err, exit.Stderr)
+					}
+					t.Fatalf("resolver exited before readiness: %v", err)
+				case <-startupCtx.Done():
+					t.Fatalf("resolver fixture did not become ready within startup budget: %v", startupCtx.Err())
+				case <-poll.C:
+					if _, err := os.Stat(ready); err == nil {
+						break readyLoop
+					} else if !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("read resolver readiness: %v", err)
+					}
 				}
-				if time.Now().After(deadline) {
-					t.Fatal("resolver did not start")
-				}
-				time.Sleep(5 * time.Millisecond)
 			}
+			stopStartup()
 			lockCtx, release := context.WithTimeout(context.Background(), time.Second)
 			defer release()
 			if err := workspace.WithReadLock(lockCtx, root, func() error { return nil }); err != nil {
@@ -83,6 +121,7 @@ func TestWorkflowResolutionDoesNotHoldWorkspaceLock(t *testing.T) {
 			cancel()
 			select {
 			case err := <-done:
+				joined = true
 				if !errors.Is(err, context.Canceled) {
 					t.Fatalf("resolution cancellation identity lost: %v", err)
 				}
