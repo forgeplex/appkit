@@ -191,10 +191,11 @@ type transactionMarker struct {
 // manufacture a trusted marker for an existing pgx transaction.
 type scopeKey struct{}
 
-// sameTx compares handles only when their dynamic type is comparable. pgx.Tx
-// is an interface, so direct interface comparison could panic for a foreign,
-// non-comparable implementation; an uncomparable handle is conservatively not
-// trusted as the marker's transaction.
+// sameTx checks actual values with reflect.Value.Comparable, not merely
+// reflect.Type.Comparable: a comparable struct type may hold a slice inside an
+// interface field. Value.Comparable checks those contents too and guarantees
+// that a subsequent interface equality will not panic. Uncomparable handles
+// are conservatively not trusted as the marker's transaction.
 func sameTx(a, b pgx.Tx) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil

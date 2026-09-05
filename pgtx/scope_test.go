@@ -1,8 +1,11 @@
 package pgtx
 
 import (
+	"context"
+	"strings"
 	"testing"
 
+	"github.com/forgeplex/appkit/tx"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -11,6 +14,26 @@ import (
 type comparableHandle struct {
 	pgx.Tx
 	value any
+}
+
+func TestDoRejectsNonComparableHandleBeforeBegin(t *testing.T) {
+	for _, handle := range []pgx.Tx{
+		comparableHandle{value: []string{"x"}},
+		comparableHandle{value: map[string]string{"x": "y"}},
+		comparableHandle{value: [1]any{[]string{"x"}}},
+		sliceHandle{values: []string{"x"}},
+	} {
+		// A private marker fixture exercises the actual Do guard. The nil
+		// embedded Tx makes any accidental Begin call panic, so this asserts
+		// rejection before touching the handle as well as before the callback.
+		ctx := context.WithValue(tx.With(context.Background(), handle), scopeKey{},
+			transactionMarker{scope: transactionScope{}, handle: handle})
+		ran := false
+		err := New(nil).Do(ctx, func(context.Context) error { ran = true; return nil })
+		if err == nil || !strings.Contains(err.Error(), "事务句柄") || ran {
+			t.Fatalf("Do must reject incomparable handle before Begin/callback: err=%v ran=%v", err, ran)
+		}
+	}
 }
 
 type sliceHandle struct {
