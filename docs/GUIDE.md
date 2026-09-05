@@ -1320,13 +1320,16 @@ go run ./internal/postgres/schematool -domain invoice -partitioned -check
 
 生成与 `-check` 需要 `TEST_DATABASE_URL` 指向测试服务器，并有 CREATEDB 权限。
 工具只在随机命名的一次性数据库里运行 pgmigrate，再读取 catalog，退出时清理；
-迁移 SQL 和测试服务器必须可信；这不是 SQL 沙箱，不应传入生产或共享业务库的\n连接凭证。它不会迁移连接串指向的现有库。输出 `db/schema.sql` 和 `db/schema.lock.json` 后，
+迁移 SQL 和测试服务器必须可信；这不是 SQL 沙箱，不应传入生产或共享业务库的
+连接凭证。它不会迁移连接串指向的现有库。输出 `db/schema.sql` 和 `db/schema.lock.json` 后，
 将 sqlc 的 `schema` 输入改为 `db/schema.sql`。脚手架的 `make schema-sqlc` 与
 `make schema-check` 封装上述步骤；`make schema` 保持原有文档/ER 图导出含义。
 新仓库首次采用是显式步骤，以保留 `appkit new` 不依赖数据库的能力。
 
 快照包含当前受支持对象的 DDL，排除迁移历史表，不含 owner/grants/序列运行值；
-是代码生成/阅读输入，不是部署脚本或完整备份。不支持的特性会明确报错。采用快照时仅支持一个 PostgreSQL SQL 项与一个\n`db/schema.sql` 输入；未采用快照时不会把这些约束施加给已有多输入配置。
+是代码生成/阅读输入，不是部署脚本或完整备份。不支持的特性会明确报错。
+采用快照时仅支持一个 PostgreSQL SQL 项与一个 `db/schema.sql` 输入；未采用快照时
+不会把这些约束施加给已有多输入配置。
 分区域使用 sqlc 默认的 `public` 作为编译期代表 schema，不改变 prefixless 运行时
 查询或路由。普通测试校验源/快照哈希，带 TEST_DATABASE_URL 的测试还会重放数据库
 逐字比对；仅修改哈希并不能通过数据库验收。删除一半产物不能关闭检查。
