@@ -8,6 +8,7 @@ forgeplex 的 Go 后端运行时框架：任何业务域拿来即用；用工具
 **模块复用与 Agent 流程：[docs/AGENT_WORKFLOW.md](docs/AGENT_WORKFLOW.md)**（AppKit 主运行时、命名实例、plan/apply 与恢复边界）。
 **可复用框架验收：[docs/FRAMEWORK_ACCEPTANCE.md](docs/FRAMEWORK_ACCEPTANCE.md)**（真实多 module 复用/升级、数据库隔离与可重复执行的门禁）。
 **服务认证：[docs/SERVICE_AUTH.md](docs/SERVICE_AUTH.md)**（短期服务 JWT、显式委托、bootstrap 配置与 HTTPS 契约客户端）。
+**可选业务引用：[docs/REFS.md](docs/REFS.md)**（跨产品复用的具名引用、资源规范与校验，附订单示例）。
 
 ## 包一览
 
@@ -25,6 +26,7 @@ forgeplex 的 Go 后端运行时框架：任何业务域拿来即用；用工具
 | `outbox` | 事务性事件外发 + relay + inbox 幂等消费 |
 | `idem` | Stripe 式幂等键中间件（claim 先行，防双重执行） |
 | `money` | 金额值类型（decimal + currency），禁 float |
+| `refs` | 可选具名业务引用：严格 JSON、版本化资源规范、完整/更新/筛选校验；不代替身份或存储 |
 | `audit` | 同事务审计（actor/action/before/after，随业务事务同生共死） |
 | `ruleset` | golangci-lint v2 / go-arch-lint v3 配置模板（经 `appkit sync` 物化） |
 | `lint`（嵌套 module） | 自研 analyzer：`moneyfloat`（金额禁浮点）、`ctxstruct` |
@@ -56,6 +58,9 @@ go run github.com/forgeplex/appkit/cmd/appkit help
 见 [examples/greeter](examples/greeter)：两个模块 + 组合根，
 `-target=all` 单二进制、`-target=gateway` 拆分部署（另一模块自动落到远程绑定）。
 新项目直接 `appkit new domain <name>`，生成即合规（骨架自身通过 `check` 与 `sync --check`）。
+
+可选引用见 [examples/refsorder](examples/refsorder)：同一个订单类型表达 PSP 四个引用与无 merchant 的门店订单，
+`go run ./examples/refsorder` 无需数据库即可运行；真实业务归属与存储仍由域实现。
 
 ## 测试
 

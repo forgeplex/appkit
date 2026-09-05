@@ -1,0 +1,14 @@
+# Wire contract only. The resource's shared refs.Spec defines key-level rules.
+# Generate into a scratch directory; main.go demonstrates validation separately.
+version: 1
+package: orderapi
+system: order
+methods:
+  - name: Create
+    path: /create
+    doc: Create an order after validating its resource reference schema and business ownership.
+    request:
+      - {name: refs, type: refs}
+    response:
+      - {name: order_id, type: string}
+      - {name: refs, type: refs}

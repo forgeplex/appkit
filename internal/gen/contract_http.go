@@ -202,11 +202,19 @@ func retryUnavailable[T any](ctx context.Context, fn func() (T, error)) (T, erro
 // 互为镜像。提供方装配：NewHTTPHandler(WrapService(impl, 0))——wrapper 在
 // 边界内侧再经一次 contract.Call，两种部署形态语义对齐。
 func renderServer(doc *contractDoc) []byte {
+	strictRefs := false
+	for _, m := range doc.Methods {
+		strictRefs = strictRefs || doc.fieldsUseRefs(m.Request)
+	}
 	var b bytes.Buffer
 	b.WriteString(header)
 	fmt.Fprintf(&b, "package %s\n\n", doc.Package)
-	b.WriteString(`import (
-	"encoding/json"
+	if strictRefs {
+		b.WriteString("import (\n\t\"bytes\"\n\t\"io\"\n\t\"strings\"\n\t\"unicode\"\n")
+	} else {
+		b.WriteString("import (\n")
+	}
+	b.WriteString(`	"encoding/json"
 	"net/http"
 
 	"github.com/forgeplex/appkit/apperr"
@@ -231,7 +239,11 @@ func renderServer(doc *contractDoc) []byte {
 		call += ")"
 		if hasReq {
 			fmt.Fprintf(&b, "\t\tvar req %sRequest\n", m.Name)
-			b.WriteString("\t\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n")
+			if doc.fieldsUseRefs(m.Request) {
+				b.WriteString("\t\tif err := decodeRefsRequest(r.Body, &req); err != nil {\n")
+			} else {
+				b.WriteString("\t\tif err := json.NewDecoder(r.Body).Decode(&req); err != nil {\n")
+			}
 			b.WriteString("\t\t\tapperr.WriteProblem(w, apperr.InvalidArgument(\"请求体不是合法 JSON\"))\n\t\t\treturn\n\t\t}\n")
 		}
 		if len(m.Response) > 0 {
@@ -247,6 +259,9 @@ func renderServer(doc *contractDoc) []byte {
 		b.WriteString("\t})\n")
 	}
 	b.WriteString("\treturn serve(mux)\n}\n\n")
+	if strictRefs {
+		renderRefsRequestDecoder(&b)
+	}
 	b.WriteString(`// serve 保留 legacy/dev 的白名单传输行为，不是认证边界。严格 App 在最外层
 // 清掉 unsigned 身份头，并由服务验证器重建 ctx；生产须挂 MountInternalService。
 // 裸挂时从头提取的 callctx.Meta 仍不可信，不可据此授权。
@@ -265,4 +280,98 @@ func writeJSON(w http.ResponseWriter, v any) {
 }
 `)
 	return b.Bytes()
+}
+
+// renderRefsRequestDecoder keeps the opt-in refs wire shape unambiguous even
+// when an outer DTO field is repeated. Values.UnmarshalJSON alone cannot detect
+// a later duplicate field in its containing object. No resource schema, external
+// relationship or authorization is inferred by this transport-level check.
+func renderRefsRequestDecoder(b *bytes.Buffer) {
+	b.WriteString(`// decodeRefsRequest rejects ambiguous envelopes as well as malformed refs.
+// Missing fields still use their zero values; domain Schema validation decides
+// required references. Unknown fields remain allowed for contract evolution.
+// These opt-in requests are limited to 1 MiB and 64 JSON nesting levels.
+const (
+	maxRefsRequestBytes = 1 << 20
+	maxRefsRequestDepth = 64
+)
+
+func decodeRefsRequest(body io.Reader, dst any) error {
+	raw, err := io.ReadAll(io.LimitReader(body, maxRefsRequestBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(raw) > maxRefsRequestBytes {
+		return apperr.InvalidArgument("JSON request is too large")
+	}
+	if raw = bytes.Trim(raw, " \t\r\n"); len(raw) == 0 || raw[0] != '{' {
+		return apperr.InvalidArgument("expected a JSON object")
+	}
+	// The standard decoder validates syntax and the single-document boundary;
+	// refs.Values performs its strict flat-value decoding during this call.
+	if err := json.Unmarshal(raw, dst); err != nil {
+		return err
+	}
+	tokens := json.NewDecoder(bytes.NewReader(raw))
+	tokens.UseNumber()
+	return uniqueJSONValue(tokens, 0)
+}
+
+func uniqueJSONValue(dec *json.Decoder, depth int) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if _, container := tok.(json.Delim); container && depth >= maxRefsRequestDepth {
+		return apperr.InvalidArgument("JSON request is too deeply nested")
+	}
+	switch tok {
+	case json.Delim('{'):
+		seen := map[string]bool{}
+		for dec.More() {
+			key, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			// encoding/json matches DTO fields using Unicode case folding.
+			// Reject case aliases too, instead of silently replacing a field.
+			folded := foldJSONKey(key.(string))
+			if seen[folded] {
+				return apperr.InvalidArgument("duplicate JSON object key")
+			}
+			seen[folded] = true
+			if err := uniqueJSONValue(dec, depth+1); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token()
+		return err
+	case json.Delim('['):
+		for dec.More() {
+			if err := uniqueJSONValue(dec, depth+1); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token()
+		return err
+	default:
+		return nil
+	}
+}
+
+func foldJSONKey(key string) string {
+	var b strings.Builder
+	for _, r := range key {
+		min := r
+		for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+			if next < min {
+				min = next
+			}
+		}
+		b.WriteRune(min)
+	}
+	return b.String()
+}
+
+`)
 }

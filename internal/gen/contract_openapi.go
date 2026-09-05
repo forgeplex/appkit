@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/forgeplex/appkit/refs"
 )
 
 // renderOpenAPI 渲染 openapi.yaml——contract.yaml 的派生导出，供文档
@@ -136,5 +138,10 @@ func writeOpenAPIType(b *bytes.Buffer, indent, typeStr string, named map[string]
 		fmt.Fprintf(b, "%stype: string\n%sdescription: 十进制数字符串（用 money.Parse 解析，全系统禁 float 金额）\n", indent, indent)
 	case "timestamp":
 		fmt.Fprintf(b, "%stype: string\n%sformat: date-time\n", indent, indent)
+	case "refs":
+		fmt.Fprintf(b, "%stype: object\n%smaxProperties: %d\n", indent, indent, refs.MaxEntries)
+		fmt.Fprintf(b, "%sdescription: 具名引用值；仅保证结构，资源规则、归属和授权须由领域校验。ID 最多 %d UTF-8 字节，不允许空白或控制字符。\n", indent, refs.MaxIDBytes)
+		fmt.Fprintf(b, "%spropertyNames:\n%s  type: string\n%s  maxLength: %d\n%s  pattern: '^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$'\n", indent, indent, indent, refs.MaxKeyBytes, indent)
+		fmt.Fprintf(b, "%sadditionalProperties:\n%s  type: string\n%s  minLength: 1\n%s  maxLength: %d\n", indent, indent, indent, indent, refs.MaxIDBytes)
 	}
 }
