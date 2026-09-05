@@ -39,8 +39,10 @@
    `Meta.Partition`，检查调用方、事件生产/消费、组合根分区映射；真正的业务
    merchant/tenant 保留在 TenantID。框架不会自动改历史事件或业务记录。
 6. **RLS 迁移**：`VerifyTenantRLS` 现在要求 isolation 与 read-all 两条策略。
-   既有租户表须通过新增迁移调用框架 `TenantPolicySQL` 更新策略，不修改历史
-   迁移文件；上线前用普通非 BYPASSRLS 角色验证。读全部标记须在外层事务前
+   须在新增迁移中先用 `TenantScopeSQL` 刷新上下文函数，再对每张租户表调用
+   `TenantPolicySQL` 更新策略；分区域分别用 `TenantScopeSQLBare` 与
+   `TenantPolicySQLBare`。不能只换策略或修改历史迁移文件。上线前用普通
+   非 BYPASSRLS 角色验证。读全部标记须在外层事务前
    显式设置并先完成权限检查；不跨契约/事件传播，也没有“写全部”模式。
 7. **最小模式**：无数据库不再隐式降级。只在 dev 环境显式 `-minimal`；正常
    运行必须补齐所需基础设施配置。无需迁移时使用明确的 SkipMigrations 配置。
