@@ -21,13 +21,27 @@ import (
 // Sync plans the same three generated files as ruleset.Sync. The configuration
 // is an asserted input, so editing it invalidates an outstanding plan.
 func Sync(ctx context.Context, root, version string) (workspace.Plan, error) {
+	ref, err := ruleset.ResolveWorkflowRefContext(ctx, version)
+	if err != nil {
+		return workspace.Plan{}, err
+	}
+	return SyncPinned(ctx, root, version, ref)
+}
+
+// SyncPinned plans with an explicit immutable workflow source, without external
+// resolution. No git/download command runs while the workspace lock is held.
+func SyncPinned(ctx context.Context, root, version, workflowRef string) (workspace.Plan, error) {
+	ref, err := ruleset.NormalizeWorkflowRef(workflowRef)
+	if err != nil {
+		return workspace.Plan{}, err
+	}
 	return build(ctx, root, ".appkit.yml", func(data []byte) (map[string][]byte, error) {
 		cfg, err := ruleset.ParseAppConfig(data)
 		if err != nil {
 			return nil, err
 		}
 		return ruleset.Render(ruleset.Config{
-			Domain: cfg.Domain, Module: cfg.Module, Contracts: cfg.Contracts, Version: version,
+			Domain: cfg.Domain, Module: cfg.Module, Contracts: cfg.Contracts, Version: version, WorkflowRef: ref,
 		})
 	})
 }

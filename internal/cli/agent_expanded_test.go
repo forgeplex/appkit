@@ -65,13 +65,13 @@ func TestAgentExpandedNewRoutes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			args := append([]string{"new", tc.kind, "sample", "-dir", root, "-target", "generated", "-module", "example.com/sample"}, tc.flags...)
+			args := append([]string{"new", tc.kind, "sample", "-dir", root, "-target", "generated", "-module", "example.com/sample", "-workflow-ref", agentWorkflowRef}, tc.flags...)
 			encoded, plan := expandedCLIPlan(t, args)
 			if entries, err := os.ReadDir(root); err != nil || len(entries) != 0 {
 				t.Fatalf("new plan route wrote target: %v %v", entries, err)
 			}
 			expandedCLIApplyReplay(t, root, encoded, plan)
-			opts := scaffold.Options{Name: "sample", Module: "example.com/sample", AppkitVersion: Version(), Tenant: tc.tenant, Partitioned: tc.partitioned}
+			opts := scaffold.Options{Name: "sample", Module: "example.com/sample", AppkitVersion: Version(), WorkflowRef: agentWorkflowRef, Tenant: tc.tenant, Partitioned: tc.partitioned}
 			var expected map[string][]byte
 			var err error
 			if tc.kind == "domain" {

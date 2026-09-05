@@ -1,0 +1,11 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "packageRules": [
+    {
+      "description": "CI service images remain reproducible while updates arrive by reviewed PR",
+      "matchDatasources": ["docker"],
+      "pinDigests": true
+    }
+  ]
+}

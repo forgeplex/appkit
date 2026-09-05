@@ -67,10 +67,30 @@ func TestSchemaGuidanceScaffoldMatrix(t *testing.T) {
 			}
 			assertRendered(t, dir)
 			assertGoParses(t, dir)
+			mustContain(t, "config/dev.yaml", readFile(t, dir, "config/dev.yaml"), "security:", "mode: disabled", "staging/prod")
+			mustContain(t, "Makefile", readFile(t, dir, "Makefile"), "run-minimal:", "-minimal")
+			if !tc.system {
+				for _, name := range []string{"cmd/sampled/main.go", "internal/module/module.go"} {
+					content := readFile(t, dir, name)
+					mustContain(t, name, content, "reg.MountPublic(")
+					if strings.Contains(content, "reg.Mount(") {
+						t.Errorf("%s has an unclassified root route", name)
+					}
+				}
+				mustContain(t, "internal/module/module.go", readFile(t, dir, "internal/module/module.go"),
+					"reg.Permissions(sample.PermissionCatalog()...)", "reg.MountPermission(")
+				mustContain(t, "AGENTS.md", readFile(t, dir, "AGENTS.md"), "security.mode", "reg.MountAuthenticated", "reg.MountInternalService")
+				if tc.partitioned {
+					mustContain(t, "internal/module/module.go", readFile(t, dir, "internal/module/module.go"),
+						"callctx.From(ctx).Partition", "unsigned X-Partition", "已验证 principal")
+				}
+			}
 			if !testing.Short() {
 				dir, workFile := writeGoWork(t, dir)
 				runSchemaGuidanceCommand(t, dir, workFile, "go", "build", "-buildvcs=false", "./...")
-				runSchemaGuidanceCommand(t, dir, workFile, cliBinary, "check", "-dir", dir)
+				// The source-built CLI resolves its devel workflow provenance
+				// from this framework checkout, not the new (non-git) project.
+				runSchemaGuidanceCommand(t, appkitRoot(t), workFile, cliBinary, "check", "-dir", dir)
 			}
 		})
 	}

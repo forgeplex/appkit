@@ -8,7 +8,8 @@
 
 ```sh
 appkit dev     # 生成 go.work，联调本地 appkit 与各域仓库（go.work 不提交）
-make run       # -target=all 单体形态起服
+make run-minimal # 尚未接数据库时，显式只起探针验证入口
+make run       # 配好 database.url 后以 -target=all 单体形态起服
 make check
 ```
 
@@ -16,9 +17,14 @@ make check
 
 ```
 cmd/{{.Name}}/       唯一 composition root：-target 过滤模块，其余契约落 Remote 绑定
-config/              dev/prod.yaml，按模块前缀分区；密钥走环境变量
+config/              dev/prod.yaml，含逐部署 security.mode；密钥走环境变量
 deploy/              部署说明：同一镜像、不同 -target（见 deploy/README.md）
 ```
+
+`config/dev.yaml` 的 `security.mode: disabled` 只用于本地开发。生产配置故意
+留空并拒绝启动，直到部署者按入口类型选择严格模式并装配对应验签器；当前
+bootstrap 阶段可完整配置 `user_facing`，`internal_service/mixed` 在服务 JWT
+验证器落地前保持 fail closed。
 
 ## 接入域仓库
 

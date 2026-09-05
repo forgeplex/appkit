@@ -25,6 +25,7 @@ func TestRenderScaffoldParityAndReadOnly(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := tc.opts
 			opts.Module, opts.AppkitVersion = "example.com/sample", "v0.7.3"
+			opts.WorkflowRef = "0123456789abcdef0123456789abcdef01234567"
 			parent := t.TempDir()
 			opts.Dir = filepath.Join(parent, "no-output")
 			before := opts

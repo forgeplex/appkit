@@ -69,7 +69,7 @@ func parseAppConfig(r io.Reader, path string) (AppConfig, error) {
 		return AppConfig{}, fmt.Errorf("%s: kind %q 非法（只允许 domain 或 system）", path, c.Kind)
 	}
 	cfg := Config{Domain: c.Domain, Module: c.Module, Contracts: c.Contracts}
-	if err := cfg.validate(); err != nil {
+	if err := cfg.validateRepository(); err != nil {
 		return AppConfig{}, fmt.Errorf("%s: %w", path, err)
 	}
 	return c, nil
@@ -77,7 +77,17 @@ func parseAppConfig(r io.Reader, path string) (AppConfig, error) {
 
 // Sync 按 .appkit.yml 渲染规则集并写入 dir，返回写入的相对路径（有序）。
 func Sync(dir, version string) ([]string, error) {
-	files, err := renderFor(dir, version)
+	workflowRef, err := ResolveWorkflowRef(version)
+	if err != nil {
+		return nil, err
+	}
+	return SyncPinned(dir, version, workflowRef)
+}
+
+// SyncPinned 与 Sync 相同，但使用调用者已解析并校验的完整 workflow commit。
+// 它供脚手架在一次运行中复用解析结果，也让离线测试无需访问模块代理。
+func SyncPinned(dir, version, workflowRef string) ([]string, error) {
+	files, err := renderFor(dir, version, workflowRef)
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +106,16 @@ func Sync(dir, version string) ([]string, error) {
 
 // Check 比对渲染结果与磁盘内容，漂移则报错并列出文件。
 func Check(dir, version string) error {
-	files, err := renderFor(dir, version)
+	workflowRef, err := ResolveWorkflowRef(version)
+	if err != nil {
+		return err
+	}
+	return CheckPinned(dir, version, workflowRef)
+}
+
+// CheckPinned 使用指定完整 commit 比对规则集。
+func CheckPinned(dir, version, workflowRef string) error {
+	files, err := renderFor(dir, version, workflowRef)
 	if err != nil {
 		return err
 	}
@@ -119,12 +138,15 @@ func Check(dir, version string) error {
 	return nil
 }
 
-func renderFor(dir, version string) (map[string][]byte, error) {
+func renderFor(dir, version, workflowRef string) (map[string][]byte, error) {
 	ac, err := LoadAppConfig(dir)
 	if err != nil {
 		return nil, err
 	}
-	return Render(Config{Domain: ac.Domain, Module: ac.Module, Contracts: ac.Contracts, Version: version})
+	return Render(Config{
+		Domain: ac.Domain, Module: ac.Module, Contracts: ac.Contracts,
+		Version: version, WorkflowRef: workflowRef,
+	})
 }
 
 func sortedKeys(m map[string][]byte) []string {

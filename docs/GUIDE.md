@@ -113,7 +113,7 @@ appkit new domain clients  -dir clients
 | `db/SCHEMA.md` + `db/schema/` | 表结构总览 + ER 图 + 每表详情，从迁移派生（要连 DB，所以 `new` 时不生成） | 改过迁移就 `make schema`；**禁止手改**（见 4.1） |
 | `identity.go` | 唯一导出面：`Module()`（只有组合仓库和本仓 cmd/ 会 import） | 一般不动 |
 | `cmd/identityd/` | 独立微服务部署入口：只声明"装哪些模块"，装配本身在 `appkit/bootstrap` | 一般不动 |
-| `config/dev.yaml` | 运行配置；任意键可被 `IDENTITYD_*` 环境变量覆盖 | 完整模式时填 `database.url` |
+| `config/dev.yaml` | 运行配置；任意键可被 `IDENTITYD_*` 环境变量覆盖 | 开发骨架显式写 `security.mode: disabled`；完整模式时再填 `database.url` |
 | `.appkit.yml` | 框架配置：`check`/`sync`/`dev` 读取 | 接入合约仓库后填 `contracts:` |
 | `.gitattributes` | 钉 `*.sql eol=lf`（迁移校验和跨平台一致）+ 折叠生成物 | 别动（`appkit sync` 维护） |
 
@@ -131,7 +131,7 @@ appkit dev       # 生成 go.work：同根目录下的兄弟仓库全部纳入�
                  # require 发版的 appkit，按发版版本构建不依赖工作区；要吃本地
                  # 未发布的 appkit 改动，才把 appkit checkout 也 go work use 进来
                  #（appkit 不在同一根目录下时按 dev 的提示手动 use）
-make run         # 零依赖试跑：最小模式（仅 /healthz /readyz /identity/ping）
+make run-minimal # 显式零依赖试跑（仅 /healthz /readyz /identity/ping）
 make run-db      # 完整模式：自动起一次性开发 Postgres（docker）并注入 database.url
 make check && make lint && make test   # = CI 跑的那几条
 ```
@@ -158,8 +158,10 @@ appkit new domain rbac -partitioned -dir rbac
 1. **schema 由调用方确定**。迁移与查询全部**不带 schema 前缀**；每次 `tx.Do`
    开启事务后按调用方的分区键（`callctx.Meta.Partition`）`SET LOCAL search_path`
    路由到对应分区。分区键的来源与租户同构：认证请求由 `authn.MultiIssuer`
-   按令牌签发方焊入（iss=`rbac-a` ↔ 分区 `a`），内部东西向经 `X-Partition`
-   头与事件 meta 传播。它与 `Meta.TenantID`（业务租户）是两个字段——分区
+   按令牌签发方焊入（iss=`rbac-a` ↔ 分区 `a`）。严格 HTTP 模式会在最外层
+   清除 `X-Partition` / `X-Tenant-Id` 及预置的分区/租户，必须由已验证凭证
+   重建，不能只凭东西向头信任身份。事件 meta 可以携带分区，但消费者须
+   保证消息来自可信链路。它与 `Meta.TenantID`（业务租户）是两个字段——分区
    决定落哪个 schema，租户决定看哪些行，别混。漏过滤的失败形态是「表不
    存在」，而不是「看到了别家的数据」。
 2. **分区映射由组合根注入**，定义放组合根自己的配置文件：
@@ -203,10 +205,10 @@ appkit new domain docs -tenant -dir docs
 
 机制四件（生成物里都已就位，读懂即可，不必重写）：
 
-1. **租户身份的来源唯一**：`authn` 验签后把令牌 `tid` 焊进
-   `callctx.From(ctx).TenantID`——有值覆盖、无值清零。`X-Tenant-Id` 头只是
-   内部东西向传播的载体（Transport 注入 → 入站 Extract 读出），认证请求里
-   伪造的头值活不下来。业务代码取租户只有一个入口：`callctx.From(ctx).TenantID`。
+1. **租户身份的来源唯一**：严格 HTTP 身份边界先删除 `X-Tenant-Id`、
+   清空 ctx 的 tenant；`authn` 再把验过签的令牌 `tid` 焊进
+   `callctx.From(ctx).TenantID`。无 `tid` 就保持空，网络请求无法用 unsigned
+   header 补上。业务代码取租户只有一个入口：`callctx.From(ctx).TenantID`。
 2. **事务自动带租户**：`pgtx.NewTenant(pool)` 的 `Do` 开事务后把租户身份落成
    事务级 GUC `app.tenant_id`（连接归池即净）。基础设施表（outbox/幂等/审计）
    无租户、不受影响。
@@ -350,12 +352,16 @@ appkit outbox -schema <域> -dsn <...> <ID>…    # 按事件 ID 放回（-all �
 **④ handler**（`internal/http/`）：解码 → 调 `Service` → `httpserver.WriteError` 统一出错出口
 （RFC 9457 problem+json，错误码即错误身份）。
 
-**⑤ 挂进 module**（`internal/module/module.go`）：`reg.Mount("POST /identity/users", ...)`。
-需要幂等的写接口（支付、建用户）用中间件包住 handler，客户端带 `Idempotency-Key` 头：
+**⑤ 挂进 module**（`internal/module/module.go`）。HTTP 路由必须显式声明安全类别；
+建用户是需要权限的写接口，先声明权限码，再用 `MountPermission`
+绑定。同时用幂等中间件包住 handler，客户端带 `Idempotency-Key` 头：
 
 ```go
+reg.Permissions(appkit.PermissionDecl{
+	Code: "identity:users:create", Name: "创建用户", Category: "identity",
+})
 idemMW := idem.Middleware(idem.NewStore(m.opts.Pool, Schema), m.opts.Log)
-reg.Mount("POST /identity/users", idemMW(usersHandler))
+reg.MountPermission("POST /identity/users", "identity:users:create", idemMW(usersHandler))
 ```
 
 默认指纹绑定原始字节：客户端重试时若重新序列化（金额 "80" 变 "80.00"、字段
@@ -651,6 +657,8 @@ app := appkit.New(
     appkit.Bus(bus),                                  // 消费者订阅端
     appkit.Migrator(pgmigrate.Runner(pool)),          // 启动时按 schema 应用各域迁移
     appkit.Middleware(httpserver.Base(log)...),
+    appkit.Middleware(authn.Middleware(cfg.Authn.PublicKey, cfg.Authn.Issuer)),
+    appkit.Security(appkit.SecurityUserFacing),       // 任何 App.Run 都必须显式选模式
     appkit.HTTPAddr(cfg.Addr),
     appkit.Logger(log),
     // target 之外的域落到远程绑定：注入生成的 HTTP client（实现同一契约接口，
@@ -675,15 +683,26 @@ return app.Run(ctx)
 | authn 独立扩容 | `./sso -target=authn` + 其余 `-target=identity,clients` |
 | 专职 relay 角色 | `./sso -target=relay`（模块把 relay 挂在自己的 OnStart，target 里含哪个域就跑哪个域的 relay） |
 
-拆分部署后把 `outbox.DirectBus` 换成 NATS/Kafka 实现（同一 `Bus` 接口），
-业务代码零改动。
+拆分部署必须通过 `bootstrap.Options.NewBus` 把 `outbox.DirectBus` 换成 NATS/Kafka
+实现；框架在 `target != all` 且仍使用隐式 DirectBus 时拒绝启动。只有确认事件绝不
+跨进程的特殊部署才可显式设置 `AllowDirectBusForSplit`。
+
+持久化 Broker 除实现发布与订阅接口外，应实现 `appkit.ManagedSubscriber`。框架会
+在监听端口前调用 `Connect`，以受管 Worker 运行 `Run` 消费循环，将 `Ready` 接入
+`/readyz`；消费循环异常会触发整个应用关停。关停时保持消费循环存活，先用关停
+预算执行 `Drain`（停止拉取并等待在途消费），随后取消并等待消费循环退出，最后
+`Close` 连接；即使 `Connect` 部分初始化后失败也会执行 `Close`。生产者只有在 Broker 返回 durable ack 后才能让
+`Publish` 成功；任何 nack、超时或断连都必须返回错误，使 outbox 保持未发布并重试。
+
+投递语义仍是至少一次：发布成功只表示 Broker 已持久确认，不表示消费者业务已经
+生效；消费端继续用 inbox 与业务唯一约束保证幂等生效。
 
 ## 7. 第六步：跑起来
 
 单个域仓库（identity 目录内）：
 
 ```sh
-make run        # 最小模式：零依赖，database.url 留空
+make run-minimal # 显式最小模式：零依赖，仅允许 env=dev
 curl localhost:8080/identity/ping          # → pong (最小模式)
 
 make run-db     # 完整模式：自动起一次性 Postgres + 迁移 + relay
@@ -705,6 +724,10 @@ curl -X POST localhost:8080/identity/users \
 
 端口被占时不用改文件：`SSO_ADDR=:18080 make run`（域仓库同理，
 `IDENTITYD_ADDR=...`）——任意配置键都能这样覆盖。
+
+正常启动缺少 `database.url` 会直接失败，即使组合根声明了 `Options.Minimal` 也
+不会自动降级。最小模式只用于本地占位验证，必须显式传 `-minimal`（生成仓库的
+`make run-minimal`），且 `staging` / `prod` 会拒绝该模式。
 
 测试：单测不需要任何环境。`TEST_DATABASE_URL` 是**给你将来写的数据层集成
 测试**的全系统约定（appkit 自身与 CI 流水线都用它；骨架初始没有测试文件）：
@@ -814,8 +837,12 @@ debug:
 ```
 
 **默认关闭**——pprof 暴露进程内部信息（goroutine 栈、堆采样可能含
-敏感数据），开启前先确认服务端口不暴露公网。开关走配置而不是代码：
-线上排障改 configmap 重启即生效，不必发版。
+敏感数据）。严格模式下它不再只靠网络约定保护：`user_facing`
+直接拒绝启动；`internal_service` / `mixed` 中每个 pprof handler 都包上
+服务主体守卫，没有验证过的 `ServicePrincipal` 返回 401。bootstrap
+只在 `env=dev` 允许 `disabled`，此时 pprof 无守卫，只用于本地调试。
+直接构造 App 的测试也可显式选 `SecurityDisabled`。开关走配置而不是代码：
+排障改 configmap 重启即生效，不必发版。
 
 ```sh
 kubectl port-forward deploy/ledger 8080 &
@@ -823,26 +850,31 @@ go tool pprof -http=:6060 http://127.0.0.1:8080/debug/pprof/heap
 go tool pprof -http=:6060 "http://127.0.0.1:8080/debug/pprof/profile?seconds=30"
 ```
 
+当前 HTTP 安全第一阶段里，bootstrap 对 `internal_service` / `mixed`
+仍 fail-closed，等待服务 JWT 验证配置落地；因此线上 pprof 也刻意不可用。
+不要为了打开 pprof 把生产改成 `disabled`。
+
 ### 附：跨服务的 request id 是怎么串起来的
 
 `contract` 的 ctx 防火墙会剥掉 ctx 里的一切值（进程内调用不该比跨网络调用能多传
-东西），但 `callctx.Meta` 的三个字段例外——request id、tenant id、caller
-在真实的跨网络调用里本来就会传：
+东西），但 `callctx.Meta` 的三个字段例外——request id、tenant id、caller。
+它们在已建立信任的边界内这样流转：
 
-- HTTP 入站：`httpserver` 中间件从请求头读进 ctx（自动）；
+- HTTP 入站：严格模式只保留用于追踪的 request id；unsigned tenant/caller
+  header 与 ctx 预置值先被最外层边界清空，随后只能由验证过的凭证重建；
 - 契约调用（进程内）：防火墙剥值后把它放回（自动）；
 - 事件：outbox 发布时快照进 `Event.Meta`，relay 投递前还原进 ctx——异步链路上也连得起来（自动）。
 
 出站 HTTP 这一段也由生成物接管：`appkit gen contract` 产出的 client 在
 `NewClient` 里把传入的 `http.Client` 复制一份、焊上
 `callctx.Transport{Caller: caller}` 再发请求——"忘了装 Transport"的静默
-失效形态不存在。`caller` 参数填**自己**的服务名；它的语义是"谁调的我"，
-留空会把上一跳的名字原样透传下去，下游据此做的归因、限流与配额也就跟着错。
-链路起点看 request id，不看 caller。
+失效形态不存在。`caller` 参数填**自己**的服务名；但它与 tenant header
+只是传播候选，不是身份证明。严格入站不直接信它们。当前 request id 能端到端
+串联；跨服务的 caller/租户委托要等服务 JWT 验证器从已签名 claims 重建。
 
-裸挂 server handler（不经 `httpserver` 中间件）时元数据也不会丢：生成的
-`serve` 兜底会把请求头里的 callctx 合并回 ctx；正常挂在 `httpserver.Base`
-后面时这步是幂等重放，request id 的生成与回写仍是外层中间件的职责。
+生成的 server `serve` 仍会把请求头里的 callctx 合并回 ctx，但在正常
+`App.Run` 严格模式下，它收到的已是信任边界清洗后的头。裸挂生成 handler
+只适合契约单测，不是绕过根边界的生产装配方式。
 
 **要验它接没接上**，给 `apptest.Conform` 的每个 `Binding` 填上 `SeenMeta`：
 
@@ -887,6 +919,7 @@ apptest.Conform(t,
 ```go
 appkit.New(modules,
     // ...其余 Option
+    appkit.Security(appkit.SecurityUserFacing),
     appkit.Middleware(append(httpserver.Base(log),
         httpserver.ClientIP(trusted...))...),
 )
@@ -921,7 +954,8 @@ if ip := callctx.ClientIP(ctx); ip.IsValid() {
 ```yaml
 jobs:
   ci:
-    uses: forgeplex/appkit/.github/workflows/domain-ci.yml@main
+    # appkit v0.7.2；sync 从该版本 module provenance 解析完整 commit。
+    uses: forgeplex/appkit/.github/workflows/domain-ci.yml@<40 位 commit SHA>
 ```
 
 这条流水线做：gofmt → vet → build → `test -race`（带 Postgres service）→
@@ -931,7 +965,10 @@ go-arch-lint** → `go mod tidy` 漂移检查。
 顺序不是随手排的：**先验规则集未漂移，再按规则集跑检查器**——反过来就可能在
 一份被改松的配置上跑出绿色。`appkit check` 本身也查规则集漂移（含配置文件被删），
 所以本地 `make check` 就能拦下"把规则改松让检查变绿"这条路，不必等 CI。
-配合 branch protection，**约束在 CI 不可绕过**；`//nolint` 必须写理由（nolintlint）。
+reusable workflow 固定到域仓库 appkit 版本对应的完整 commit，不追随 `main`；
+GitHub Actions 本身固定完整 commit SHA，workflow 默认只有 `contents: read`。
+配合 main/release tag protection，**约束在 CI 不可绕过**；`//nolint` 必须写理由（nolintlint）。
+仓库 ruleset、紧急升级和回滚步骤见 [CI_SECURITY.md](CI_SECURITY.md)。
 
 两个检查器的版本由 `ruleset.GolangciLintVersion` / `ruleset.ArchLintVersion` 钉死，
 域仓库 `make lint` 从同一处渲染——本地跑的和 CI 跑的是同一个二进制，
@@ -948,14 +985,60 @@ CI**：`domain-ci.yml` 里有一步 appkit-lint，版本随域仓库 go.mod 钉�
 go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@v0.4.0 -moneyfloat.scope 'internal/(identity|authn)' ./...
 ```
 
-## 鉴权与权限（声明 / 绑定 / 判定 / step-up）
+## HTTP 安全、鉴权与权限
 
-这章是可选能力，接入顺序：**声明 → 绑码 → 组合根挂验签**，之后判定矩阵
-（401/403/step-up）全部在框架，业务域不写一行鉴权代码。设计是可插拔的：
-判定机制在 appkit，鉴权语义（角色模型、令牌签发、MFA）在提供方域（如
-rbac）——换提供方，业务域与框架代码零改动（DESIGN §5.4）。
+HTTP 安全模式不是可选能力。任何会走 `App.Run` 监听端口的进程都必须
+显式选择；零值会在监听前拒绝启动，不会退化成匿名服务。bootstrap 从运行配置读：
 
-### ① 声明（域仓库，Register 阶段）
+```yaml
+security:
+  mode: user_facing # user_facing | internal_service | mixed | disabled
+```
+
+也可用 `SSO_SECURITY__MODE=user_facing` 这类环境变量覆盖。手写 `appkit.New`
+时等价地传 `appkit.Security(appkit.SecurityUserFacing)`。`App.Migrate` / `-migrate`
+不监听 HTTP，因此豁免这项配置。
+
+| 模式 | 路由用途 | bootstrap 当前行为 |
+|---|---|---|
+| `disabled` | bootstrap 本地开发，或直接构造 App 的测试；保留旧 `Mount` 行为 | bootstrap 仅 `env=dev` 可用 |
+| `user_facing` | 面向用户的公开、已认证、权限路由 | 需精确 32 字节 Ed25519 公钥 + issuer，自动挂用户令牌验签 |
+| `internal_service` | 公开探针 + 服务身份路由 | 第一阶段暂无服务 JWT 配置，fail-closed 拒绝启动 |
+| `mixed` | 同一进程同时有用户与服务路由 | 同上，服务 JWT 机制落地前拒绝启动 |
+
+严格模式（除 `disabled` 外）要求每个根路由选四类之一：
+
+```go
+reg.MountPublic("POST /login", loginHandler)
+reg.MountAuthenticated("GET /me", meHandler)
+reg.MountPermission("POST /files", "files:write", createFileHandler)
+reg.MountInternalService("POST /internal/reconcile", reconcileHandler)
+```
+
+| 安全分类 | `user_facing` | `internal_service` | `mixed` |
+|---|---:|---:|---:|
+| `MountPublic` | ✓ | ✓ | ✓ |
+| `MountAuthenticated` / `MountPermission` | ✓ | — | ✓ |
+| `MountInternalService` | — | ✓ | ✓ |
+
+内建 `/healthz` 与 `/readyz` 是隐式公开探针。模块在 Register/Setup 期间挂的
+路由会在全部 Setup 完成后、端口监听之前统一校验；严格模式里裸
+`reg.Mount` 属未分类路由，启动当场失败。
+
+严格模式还在**所有可配中间件的最外层**放一道身份信任边界。它先清空
+ctx 里预置的 `Actor` / `ServicePrincipal` 以及 `callctx` 的 tenant/caller，
+再删掉未签名的 `X-Tenant-Id` / `X-Caller` / `X-Merchant-Id`。Request ID
+只用于追踪，会保留。边界内的验签中间件才能从凭证重建可信主体和租户范围；
+调整中间件顺序也无法把这道边界挪到内层。组合根自己配的 Middleware
+仍是受信代码：它可以注入验过的 principal，也能因错写而短路路由守卫；
+这不是对恶意 wiring 的沙箱。
+
+权限接入顺序是：**选安全模式 → 给路由分类 → 声明权限码 → 绑码 → 组合根挂验签**。
+判定矩阵（401/403/step-up）全部在框架，业务域不写一行鉴权代码。判定机制
+在 appkit，鉴权语义（角色模型、令牌签发、MFA）在提供方域（如 rbac）
+——换提供方，业务域与框架代码零改动（DESIGN §5.4）。
+
+### ① 权限声明（域仓库，Register 阶段）
 
 脚手架生成的 module.go 已带样例：
 
@@ -974,9 +1057,11 @@ reg.Permissions(appkit.PermissionDecl{
 ### ② 绑码（端点）
 
 ```go
-reg.Mount("POST /files", reg.Require("files:write", handler))
-// 模块内部 mux 的形态（Setup 期装配同样合法）：
-// mux.Handle("DELETE /files/{id}", reg.Require("files:delete", h))
+reg.MountPermission("POST /files", "files:write", handler)
+
+// 只有模块内部 mux 才需要低层 Require；根挂载仍须声明分类。
+mux.Handle("DELETE /files/{id}", reg.Require("files:delete", deleteHandler))
+reg.MountAuthenticated("/files/", mux)
 ```
 
 绑定的码必须在某处声明过（跨模块绑码合法，gateway 可以绑别域的码）；拼错
@@ -986,7 +1071,7 @@ reg.Mount("POST /files", reg.Require("files:write", handler))
 appkit: 模块 "files" 绑定了未声明的权限码 "files:wirte"——在 Register 阶段用 reg.Permissions 声明
 ```
 
-### ③ 组合根挂验签（两行）
+### ③ `user_facing` 组合根挂验签（两行）
 
 私钥在提供方；组合根只持 Ed25519 公钥。`appkit new system` 生成的 main.go
 加两个字段：
@@ -995,7 +1080,7 @@ appkit: 模块 "files" 绑定了未声明的权限码 "files:wirte"——在 Reg
 bootstrap.Main(bootstrap.Options{
     Service: "sso",
     // …Modules / Minimal / AppOptions 照旧…
-    AuthnPublicKey: mustEd25519Pub(cfg.Authn.PubkeyFile), // 非空 = 根链挂验签
+    AuthnPublicKey: mustEd25519Pub(cfg.Authn.PubkeyFile), // user_facing 必填
     AuthnIssuer:    cfg.Authn.Issuer,                     // 如 "rbac-demo"
 })
 ```
@@ -1019,25 +1104,33 @@ func mustEd25519Pub(path string) ed25519.PublicKey {
 }
 ```
 
-配了公钥不配 issuer 会启动报错——没有 iss 约束的验签会接受任何持私钥者
-签的令牌。手写 `appkit.New` 的等价形态：`appkit.Middleware(authn.Middleware(pub, issuer))`。
+公钥必须恰好是 Ed25519 的 32 字节，issuer 也必填——没有 iss 约束的验签会接受
+其他系统的令牌。手写 `appkit.New` 要同时注入验签中间件与安全模式：
+
+```go
+appkit.Middleware(authn.Middleware(pub, issuer)),
+appkit.Security(appkit.SecurityUserFacing),
+```
 
 多分区同进程（N 个 rbac 分区，每个一个 iss=`rbac-<分区键>`）用多签发方形态，
-顺手把分区键焊进 `callctx`（分区域 / 分区 + 行级的域据此路由）：
+同时显式配置安全模式；分区键焊进 `callctx`（分区域 / 分区 + 行级的域据此路由）：
 
 ```go
 appkit.Middleware(authn.MultiIssuer(map[string]authn.Issuer{
     "rbac-a": {Key: pubA, Partition: "a"},
     "rbac-b": {Key: pubB, Partition: "b"}, // 可各配一把密钥，缩小泄露半径
-}))
+})),
+appkit.Security(appkit.SecurityUserFacing),
 ```
 
 按令牌 iss 选公钥（伪造 iss 只会取到别家的钥而验不过）；step-up 证明必须与
 访问令牌同一签发方；未知 iss 401。
 
-行为约定：无 Authorization 头原样放行（公开端点是合法状态，判公开与否是
-Require 的事，挂中间件 ≠ 全站要登录）；有头但验不过必须 401——坏凭证是
-攻击不是匿名，不静默降级。
+行为约定：无 Authorization 头时，验签中间件本身不报错；`MountPublic`
+可继续，`MountAuthenticated` / `MountPermission` 的守卫返回 401。有头但
+验不过必须 401——坏凭证是攻击不是匿名，不静默降级。唯一例外是内建
+`/healthz` / `/readyz`：探针不参与身份判定，即使请求夹带损坏的
+Authorization 也会旁路验签，只反映存活/就绪状态。
 
 ### ④ 判定矩阵与 step-up 客户端流程
 
@@ -1066,11 +1159,10 @@ step-up 令牌），重试时放进 `X-Step-Up` 头；框架验它的签名、is
 生效的码，提供方把对应令牌的 `exp` 签短一点；拆分部署时每个服务**自己**
 挂验签中间件（凭证都在请求头上，本就该各自验），Actor 不跨契约调用传播。
 
-**租户身份也在这条链上**：验签过后 `tid` 不只进 Actor，还会焊进
-`callctx`（有值覆盖、无值清零入站头带来的值）——租户域（§3.2）靠它
-下沉到存储层做 RLS。所以业务代码取租户永远 `callctx.From(ctx).TenantID`，
-读请求头即伪造面（未认证入口的头值是东西向传播的合法形态，边缘剥头
-归网关）。
+**租户身份也在这条链上**：最外层边界先清空 header 与 ctx tenant，
+验签过后 `tid` 才进 Actor 并焊进 `callctx`——租户域（§3.2）靠它下沉到
+存储层做 RLS。所以业务代码取租户永远 `callctx.From(ctx).TenantID`，
+读 `X-Tenant-Id` 永远是伪造面。
 
 ## 列表端点：分页
 
@@ -1144,8 +1236,6 @@ keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可
 
 ## 10. 规则速查
 
-## 10. 规则速查
-
 | 你想做 | 正确做法 | 错误做法（会被什么拦住） |
 |---|---|---|
 | 域 A 调域 B | 合约接口 + `Resolve`，事务外调用 | 直接 require B 仓库（check/编译失败）；事务内调用（运行时守卫报 TX_BOUNDARY） |
@@ -1155,14 +1245,15 @@ keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可
 | 写 SQL | `db/queries/*.sql` + sqlc | handler/service 里拼 SQL（depguard 拦 pgx import） |
 | 表示金额 | `decimal.Decimal`（存储/运算，sqlc 全局 override NUMERIC）+ `money.Money`（需币种绑定时，领域层）+ JSON 边界字符串（入站用 `money.ParseCanonical`） | float64、裸 decimal 上 JSON 面（都在 appkit-lint 里，make lint 与 CI 都跑） |
 | 返回错误 | 合约错误码（`apperr.Is(err, identityv1.CodeXxx)` 单体/微服务行为一致） | 字符串比对、裸 errors.New 跨层 |
-| 给端点加鉴权 | `reg.Require(code, handler)`（码先在 Register 阶段声明；组合根配 `AuthnPublicKey`/`AuthnIssuer`） | 各写各的 JWT 验签判定（样板漂移、拼错码无人兜底）；自解 Authorization 头（无机制挡，别做） |
+| 启动 HTTP | 显式配 `security.mode`；手写 App 用 `appkit.Security`（`-migrate` 豁免） | 留空靠默认（启动在监听前失败）；生产用 `disabled`（bootstrap 拒绝） |
+| 给端点分类/鉴权 | 根路由用 `MountPublic` / `MountAuthenticated` / `MountPermission` / `MountInternalService`；权限码先声明 | 严格模式裸 `Mount`（启动失败）；各写各的 JWT 判定（样板漂移） |
 | 跑后台任务 | `reg.Worker(name, run)` | 自己 `go func()`（关停不等它、崩了没人管） |
 | 跑周期任务 | `reg.Worker(name, job.Every(pool, ...))` | 裸 `time.Ticker`（多副本每轮重复执行） |
 | 改数据库结构 | 新增 `000N_xxx.sql`（建表同一文件里写 `COMMENT ON TABLE`）+ `make schema` | 改已应用的迁移文件（启动报 MIGRATION_DRIFT）；手改 `db/schema/`（CI 报漂移） |
 | 搞清楚现有表长什么样 | 读 `db/SCHEMA.md` / `db/schema/<表>.sql` | 翻整条迁移历史在脑子里重放 |
 | 加业务指标 | `otel.Meter("你的域名")` 自建 | 往框架指标上加标签（基数无界） |
-| 传 request id / 租户 | `callctx.Meta`（入站/契约/事件自动，生成 client 出站自动焊 `Transport`） | 自己往 ctx 塞值（跨契约调用会被防火墙剥掉） |
-| 多租户的数据隔离 | 生成时选形态：`-tenant`（RLS 行级）/ `-partitioned`（schema 级，§3.1）/ 两个同给（平台一套 schema + 平台内商户分行，§3.3）；建租户表照抄 0002 样例（tenant_id + 索引 + 策略）；跨租户读用 `tx.WithReadAllTenants`（只放开 SELECT） | 手写 `WHERE tenant_id = ...` 满代码（漏一条就是静默泄漏）；业务代码读 `X-Tenant-Id` / `X-Partition` 头（认证请求里已被令牌覆盖/清零）；靠 BYPASSRLS 角色或「缺 GUC = 看全部」的策略给运营开口子 |
+| 传 request id / 分区 / 租户 | 用 `callctx.Meta`；严格 HTTP 入站仅保留 request id，partition/tenant/caller 必须由已验凭证重建 | 把 unsigned `X-Partition` / `X-Tenant-Id` / `X-Caller` 当身份（最外层边界删除） |
+| 多租户的数据隔离 | 生成时选形态：`-tenant`（RLS 行级）/ `-partitioned`（schema 级，§3.1）/ 两个同给（平台一套 schema + 平台内商户分行，§3.3）；建租户表照抄 0002 样例；跨租户读用 `tx.WithReadAllTenants`（只放开 SELECT） | 手写 `WHERE tenant_id = ...` 满代码（漏一条就是静默泄漏）；业务代码信任 unsigned 身份头；靠 BYPASSRLS 角色或「缺 GUC = 看全部」给运营开口子 |
 | 列表端点 | `page.Parse` + `page.Decode[T]` + keyset SQL + `page.Trim` + `page.List` 信封（排序键必加 id 兜住同刻并列） | 自发明游标格式/自解析 limit（一个仓库很快两三种格式并存）；OFFSET 深翻页（线性变慢 + 页间漂移） |
 | 确认拆分部署不会变行为 | 提供方域仓库里写一条 `apptest.Conform`（local + remote 两个绑定） | 只测本地实现（远程那条路径第一次跑就是在生产） |
 

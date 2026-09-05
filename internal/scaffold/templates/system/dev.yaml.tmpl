@@ -2,14 +2,19 @@
 # （{{.EnvPrefix}}_LOG__LEVEL 覆盖 log.level）。
 addr: ":8080"
 env: dev
+security:
+  # bootstrap 仅允许 env=dev 显式关闭；staging/prod 会拒绝 disabled。
+  mode: disabled
 database:
   # 各域共用一个库（每域独占自己的 schema）。require 域仓库并取消 main.go
   # 里 pool 注释后填写，形如：
   # url: postgres://postgres:dev@127.0.0.1:5432/{{.Name}}_dev?sslmode=disable
+  # 留空时正常启动会 fail closed；尚未接库只验证入口请 make run-minimal。
   url: ""
 log:
   level: debug
   format: text
 debug:
-  # pprof 排障端点默认关闭。本地开发打开无妨；生产开启前先确认端口不暴露公网。
+  # disabled 模式下 pprof 无身份保护，只能在可信本机临时打开；严格模式仅
+  # internal_service/mixed 可启用，并要求已验证的服务身份。
   pprof: false

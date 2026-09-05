@@ -14,6 +14,7 @@ import (
 	"github.com/forgeplex/appkit/internal/agentplan"
 	"github.com/forgeplex/appkit/internal/scaffold"
 	"github.com/forgeplex/appkit/internal/workspace"
+	"github.com/forgeplex/appkit/ruleset"
 )
 
 const agentResultVersion = "appkit.dev/agent-result/v1alpha1"
@@ -123,8 +124,11 @@ func executeAgent(command string, args []string, out, diagnostics io.Writer) err
 	flags.SetOutput(diagnostics)
 	dir := flags.String("dir", ".", "工作区根目录")
 	timeout := flags.Duration("timeout", 30*time.Second, "等待工作区锁及执行的超时")
-	var input, target, planPath, expectedDigest, iface, system, module, dsn string
+	var input, target, planPath, expectedDigest, iface, system, module, dsn, workflowRef string
 	var tenant, partitioned, allowTempDB bool
+	if command == "plan" && (operation == "sync" || operation == "new") {
+		flags.StringVar(&workflowRef, "workflow-ref", "", "AppKit workflow 的完整 40 位 commit SHA（显式提供可离线规划）")
+	}
 	if command == "plan" && operation == "schema" {
 		flags.BoolVar(&allowTempDB, "allow-temp-db", false, "授权在一次性临时库执行可信迁移 SQL（不是 SQL 沙箱；需建库权限）")
 		flags.StringVar(&dsn, "dsn", "", "临时库管理连接，默认 TEST_DATABASE_URL；不会写入计划")
@@ -157,6 +161,13 @@ func executeAgent(command string, args []string, out, diagnostics io.Writer) err
 	if flags.NArg() != 0 || *timeout <= 0 {
 		return fmt.Errorf("%w: unexpected positional arguments or non-positive timeout", errAgentUsage)
 	}
+	if workflowRef != "" {
+		var err error
+		workflowRef, err = ruleset.NormalizeWorkflowRef(workflowRef)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errAgentUsage, err)
+		}
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
@@ -169,7 +180,11 @@ func executeAgent(command string, args []string, out, diagnostics io.Writer) err
 		}
 		switch operation {
 		case "sync":
-			plan, err = agentplan.Sync(ctx, *dir, Version())
+			if workflowRef == "" {
+				plan, err = agentplan.Sync(ctx, *dir, Version())
+			} else {
+				plan, err = agentplan.SyncPinned(ctx, *dir, Version(), workflowRef)
+			}
 		case "schema":
 			if !allowTempDB {
 				return fmt.Errorf("%w: plan schema requires -allow-temp-db to execute trusted migrations in a disposable database (not a SQL sandbox)", errAgentUsage)
@@ -193,7 +208,7 @@ func executeAgent(command string, args []string, out, diagnostics io.Writer) err
 			}
 			plan, err = agentplan.Wrap(ctx, *dir, input, target, iface, system)
 		case "new":
-			plan, err = agentplan.New(ctx, *dir, target, kind, scaffold.Options{Name: name, Module: module, AppkitVersion: Version(), Tenant: tenant, Partitioned: partitioned})
+			plan, err = agentplan.New(ctx, *dir, target, kind, scaffold.Options{Name: name, Module: module, AppkitVersion: Version(), WorkflowRef: workflowRef, Tenant: tenant, Partitioned: partitioned})
 		}
 		if err != nil {
 			return err

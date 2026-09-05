@@ -47,8 +47,8 @@ type EventBus interface {
 // Database 是数据库配置。
 type Database struct {
 	// URL 形如 postgres://user:pass@host:5432/db?sslmode=disable。
-	// 留空 = 最小模式（只起探针与 Options.Minimal 声明的模块），
-	// 便于零依赖试跑；生产部署必须配置。
+	// 留空时默认拒绝启动；本地零依赖试跑必须显式传 -minimal。
+	// 生产部署必须配置。
 	URL string `koanf:"url"`
 }
 
@@ -65,6 +65,17 @@ type Log struct {
 type Debug struct {
 	// Pprof 为 true 时挂 /debug/pprof/*（语义见 appkit.Pprof）。
 	Pprof bool `koanf:"pprof"`
+}
+
+// httpSecurityConfig 是 HTTP 身份边界配置。它故意不放进公开的 Base：给
+// 已导出结构体增加字段会破坏使用无键字面量的调用方。mode 无默认值，同一
+// 镜像以不同 target 部署时必须由运行环境显式选择。
+type httpSecurityConfig struct {
+	Mode appkit.SecurityMode `koanf:"mode"`
+}
+
+type runtimeSecurityConfig struct {
+	Security httpSecurityConfig `koanf:"security"`
 }
 
 // Base 是每个域服务共有的配置项。需要额外配置项时，用 Deps.Config
@@ -92,7 +103,7 @@ type Deps struct {
 	Config config.Options
 }
 
-// IsMinimal 报告当前是否为最小模式（未配置 database.url）。
+// IsMinimal 报告当前是否为显式最小模式。
 func (d Deps) IsMinimal() bool { return d.Pool == nil }
 
 // Options 声明一个域服务的装配。除 Service 与 Modules 外均可留空。
@@ -106,13 +117,18 @@ type Options struct {
 	// Modules 声明本进程可装配的模块全集（实际启用集由 -target 决定）。
 	// 完整模式下 Deps.Pool 与 Deps.Bus 非 nil。必填。
 	Modules func(Deps) ([]appkit.Module, error)
-	// Minimal 声明未配置 database.url 时装配的模块（通常挂个 ping 证明服务能起）。
-	// 为 nil 时未配置数据库直接报错。此时 Deps.Pool 与 Deps.Bus 为 nil。
+	// Minimal 声明显式 -minimal 模式装配的模块（通常挂个 ping 证明服务能起）。
+	// 仅 env=dev 可启用；Deps.Pool 与 Deps.Bus 为 nil。提供此回调不会授权
+	// database.url 缺失时自动降级，运行者仍必须显式传 -minimal。
 	Minimal func(Deps) ([]appkit.Module, error)
 	// AppOptions 追加 appkit.Option，典型用途是 appkit.Remote 绑定外域契约。
 	AppOptions func(Deps) []appkit.Option
 	// NewBus 覆盖默认事件总线（默认 outbox.NewDirectBus()）。
 	NewBus func() EventBus
+	// AllowDirectBusForSplit 明确允许 target != all 时仍使用默认 DirectBus。
+	// 这只适用于调用方确认事件不会跨进程的特殊部署；默认拒绝，避免生产者侧
+	// 无本地订阅者却误把拆分部署当成可工作的跨进程事件总线。
+	AllowDirectBusForSplit bool
 	// PoolOptions 追加连接池配置，随 bootstrap 建的生产池生效：
 	// pgtx.WithAfterConnect 装 per-connection 钩子（otelpgx tracer、
 	// 会话级 GUC），pgtx.WithMaxConns 调容量。留空即框架默认。
@@ -120,12 +136,13 @@ type Options struct {
 	// 幂等装配全部重写一遍，正是这条例外最不该存在的地方。
 	PoolOptions []pgtx.PoolOption
 	// AuthnPublicKey 是访问令牌的 Ed25519 验签公钥（组合根只持公钥，
-	// 私钥在鉴权提供方）。非空时在根链 Base 之后挂 authn.Middleware：
+	// 私钥在鉴权提供方）。security.mode=user_facing 时必填，并在根链
+	// Base 之后挂 authn.Middleware：
 	// 验签结果（appkit.Actor）注入 ctx，reg.Require / appkit.Check 据此
-	// 判定。留空 = 不启用验签（最小模式、内部网部署）。
+	// 判定。disabled 模式不得同时提供；内部服务身份由独立配置负责。
 	AuthnPublicKey ed25519.PublicKey
 	// AuthnIssuer 是期望的令牌 iss（提供方按分区签发，如 "rbac-demo"）。
-	// AuthnPublicKey 非空时必填，缺了启动报错——没有 iss 约束的验签
+	// user_facing 模式必填，缺了启动报错——没有 iss 约束的验签
 	// 会接受任何持私钥者签的令牌。
 	AuthnIssuer string
 }
@@ -138,6 +155,8 @@ type RunOptions struct {
 	ConfigFile string
 	// MigrateOnly 为 true 时只应用迁移然后退出，不监听端口、不跑后台任务。
 	MigrateOnly bool
+	// Minimal 显式启用无数据库最小模式，仅允许 env=dev。
+	Minimal bool
 }
 
 // Main 是域服务 main() 的全部内容：解析 flag、装配、运行；
@@ -151,6 +170,8 @@ func Main(o Options) {
 	flag.StringVar(&r.ConfigFile, "config", "config/dev.yaml", "配置文件路径（可缺省）")
 	flag.BoolVar(&r.MigrateOnly, "migrate", false,
 		"只应用数据库迁移然后退出（K8s initContainer / Job 用）")
+	flag.BoolVar(&r.Minimal, "minimal", false,
+		"显式启用无数据库最小模式（仅 env=dev，只有探针与占位路由）")
 	flag.Parse()
 
 	if err := Run(context.Background(), o, r); err != nil {
@@ -168,6 +189,9 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 	if o.Modules == nil {
 		return fmt.Errorf("bootstrap: %s: Options.Modules 不能为 nil", o.Service)
 	}
+	if !r.Minimal && !r.MigrateOnly && isSplitTarget(r.Target) && o.NewBus == nil && !o.AllowDirectBusForSplit {
+		return fmt.Errorf("%s: -target=%q 是拆分部署，禁止隐式使用进程内 DirectBus；请通过 Options.NewBus 配置外部 Broker，或明确设置 AllowDirectBusForSplit", o.Service, r.Target)
+	}
 
 	copts := config.Options{
 		Files:     []string{r.ConfigFile},
@@ -178,8 +202,22 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 	if err != nil {
 		return fmt.Errorf("%s: 加载配置: %w", o.Service, err)
 	}
+	securityConfig, err := config.Load[runtimeSecurityConfig](copts)
+	if err != nil {
+		return fmt.Errorf("%s: 加载 HTTP 安全配置: %w", o.Service, err)
+	}
+	securityMode := securityConfig.Security.Mode
 	base.Addr = cmp.Or(base.Addr, o.DefaultAddr, ":8080")
 	base.Env = cmp.Or(base.Env, "dev")
+	if r.Minimal && r.MigrateOnly {
+		return fmt.Errorf("%s: -minimal 与 -migrate 不能同时使用", o.Service)
+	}
+	if r.Minimal && base.Env != "dev" {
+		return fmt.Errorf("%s: -minimal 仅允许 env=dev，当前 env=%s", o.Service, base.Env)
+	}
+	if err := validateHTTPSecurity(o, base.Env, securityMode, copts.EnvPrefix, r.MigrateOnly); err != nil {
+		return err
+	}
 
 	tel, err := telemetry.Init(ctx, telemetry.Config{
 		ServiceName: o.Service,
@@ -207,12 +245,9 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 		appkit.Logger(d.Log),
 		appkit.Middleware(httpserver.Base(d.Log)...),
 	}
-	if len(o.AuthnPublicKey) > 0 {
+	if securityMode == appkit.SecurityUserFacing || securityMode == appkit.SecurityMixed {
 		// 验签挂在 Base 之后（内一层）：RequestID/AccessLog 在外层，
 		// 401 响应也进访问日志。
-		if o.AuthnIssuer == "" {
-			return fmt.Errorf("%s: 配置了 AuthnPublicKey 但 AuthnIssuer 为空——没有 iss 约束的验签会接受任何持私钥者签的令牌", o.Service)
-		}
 		opts = append(opts, appkit.Middleware(authn.Middleware(o.AuthnPublicKey, o.AuthnIssuer)))
 	}
 	if base.Debug.Pprof {
@@ -220,22 +255,25 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 	}
 
 	var modules []appkit.Module
-	if base.Database.URL == "" {
+	if r.Minimal {
+		if o.Minimal == nil {
+			return fmt.Errorf("%s: 指定了 -minimal，但 Options.Minimal 未声明最小模式模块", o.Service)
+		}
+		d.Log.Warn(o.Service + ": 显式最小模式启动：" +
+			"仅探针与 Minimal 声明的路由，数据面（迁移/outbox/幂等/审计）未启用")
+		if modules, err = o.Minimal(d); err != nil {
+			return fmt.Errorf("%s: 装配最小模式模块: %w", o.Service, err)
+		}
+	} else if base.Database.URL == "" {
 		// 迁移模式没有数据库可迁，明确报错而不是"最小模式跑完什么也没做"地成功退出——
 		// 那会让 initContainer 绿着、服务对着空库起来。
 		if r.MigrateOnly {
 			return fmt.Errorf("%s: -migrate 需要 database.url（配置文件的 database.url 或环境变量 %s_DATABASE__URL）",
 				o.Service, copts.EnvPrefix)
 		}
-		if o.Minimal == nil {
-			return fmt.Errorf("%s: 未配置 database.url（配置文件的 database.url 或环境变量 %s_DATABASE__URL）",
-				o.Service, copts.EnvPrefix)
-		}
-		d.Log.Warn(o.Service + ": 未配置 database.url，最小模式启动：" +
-			"仅探针与 Minimal 声明的路由，数据面（迁移/outbox/幂等/审计）未启用")
-		if modules, err = o.Minimal(d); err != nil {
-			return fmt.Errorf("%s: 装配最小模式模块: %w", o.Service, err)
-		}
+		return fmt.Errorf("%s: 未配置 database.url（配置文件的 database.url 或环境变量 %s_DATABASE__URL）；"+
+			"本地零依赖试跑请显式传 -minimal",
+			o.Service, copts.EnvPrefix)
 	} else {
 		pool, perr := pgtx.NewPool(ctx, base.Database.URL, o.PoolOptions...)
 		if perr != nil {
@@ -255,11 +293,54 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 	if o.AppOptions != nil {
 		opts = append(opts, o.AppOptions(d)...)
 	}
+	// 安全模式来自已经校验过的部署配置，必须最后写入；否则 AppOptions 可用
+	// 另一个 Security Option 覆盖生产模式，绕过身份边界与路由分类校验。
+	opts = append(opts, appkit.Security(securityMode))
 	app := appkit.New(modules, opts...)
 	if r.MigrateOnly {
 		return app.Migrate(ctx)
 	}
 	return app.Run(ctx)
+}
+
+func validateHTTPSecurity(o Options, env string, mode appkit.SecurityMode, envPrefix string, migrateOnly bool) error {
+	// 迁移专用进程不监听 HTTP，安全模式与凭证配置均不参与。
+	if migrateOnly {
+		return nil
+	}
+	switch mode {
+	case appkit.SecurityUnspecified:
+		return fmt.Errorf("%s: 未配置 security.mode（配置文件的 security.mode 或环境变量 %s_SECURITY__MODE）；"+
+			"必须显式选择 user_facing/internal_service/mixed，只有 env=dev 可选 disabled", o.Service, envPrefix)
+	case appkit.SecurityDisabled:
+		if env != "dev" {
+			return fmt.Errorf("%s: security.mode=disabled 仅允许 env=dev，当前 env=%s", o.Service, env)
+		}
+		if len(o.AuthnPublicKey) > 0 || o.AuthnIssuer != "" {
+			return fmt.Errorf("%s: security.mode=disabled 与 AuthnPublicKey/AuthnIssuer 冲突；要验证用户令牌请使用 user_facing", o.Service)
+		}
+		return nil
+	case appkit.SecurityUserFacing:
+		if len(o.AuthnPublicKey) != ed25519.PublicKeySize {
+			return fmt.Errorf("%s: security.mode=user_facing 需要 %d 字节 Ed25519 AuthnPublicKey", o.Service, ed25519.PublicKeySize)
+		}
+		if o.AuthnIssuer == "" {
+			return fmt.Errorf("%s: security.mode=user_facing 需要 AuthnIssuer——没有 iss 约束的验签会接受其他系统令牌", o.Service)
+		}
+		return nil
+	case appkit.SecurityInternalService, appkit.SecurityMixed:
+		// 路由分类与 fail-closed guard 已可表达这两种模式；服务凭证的
+		// iss/aud/sub/exp/iat/kid 验证器在 Issue #3 下一阶段落地。在它存在
+		// 前 bootstrap 不接受“靠网络可信”的替代品。
+		return fmt.Errorf("%s: security.mode=%s 需要受框架验证的服务身份配置；当前尚未配置，拒绝启动", o.Service, mode)
+	default:
+		return fmt.Errorf("%s: 未知 security.mode %q（允许 user_facing/internal_service/mixed/disabled）", o.Service, mode)
+	}
+}
+
+func isSplitTarget(target string) bool {
+	target = strings.TrimSpace(target)
+	return target != "" && target != "all"
 }
 
 func newBus(o Options) EventBus {

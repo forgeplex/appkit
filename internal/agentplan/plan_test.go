@@ -12,6 +12,8 @@ import (
 	"github.com/forgeplex/appkit/ruleset"
 )
 
+const testWorkflowRef = "0123456789abcdef0123456789abcdef01234567"
+
 func put(t *testing.T, root, name, content string) {
 	t.Helper()
 	full := filepath.Join(root, name)
@@ -34,11 +36,11 @@ func TestSyncPlanReadOnlyDeterministicApplyAndReplay(t *testing.T) {
 	ctx := context.Background()
 	root := domain(t)
 	put(t, root, "user.txt", "untouched")
-	plan, err := Sync(ctx, root, "v0.7.2")
+	plan, err := SyncPinned(ctx, root, "v0.7.2", testWorkflowRef)
 	if err != nil {
 		t.Fatal(err)
 	}
-	again, err := Sync(ctx, root, "v0.7.2")
+	again, err := SyncPinned(ctx, root, "v0.7.2", testWorkflowRef)
 	if err != nil || plan.Digest() != again.Digest() {
 		t.Fatalf("nondeterministic: %v", err)
 	}
@@ -52,14 +54,14 @@ func TestSyncPlanReadOnlyDeterministicApplyAndReplay(t *testing.T) {
 	if _, err := workspace.Apply(ctx, root, plan); err != nil {
 		t.Fatal(err)
 	}
-	if err := ruleset.Check(root, "v0.7.2"); err != nil {
+	if err := ruleset.CheckPinned(root, "v0.7.2", testWorkflowRef); err != nil {
 		t.Fatal(err)
 	}
 	result, err := workspace.Apply(ctx, root, plan)
 	if err != nil || result.Disposition != workspace.ApplyReplayed {
 		t.Fatalf("replay: %+v %v", result, err)
 	}
-	clean, err := Sync(ctx, root, "v0.7.2")
+	clean, err := SyncPinned(ctx, root, "v0.7.2", testWorkflowRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +79,7 @@ func TestPlanRejectsInputOrOutputDrift(t *testing.T) {
 	for _, changed := range []string{".appkit.yml", ".golangci.yml"} {
 		t.Run(changed, func(t *testing.T) {
 			root := domain(t)
-			plan, err := Sync(context.Background(), root, "test")
+			plan, err := SyncPinned(context.Background(), root, "test", testWorkflowRef)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -164,18 +166,18 @@ func TestPlanRejectsUnsafePathsAndSymlinks(t *testing.T) {
 	if err := os.Symlink(t.TempDir(), filepath.Join(root, ".github")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Sync(context.Background(), root, "test"); !errors.Is(err, workspace.ErrSymlink) {
+	if _, err := SyncPinned(context.Background(), root, "test", testWorkflowRef); !errors.Is(err, workspace.ErrSymlink) {
 		t.Fatalf("accepted symlink output ancestor: %v", err)
 	}
 }
 
 func TestPlanSourceMissingAndCanceled(t *testing.T) {
-	if _, err := Sync(context.Background(), t.TempDir(), "test"); !errors.Is(err, os.ErrNotExist) {
+	if _, err := SyncPinned(context.Background(), t.TempDir(), "test", testWorkflowRef); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("missing input: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := Sync(ctx, domain(t), "test"); !errors.Is(err, context.Canceled) {
+	if _, err := SyncPinned(ctx, domain(t), "test", testWorkflowRef); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled: %v", err)
 	}
 }
@@ -186,7 +188,7 @@ func TestExistingModePreservedAndUnrelatedChangesAllowed(t *testing.T) {
 	if err := os.Chmod(filepath.Join(root, ".golangci.yml"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	plan, err := Sync(context.Background(), root, "test")
+	plan, err := SyncPinned(context.Background(), root, "test", testWorkflowRef)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -77,6 +77,7 @@ func run(target string) error {
 		appkit.Target(target),
 		appkit.HTTPAddr(cfg.Addr),
 		appkit.Logger(log),
+		appkit.Security(appkit.SecurityDisabled), // 示例仅用于本地 dev。
 		appkit.Middleware(httpserver.Base(log)...),
 		// greet 不在 target 集内时，gateway 对 greetapi.Service 的 Resolve
 		// 落到这个远程兜底。真实项目直接用生成 client：

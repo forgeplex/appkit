@@ -9,6 +9,7 @@ import (
 	"github.com/forgeplex/appkit/idem"
 	"github.com/forgeplex/appkit/outbox"
 	"github.com/forgeplex/appkit/pgtx"
+	"github.com/forgeplex/appkit/ruleset"
 )
 
 // domainFiles 是域仓库骨架的模板清单（DESIGN §4 的 Go 惯用形态）。
@@ -44,6 +45,13 @@ func Domain(o Options, out io.Writer) error {
 	if err := ensureFreshDir(o.Dir); err != nil {
 		return fmt.Errorf("new domain: %w", err)
 	}
+	if o.WorkflowRef == "" {
+		var err error
+		o.WorkflowRef, err = ruleset.ResolveWorkflowRef(o.AppkitVersion)
+		if err != nil {
+			return fmt.Errorf("new domain %s: 解析 CI workflow commit: %w", o.Name, err)
+		}
+	}
 	files, err := RenderDomain(o)
 	if err != nil {
 		return err
@@ -53,7 +61,7 @@ func Domain(o Options, out io.Writer) error {
 	}
 	summarize(out, "域仓库", o.Dir, []string{
 		"appkit dev    # 生成 go.work 联调兄弟仓库；要吃本地未发布的 appkit 改动，把 appkit 也纳入",
-		"make run      # 零依赖试跑（最小模式）；make run-db 进完整模式",
+		"make run-minimal # 显式零依赖试跑；make run-db 进完整模式",
 		"make check && make test",
 	})
 	return nil

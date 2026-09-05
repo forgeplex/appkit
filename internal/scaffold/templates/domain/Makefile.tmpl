@@ -5,11 +5,15 @@
 GO ?= go
 DEV_DB_URL := postgres://postgres:dev@127.0.0.1:54329/{{.Name}}_dev?sslmode=disable
 
-.PHONY: run dev-db run-db migrate gen schema lint check test
+.PHONY: run run-minimal dev-db run-db migrate gen schema lint check test
 
-# 零依赖试跑：config/dev.yaml 的 database.url 留空 → 最小模式（仅探针 + /ping）。
+# 正常启动必须有 database.url；缺配置时 fail closed。
 run:
 	$(GO) run ./cmd/{{.Name}}d
+
+# 零依赖试跑必须显式选择最小模式（仅探针 + /ping）。
+run-minimal:
+	$(GO) run ./cmd/{{.Name}}d -minimal
 
 # 启动/复用一次性开发 Postgres（docker），与 config/dev.yaml 注释里的地址一致。
 dev-db:
@@ -45,10 +49,12 @@ GOLANGCI ?= $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.
 ARCHLINT ?= $(GO) run github.com/fe3dback/go-arch-lint@{{.ArchLintVersion}}
 # appkit-lint 是嵌套 module（不进业务依赖图），@版本直接拉取。版本随
 # go.mod 钉的 appkit——规则与依赖同版本升级，与 domain-ci.yml 同一套取法；
-# go.work 联调取不到版本时退 @main。用 make 函数而不是 shell case：
+# go.work 联调取不到版本时必须显式传 APPKITLINT_VERSION，禁止静默追随 main。
+# 用 make 函数而不是 shell case：
 # case 分支模式里的 ) 不配平会被 make 的 $(shell) 解析器提前截断。
-APPKITLINT_VERSION ?= $(or $(filter v%,$(shell $(GO) list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $$2}')),main)
+APPKITLINT_VERSION ?= $(filter v%,$(shell $(GO) list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $$2}'))
 lint:
+	@if [ -z "$(APPKITLINT_VERSION)" ]; then echo "APPKITLINT_VERSION 为空：go.work 联调请显式指定已发布版本" >&2; exit 1; fi
 	$(GOLANGCI) run ./...
 	$(ARCHLINT) check
 	$(GO) run github.com/forgeplex/appkit/lint/cmd/appkit-lint@$(APPKITLINT_VERSION) ./...

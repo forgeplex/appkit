@@ -6,7 +6,8 @@ github.com/forgeplex/appkit，设计文档 docs/DESIGN.md）。
 
 **本仓库是分区域域**：一套代码、N 份数据分区，schema 由调用方确定——组合根
 注入分区映射（分区键 → schema，见 cmd/{{.Name}}d/main.go 的演示；分区键由
-authn.MultiIssuer 按令牌签发方焊入 callctx，内部东西向经 X-Partition 头传播），
+authn.MultiIssuer 按令牌签发方确定，并由已验证 principal 重建进 callctx；
+unsigned X-Partition 只负责传输、不授信），
 每次事务开启后 `SET LOCAL search_path` 路由到当前分区，查询与迁移因此全部
 **无 schema 前缀**。新分区 = 组合根的映射加一条 + 重启，迁移自动建 schema。
 `make schema` 自动生成 **logical-template（逻辑模板）**：无前缀迁移只在一次性
@@ -28,7 +29,7 @@ RLS 策略（样例见 `db/migrations/0002_demo_notes.sql`，建真表照抄）�
 
 ```sh
 appkit dev     # 生成 go.work，联调本地 appkit / 各域仓库（go.work 不提交）
-make run       # ★ 零依赖试跑：最小模式（仅 /healthz /readyz /ping，数据面未启用）
+make run-minimal # ★ 显式零依赖试跑（仅 /healthz /readyz /ping，数据面未启用）
 make run-db    # 完整模式：自动起一次性开发 Postgres（docker）并注入 database.url
 make migrate   # 只应用迁移然后退出（生产上这一步跑在 initContainer/Job 里）
 make schema    # 从迁移重新生成 db/SCHEMA.md 与 db/schema/（{{if .Partitioned}}logical-template，非运行时分区检查{{else}}表结构总览 + ER 图{{end}}）
@@ -42,6 +43,10 @@ lint / CI 配置（.golangci.yml、.go-arch-lint.yml、.github/workflows/ci.yml�
 CI 都会校验未漂移（改松规则不会让检查变绿）。CI 先验漂移、再按这份配置跑
 `make lint` 的那两个检查器，版本与本地钉在同一个。
 运行配置在 `config/dev.yaml`，任意键可被 `{{.EnvPrefix}}_*` 环境变量覆盖。
+其中 `security.mode: disabled` 只供本地开发；任何监听 HTTP 的 staging/prod
+进程都必须按暴露面显式选择严格模式并装配对应验签器，裸 `reg.Mount` 会在
+严格模式下于监听前被拒绝。当前 bootstrap 阶段可完整配置 `user_facing`；
+`internal_service/mixed` 在服务 JWT 验证器落地前保持 fail closed。
 
 **已应用的迁移不可再改**：历史表存着每个文件的 sha256，改动已应用的文件会让服务
 以 `MIGRATION_DRIFT` 拒绝启动（错误信息里带修复命令）。改结构一律新增 `000N_*.sql`。

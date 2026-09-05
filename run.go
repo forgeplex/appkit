@@ -13,10 +13,12 @@ import (
 	"sort"
 	"syscall"
 	"time"
+
+	"github.com/forgeplex/appkit/health"
 )
 
 // Run 启动应用并阻塞到 ctx 取消、收到 SIGINT/SIGTERM 或 HTTP 服务异常退出，
-// 然后优雅关停。
+// 然后优雅关停。调用前必须通过 Security 显式选择 HTTP 安全模式。
 //
 // 启动顺序：Register（声明）→ Remote 绑定 → 依赖图解析（fail-fast）→ 迁移 →
 // Setup（装配）→ 消费者订阅 Bus → OnStart 按 stage 升序 → HTTP 监听 → 置 ready。
@@ -41,6 +43,13 @@ func (a *App) Run(ctx context.Context) error {
 	if err := a.register(enabled); err != nil {
 		return err
 	}
+	// 安全模式是监听 HTTP 的前置条件，零值不能退化成匿名服务。
+	// Migrate 不走 Run，因此迁移专用进程不受这条 HTTP 约束影响。
+	if err := validateSecurityMode(a.cfg.securityMode); err != nil {
+		return err
+	}
+	cancelBus := a.registerBusLifecycle(ctx)
+	defer cancelBus()
 	if err := a.reg.resolveAll(); err != nil {
 		return err
 	}
@@ -48,6 +57,11 @@ func (a *App) Run(ctx context.Context) error {
 		return err
 	}
 	if err := a.reg.runSetups(ctx); err != nil {
+		return err
+	}
+	// Setup 也允许挂路由，因此必须等全部 Setup 完成后再校验；校验仍发生在
+	// buildMux/listen 之前，任何未分类路由都不可能先监听再暴露。
+	if err := a.reg.validateRouteSecurity(a.cfg.securityMode, a.cfg.pprof); err != nil {
 		return err
 	}
 	// 全部 Setup 之后统一校验权限绑定 ⊆ 声明——模块内部 mux 在 Setup 期
@@ -99,6 +113,55 @@ func (a *App) Run(ctx context.Context) error {
 	return errors.Join(startErr, serveErr, shutdownErr)
 }
 
+// registerBusLifecycle 把可选的持久化 Broker 生命周期纳入 App 的标准启动、
+// readiness、异常传播与反序关停。普通进程内 Subscriber 保持原行为。
+func (a *App) registerBusLifecycle(ctx context.Context) context.CancelFunc {
+	bus, ok := a.cfg.bus.(ManagedSubscriber)
+	if !ok {
+		return func() {}
+	}
+	busCtx, cancelBus := context.WithCancel(context.WithoutCancel(ctx))
+	previous := a.reg.current
+	a.reg.current = "appkit-bus"
+	defer func() { a.reg.current = previous }()
+
+	a.reg.Health("ready", health.CheckFunc(bus.Ready))
+	connectAttempted := false
+	a.reg.OnStart(StageInfra, func(ctx context.Context) error {
+		connectAttempted = true
+		return bus.Connect(ctx)
+	})
+	// Close 在 Worker 启动钩子登记前绑定 Infra stage：Connect 即使只完成部分
+	// 初始化便失败，shutdown 也会执行 Close；正常关停时它排在 Worker stage 后。
+	a.reg.OnStop(func(ctx context.Context) error {
+		if !connectAttempted {
+			return nil
+		}
+		return bus.Close(ctx)
+	})
+
+	// Worker 仍由 Registry 托管错误传播和等待，但忽略普通 runCtx，改用独立
+	// busCtx；因此 App 取消普通 worker 后，Broker 仍可继续处理在途消息。
+	worker := a.reg.worker("consume", func(context.Context) error {
+		return bus.Run(busCtx)
+	})
+	// 同一 stage 的 stop 逆序执行：Drain → cancelBus → Worker 等待。
+	a.reg.OnStop(func(context.Context) error {
+		if !worker.started {
+			return nil
+		}
+		cancelBus()
+		return nil
+	})
+	a.reg.OnStop(func(ctx context.Context) error {
+		if !worker.started {
+			return nil
+		}
+		return bus.Drain(ctx)
+	})
+	return cancelBus
+}
+
 // Migrate 只做「声明 → 应用迁移」然后返回：不解析依赖图、不跑 Setup/OnStart、
 // 不监听端口。供部署的前置步骤使用（K8s initContainer 或 Job）——多副本滚动
 // 更新时先由一个 Job 把 schema 迁到位，服务副本再带 SkipMigrations 起来，
@@ -138,14 +201,14 @@ func (a *App) migrate(ctx context.Context) error {
 	if len(sets) == 0 {
 		return nil
 	}
-	if a.cfg.migrator == nil {
-		if !a.cfg.skipMigrations {
-			return fmt.Errorf("appkit: 有 %d 个迁移集待应用（如模块 %q 的 schema %q）但未注入迁移执行器："+
-				"注入 appkit.Migrator(pgmigrate.Runner(pool))，或以 appkit.SkipMigrations() 声明由进程外施加",
-				len(sets), sets[0].Module, sets[0].Schema)
-		}
+	if a.cfg.skipMigrations {
 		a.cfg.logger.Info("appkit: 跳过迁移（SkipMigrations）", "sets", len(sets))
 		return nil
+	}
+	if a.cfg.migrator == nil {
+		return fmt.Errorf("appkit: 有 %d 个迁移集待应用（如模块 %q 的 schema %q）但未注入迁移执行器："+
+			"注入 appkit.Migrator(pgmigrate.Runner(pool))，或以 appkit.SkipMigrations() 声明由进程外施加",
+			len(sets), sets[0].Module, sets[0].Schema)
 	}
 	if err := a.cfg.migrator(ctx, sets); err != nil {
 		return fmt.Errorf("appkit: 迁移失败: %w", err)
@@ -176,7 +239,11 @@ func (a *App) buildMux() (mux *http.ServeMux, err error) {
 	mux.Handle("/healthz", a.reg.health.LiveHandler())
 	mux.Handle("/readyz", a.reg.health.ReadyHandler())
 	if a.cfg.pprof {
-		mountPprof(mux)
+		guard := func(h http.Handler) http.Handler { return h }
+		if a.cfg.securityMode == SecurityInternalService || a.cfg.securityMode == SecurityMixed {
+			guard = requireService
+		}
+		mountPprof(mux, guard)
 	}
 	defer func() {
 		if p := recover(); p != nil {
@@ -191,14 +258,14 @@ func (a *App) buildMux() (mux *http.ServeMux, err error) {
 
 // mountPprof 挂标准 pprof 端点集。显式列举而非 import 副作用挂
 // DefaultServeMux：路由必须落在应用自己的 mux 上，与探针同级。
-func mountPprof(mux *http.ServeMux) {
-	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
-	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+func mountPprof(mux *http.ServeMux, guard func(http.Handler) http.Handler) {
+	mux.Handle("GET /debug/pprof/", guard(http.HandlerFunc(pprof.Index)))
+	mux.Handle("GET /debug/pprof/cmdline", guard(http.HandlerFunc(pprof.Cmdline)))
+	mux.Handle("GET /debug/pprof/profile", guard(http.HandlerFunc(pprof.Profile)))
+	mux.Handle("GET /debug/pprof/symbol", guard(http.HandlerFunc(pprof.Symbol)))
+	mux.Handle("GET /debug/pprof/trace", guard(http.HandlerFunc(pprof.Trace)))
 	for _, name := range []string{"goroutine", "heap", "allocs", "block", "mutex", "threadcreate"} {
-		mux.Handle("GET /debug/pprof/"+name, pprof.Handler(name))
+		mux.Handle("GET /debug/pprof/"+name, guard(pprof.Handler(name)))
 	}
 }
 
@@ -216,12 +283,23 @@ func (a *App) buildServer(h http.Handler) *http.Server {
 	for _, f := range a.cfg.httpServerOpts {
 		f(server)
 	}
+	if a.cfg.securityMode != SecurityDisabled {
+		// HTTPServer 是超时等传输参数的扩展点，不是替换根 handler 的逃生口。
+		// 严格模式强制恢复，防止绕过路由分类、guard 与身份边界；disabled
+		// 保留历史逃生口，避免 dev/test 兼容模式出现无关行为变化。
+		server.Handler = h
+	}
 	return server
 }
 
 func (a *App) wrap(h http.Handler) http.Handler {
 	for i := len(a.cfg.middleware) - 1; i >= 0; i-- {
 		h = a.cfg.middleware[i](h)
+	}
+	if a.cfg.securityMode != SecurityDisabled {
+		// 放在所有可注入中间件之外：调用方无法通过中间件顺序让 unsigned
+		// identity header 或预置 ctx 绕过信任边界；验签发生在边界内并重建。
+		h = identityBoundary(h)
 	}
 	return h
 }

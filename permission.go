@@ -80,6 +80,12 @@ func ActorFrom(ctx context.Context) (Actor, bool) {
 	return a, ok
 }
 
+// clearActor 在信任边界遮蔽更外层预置的 Actor，同时保留 ActorFrom 的历史
+// 语义（WithActor(ctx, Actor{}) 仍报告存在），避免为清边界引入无关行为变化。
+func clearActor(ctx context.Context) context.Context {
+	return context.WithValue(ctx, actorKey{}, struct{}{})
+}
+
 // Check 报告当前请求主体是否持有 code——service 层的代码内判定
 // （HTTP 边界用 Registry.Require）。未认证一律 false。
 func Check(ctx context.Context, code string) bool {

@@ -24,8 +24,8 @@ func main() {
 				// gateway.Module(gateway.Options{Log: d.Log, Pool: d.Pool, Bus: d.Bus}),
 			}, nil
 		},
-		// 未配置 database.url 时只起探针：刚 new 出来还没 require 任何域仓库，
-		// make run 也能证明服务能起。装上域模块后配 database.url 走完整模式。
+		// 显式 -minimal 时只起探针：刚 new 出来还没 require 任何域仓库，
+		// make run-minimal 可验证入口。装上域模块后配 database.url 走完整模式。
 		Minimal: func(bootstrap.Deps) ([]appkit.Module, error) { return nil, nil },
 		// target 之外的契约自动落到 Remote 绑定（合约仓库生成的 HTTP client，
 		// 实现同一接口）——消费方代码在单体与微服务下完全一致。

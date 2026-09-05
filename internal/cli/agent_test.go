@@ -12,6 +12,8 @@ import (
 	"github.com/forgeplex/appkit/internal/workspace"
 )
 
+const agentWorkflowRef = "0123456789abcdef0123456789abcdef01234567"
+
 func agentDomain(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -24,7 +26,7 @@ func agentDomain(t *testing.T) string {
 func TestAgentCLIPlanApplyReplay(t *testing.T) {
 	root := agentDomain(t)
 	var out, diagnostics bytes.Buffer
-	if err := runAgent("plan", []string{"sync", "-dir", root}, &out, &diagnostics); err != nil {
+	if err := runAgent("plan", []string{"sync", "-dir", root, "-workflow-ref", agentWorkflowRef}, &out, &diagnostics); err != nil {
 		t.Fatalf("plan: %v %s", err, out.String())
 	}
 	plan, err := workspace.ParsePlan(out.Bytes())
@@ -66,7 +68,7 @@ func TestAgentJSONFailures(t *testing.T) {
 		{"plan", []string{"sync", "extra"}, "invalid_arguments", 2},
 		{"apply", nil, "invalid_arguments", 2},
 		{"apply", []string{"-timeout", "0"}, "invalid_arguments", 2},
-		{"plan", []string{"sync", "-dir", t.TempDir()}, "operation_failed", 1},
+		{"plan", []string{"sync", "-dir", t.TempDir(), "-workflow-ref", agentWorkflowRef}, "operation_failed", 1},
 	} {
 		t.Run(strings.Join(append([]string{tc.command}, tc.args...), " "), func(t *testing.T) {
 			var out, diagnostics bytes.Buffer
@@ -112,7 +114,7 @@ func TestAgentConflictAndTampering(t *testing.T) {
 		t.Run(tc.mode, func(t *testing.T) {
 			root := agentDomain(t)
 			var out, diagnostics bytes.Buffer
-			if err := runAgent("plan", []string{"sync", "-dir", root}, &out, &diagnostics); err != nil {
+			if err := runAgent("plan", []string{"sync", "-dir", root, "-workflow-ref", agentWorkflowRef}, &out, &diagnostics); err != nil {
 				t.Fatal(err)
 			}
 			encoded := bytes.Clone(out.Bytes())

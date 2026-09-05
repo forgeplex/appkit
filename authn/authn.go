@@ -64,7 +64,8 @@ type Issuer struct {
 	// Partition 是该签发方所属的分区键（rbac 分区 "a" 的签发方 iss=rbac-a
 	// 对应 "a"）。非空时验签后焊进 callctx.Meta.Partition——认证请求的分区
 	// 以令牌为准，入站 X-Partition 头带来的值被覆盖；空则不动 callctx 里的
-	// 分区（单分区部署或不用分区的系统）。
+	// 分区（单分区部署或不用分区的系统）。严格 HTTP 边界已清除 unsigned
+	// 分区；如果另有可信服务验证器先重建了分区，空配置也不会覆盖它。
 	Partition string
 }
 
@@ -84,13 +85,15 @@ type stepUpClaims struct {
 // Middleware 验签并注入 appkit.Actor。语义：
 //   - 无 Authorization 头的请求原样放行（不注入 Actor）——判公开与否是
 //     Require 的职责，公开端点（探针等）不因本中间件存在而关死；
-//   - 有头但验签失败（坏签名、错算法、错 iss、过期、缺 exp、sub 为空）
-//     → 401：凭证无效必须响亮，不能静默降级为匿名；
+//   - 除内建 /healthz、/readyz 探针外，有头但验签失败（坏签名、错算法、
+//     错 iss、过期、缺 exp、sub 为空）→ 401：凭证无效必须响亮，不能
+//     静默降级为匿名；探针始终隐式 Public；
 //   - X-Step-Up 同样原则：有头才验，验不过 401（含 sub 与访问令牌不一致、
 //     purpose 不是 step-up）；验过则 Actor.StepUpAt = 证明的 iat。
 //
-// 租户身份在此焊进 callctx：认证请求以令牌 tid 为准（覆盖或清零入站
-// X-Tenant-Id 头带来的值——该头只在内部东西向可信，外部入口可伪造）。
+// 租户身份在此焊进 callctx：认证请求以令牌 tid 为准。严格安全模式会在
+// 更外层先清掉所有 unsigned 身份头与预置 principal，本中间件只从已验签
+// token 重建用户与租户身份。
 // 域代码与存储层（RLS）统一从 callctx.From(ctx).TenantID 取租户。
 //
 // 单签发方形态；多签发方（多分区同进程）见 MultiIssuer。
@@ -100,8 +103,8 @@ func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Ha
 
 // MultiIssuer 是 Middleware 的多签发方形态：按令牌 iss 选验签公钥，iss 不在
 // 表里即 401；step-up 证明必须与访问令牌出自同一签发方。签发方带 Partition
-// 时验签后把分区键焊进 callctx.Meta.Partition（与租户同一信任模型：令牌
-// 说了算，头值只在未认证的内部东西向存活）。
+// 时验签后把分区键焊进 callctx.Meta.Partition。严格 HTTP 边界先剥离所有
+// unsigned 分区/租户头；本中间件只从已验签令牌及组合根配置重建身份。
 //
 // 表为空、iss 为空、公钥缺失都是装配错误，直接 panic。
 func MultiIssuer(issuers map[string]Issuer) func(http.Handler) http.Handler {
@@ -135,6 +138,12 @@ func MultiIssuer(issuers map[string]Issuer) func(http.Handler) http.Handler {
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 框架探针是隐式 Public：kubelet 不应因误带/陈旧凭证而把存活
+			// 检查变成 401。身份边界仍在更外层清除 unsigned 身份头。
+			if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+				next.ServeHTTP(w, r)
+				return
+			}
 			raw, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if !ok {
 				next.ServeHTTP(w, r)
@@ -163,10 +172,9 @@ func MultiIssuer(issuers map[string]Issuer) func(http.Handler) http.Handler {
 				}
 				actor.StepUpAt = at
 			}
-			// 租户身份焊进 callctx：令牌说了算。tid 有值则覆盖入站头带来的
-			// 租户，无值则清零——「无租户令牌 + 伪造的 X-Tenant-Id」不能
-			// 成立。未认证路径不进这里，头值存活（内部东西向的合法形态）。
-			// 分区键同理，但只在签发方配了分区时才动它。
+			// 租户身份焊进 callctx：令牌说了算。tid 有值则写入，空值则保持
+			// 清空——「无租户令牌 + 伪造的 X-Tenant-Id」不能成立。
+			// 严格边界也先清除 unsigned 分区；已配置签发方可重新建立分区。
 			meta := callctx.From(r.Context())
 			meta.TenantID = actor.TenantID
 			if issuer.Partition != "" {

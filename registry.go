@@ -64,9 +64,11 @@ type binding struct {
 }
 
 type mountReg struct {
-	pattern string
-	handler http.Handler
-	module  string
+	pattern    string
+	handler    http.Handler
+	module     string
+	security   routeSecurity
+	permission string
 }
 
 type namedHook struct {
@@ -114,10 +116,23 @@ func newRegistry() *Registry {
 	}
 }
 
-// Mount 把一个 http.Handler 挂到根路由。pattern 使用标准库 ServeMux 语法
-// （Go 1.22+，可含方法与通配符）。同一 pattern 重复挂载在启动期报错。
+// Mount 把一个未分类 http.Handler 挂到根路由，仅为 SecurityDisabled 的
+// 向后兼容保留；严格模式会在监听前拒绝它。新代码应按暴露面改用
+// MountPublic、MountAuthenticated、MountPermission 或 MountInternalService。
+// pattern 使用标准库 ServeMux 语法（Go 1.22+，可含方法与通配符）。
+// 同一 pattern 重复挂载在启动期报错。
 func (r *Registry) Mount(pattern string, h http.Handler) {
-	r.mounts = append(r.mounts, mountReg{pattern: pattern, handler: h, module: r.current})
+	r.mount(pattern, h, routeUnclassified, "")
+}
+
+func (r *Registry) mount(pattern string, h http.Handler, security routeSecurity, permission string) {
+	if h == nil {
+		panic(fmt.Sprintf("路由 %q 的 handler 不能为 nil", pattern))
+	}
+	r.mounts = append(r.mounts, mountReg{
+		pattern: pattern, handler: h, module: r.current,
+		security: security, permission: permission,
+	})
 }
 
 // Setup 注册一个装配回调：在全部模块 Register 完、依赖图解析通过之后、

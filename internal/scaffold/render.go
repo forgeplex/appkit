@@ -11,9 +11,14 @@ import (
 
 // RenderDomain renders the entire scaffold without touching o.Dir. Migration
 // DDL still comes from the framework library functions, never duplicated SQL.
+// WorkflowRef must already be an explicit commit SHA: resolving provenance is
+// the caller's responsibility and must not turn this renderer into external I/O.
 func RenderDomain(o Options) (map[string][]byte, error) {
 	if err := o.normalize(); err != nil {
 		return nil, fmt.Errorf("new domain: %w", err)
+	}
+	if o.WorkflowRef == "" {
+		return nil, fmt.Errorf("new domain: pure rendering requires an explicit WorkflowRef commit SHA")
 	}
 	files, err := renderFiles("domain", domainSpecs(o), newData(o, strings.ToUpper(o.Name)+"D"))
 	if err != nil {
@@ -27,7 +32,8 @@ func RenderDomain(o Options) (map[string][]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("new domain %s: 物化规则集: %w", o.Name, err)
 	}
-	rules, err := ruleset.Render(ruleset.Config{Domain: cfg.Domain, Module: cfg.Module, Contracts: cfg.Contracts, Version: o.AppkitVersion})
+	rules, err := ruleset.Render(ruleset.Config{Domain: cfg.Domain, Module: cfg.Module, Contracts: cfg.Contracts,
+		Version: o.AppkitVersion, WorkflowRef: o.WorkflowRef})
 	if err != nil {
 		return nil, fmt.Errorf("new domain %s: 物化规则集: %w", o.Name, err)
 	}

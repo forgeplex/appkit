@@ -7,7 +7,8 @@ AppKit 是现有项目和后续可复用模块的主运行时。保留独立 Go 
 从 mkit 吸收命名实例、确定性文件计划及恢复机制，不引入 mkit 运行时依赖。
 mkit 保留为设计与机制参考，不再作为需要同步建设的第二套业务底座。
 
-本轮只改框架，不迁移或实现 RBAC、订单、ledger、email、notification 等业务。
+框架基线不迁移或实现 RBAC、订单、ledger、email、notification 等业务。
+经额外确认修复的 email/RBAC 测试夹具见验收记录；未改变业务逻辑或部署配置。
 既有 tenant / partition 机制保持独立，业务 merchant_id 不加入通用实例标识。
 
 ## 同一契约的多个实例
@@ -71,6 +72,15 @@ appkit sync -dir . -check
 此外支持 `plan events` / `plan errors` / `plan wrap` / `plan new`。
 `plan schema` 是需要单独授权的例外：不写仓库文件，但会执行临时数据库操作，见下文。
 
+`plan sync` / `plan new domain` 需要不可变 workflow 来源。省略 `-workflow-ref`
+时，在持有工作区锁之前解析当前 AppKit 版本：已发布版本可运行 Go 下载并更新
+模块缓存，源码联调只接受 AppKit 自身的构建来源或已校验的 AppKit Git 仓库，
+不会拿下游项目的 HEAD 冒充框架来源。因此“只读计划”指目标工作区不变，不是
+绝对无网络或缓存写入。离线使用时显式传入已核验的完整 40 位 AppKit commit SHA；
+`plan sync`、`plan new domain` 与普通 `sync` / `new domain` 均支持 `-workflow-ref`。
+仅检查 SHA 格式不证明其已发布或可被 GitHub 获取，来源核验仍是调用方责任。
+渲染只消费固定 SHA；计划捕获最终字节，apply 不解析版本或访问网络。
+
 ### 事件、错误码、wrapper 与新项目
 
 下面命令在 AppKit 仓库内运行。单文件生成使用 `-target` 指定输出 .go 文件；
@@ -105,6 +115,9 @@ go run ./cmd/appkit apply -dir "$task_workspace" -plan "$task_plan_dir/system.js
 apply 前后新增的无关文件不属于计划目标，框架不会删除它们，也不承诺冻结整个目录。
 新项目的参数和内置模板体现为完整计划内容，不会在 apply 时重新渲染。
 普通 `new` 与 plan 使用同一个 renderer，基础迁移仍只调用框架库函数取得 DDL。
+
+生成的应用显式声明安全模式，根路由必须分类；旧项目接入候选版本前须阅读
+[RELEASE_CANDIDATE.md](RELEASE_CANDIDATE.md) 的启动、身份与 RLS 升级要求。
 
 `apply` 验证计划格式和指纹，再在工作区锁内复核前置条件。输入或输出被修改会返回
 `workspace_conflict`，不得通过手改计划里的摘要解决，应重新计划并审查。

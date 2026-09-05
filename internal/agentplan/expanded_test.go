@@ -213,7 +213,7 @@ func TestExpandedNewPlanMatrixParityReplay(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, root := context.Background(), t.TempDir()
-			opts := scaffold.Options{Name: "sample", Module: "example.com/sample", AppkitVersion: "v0.7.3", Tenant: tc.tenant, Partitioned: tc.partitioned, Dir: filepath.Join(t.TempDir(), "ignored")}
+			opts := scaffold.Options{Name: "sample", Module: "example.com/sample", AppkitVersion: "v0.7.3", WorkflowRef: testWorkflowRef, Tenant: tc.tenant, Partitioned: tc.partitioned, Dir: filepath.Join(t.TempDir(), "ignored")}
 			put(t, root, "handwritten.txt", "unchanged")
 			before := expandedTree(t, root)
 			plan, err := New(ctx, root, "repos/sample", tc.kind, opts)
@@ -268,7 +268,7 @@ func TestExpandedNewPlanRejectsExistingAndConcurrentFiles(t *testing.T) {
 		root := t.TempDir()
 		put(t, root, "new/"+existing, "keep")
 		before := expandedTree(t, root)
-		if _, err := New(ctx, root, "new", "domain", scaffold.Options{Name: "sample"}); !errors.Is(err, workspace.ErrInvalidChange) {
+		if _, err := New(ctx, root, "new", "domain", scaffold.Options{Name: "sample", WorkflowRef: testWorkflowRef}); !errors.Is(err, workspace.ErrInvalidChange) {
 			t.Fatalf("nonempty target accepted: %v", err)
 		}
 		if !reflect.DeepEqual(before, expandedTree(t, root)) {
@@ -276,7 +276,7 @@ func TestExpandedNewPlanRejectsExistingAndConcurrentFiles(t *testing.T) {
 		}
 	}
 	root := t.TempDir()
-	plan, err := New(ctx, root, "new", "domain", scaffold.Options{Name: "sample"})
+	plan, err := New(ctx, root, "new", "domain", scaffold.Options{Name: "sample", WorkflowRef: testWorkflowRef})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -317,9 +317,9 @@ func TestExpandedNewPlanValidation(t *testing.T) {
 		target, kind string
 		opts         scaffold.Options
 	}{
-		{"../escape", "domain", scaffold.Options{Name: "sample"}},
+		{"../escape", "domain", scaffold.Options{Name: "sample", WorkflowRef: testWorkflowRef}},
 		{"new", "unknown", scaffold.Options{Name: "sample"}},
-		{"new", "domain", scaffold.Options{Name: "Bad-Name"}},
+		{"new", "domain", scaffold.Options{Name: "Bad-Name", WorkflowRef: testWorkflowRef}},
 		{"new", "system", scaffold.Options{Name: "sample", Tenant: true}},
 		{"new", "system", scaffold.Options{Name: "sample", Partitioned: true}},
 	} {
@@ -330,7 +330,7 @@ func TestExpandedNewPlanValidation(t *testing.T) {
 	if err := os.Symlink(t.TempDir(), filepath.Join(root, "linked")); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
-	if _, err := New(context.Background(), root, "linked/new", "domain", scaffold.Options{Name: "sample"}); !errors.Is(err, workspace.ErrSymlink) {
+	if _, err := New(context.Background(), root, "linked/new", "domain", scaffold.Options{Name: "sample", WorkflowRef: testWorkflowRef}); !errors.Is(err, workspace.ErrSymlink) {
 		t.Fatalf("symlink ancestor accepted: %v", err)
 	}
 }

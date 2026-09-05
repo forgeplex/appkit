@@ -18,12 +18,15 @@
 | Schema 计划与文档 | 显式授权的 scratch-DB 规划、捕获迁移 fs.FS、输入/输出目录 guard、过时生成文件删除与手写文件拒绝、无 DB apply/replay；分区逻辑模板与 tenant RLS 真库验证 |
 | 现有业务项目兼容性 | `scripts/test-downstream-local.sh` 复制四个现有项目当前 Go/SQL 源码后替换框架依赖，编译并在独立 DB 执行 race 测试；既有失败单列，不计作通过 |
 | 脚手架 | 普通、tenant、partitioned、两者组合、system 五种产物实际编译；内存渲染与直接生成逐文件相同 |
-| 框架兼容性 | 根 module 的 apidiff 对最新发布 tag 不得有 incompatible；旧 API 保持原行为 |
+| 框架兼容性 | 根 module 的 apidiff 对最新发布 tag 不得有 incompatible；运行默认行为变化单列升级要求，不能由签名兼容推断启动兼容 |
 | 工程门禁 | fmt、vet、build、全量测试、独立 lint module、真实规则检查器 E2E，不能把 skip 当通过 |
 
 验收夹具没有 RBAC、订单、账本等业务实现。版本测试使用临时 Go module 的本地
 `replace`，验证解析关系与源码升级；没有伪装成 tag 分发、远程 registry 或供应链测试。
 Go 子进程关闭 module 网络下载，依赖来自已准备的本地缓存；HTTP 测试只用 loopback。
+四 module 的 HTTP 夹具验证 contract 传输边界，不提供生产级服务身份验证；App
+组合测试显式声明 UserFacing 模式但不挂业务路由。实际严格 HTTP 身份链另由
+authn 的真实 App/loopback 集成测试覆盖，不把未验签的元数据透传当可信身份。
 现有项目兼容性检查是独立于上述四 module 夹具的第二层证据，结果见下文。
 
 ## 本地执行
@@ -76,7 +79,7 @@ APPKIT_POSTGRES_BIN=/path/to/postgresql/bin \
 依赖；每个项目独立临时 DB。测试代码本身不是沙箱，项目新增外部调用测试后应先
 审查再执行。失败返回非零并保留副本与日志，不能通过忽略失败冒充兼容。
 
-## 2026-09-05 实测记录
+## 2026-09-05 首轮实测记录（远端安全合并前）
 
 - PostgreSQL 18.6 的隔离实例上实际运行全仓 `make test-db`（含 race），通过。
 - schema 的 planner/CLI/introspection 单独执行 race 真库回归通过；覆盖 schema 及
@@ -109,13 +112,57 @@ APPKIT_POSTGRES_BIN=/path/to/postgresql/bin \
 email 不是 Git 仓库；notification 检查时 HEAD 为 `cd1a2fa` 且干净；rbac、ledger
 含原有未提交修改，验收副本也包含它们。330 个 Go/SQL 源文件验收前后逐字节一致。
 这证明现有模块在该源码状态下的框架接入与测试表现，不表示已修改业务 go.mod、
-上线或完成真实数据升级。两个既有测试问题保留为下游待办，未改业务代码或删测试。
+上线或完成真实数据升级。该首轮把两个既有测试问题保留为下游待办，未改业务代码
+或删测试；后续修复见下节。
 表中的数量是 Go JSON 的 test/subtest 事件，包含父子测试，不是独立顶层测试数。
 可定位到 `email/internal/module/provider/provider_test.go` 的
 `TestSMTPSendTimeoutOnSilentServer`（146 行发送、150 行 close）；RBAC 的
 `internal/rbac/webauthn_test.go` 的 `TestWebAuthnLogin/混合因子双挑战`（363 行失败），
 根因在 `internal/rbac/mfa_test.go` 的 `loginChallenge`（51–53 行选取未按因子过滤）。
 RBAC 的 `internal/postgres` 包 18 项全部通过。
+
+## 2026-09-05 后续修复与发布候选验收
+
+经确认只修复两处业务测试问题，没有改业务用例、依赖版本、数据库或部署配置：
+
+- email 的 SMTP 夹具由发送方关闭连接 channel，先关闭 listener 再排空连接；
+  断言确实收到 timeout。定向 race 30 次通过，全 provider 包 race 3 次通过。
+- RBAC 的 TOTP/WebAuthn helper 使用本次 Login 响应的 challenge ID，验证租户、
+  用户、用途与待决状态；混合因子回归覆盖旧挑战、交叉因子拒绝及各自成功。
+  五组相关测试 race 20 次通过；仅两份测试文件提交为 `0843919`。
+  原有 seed.go 修改保持原样。email 无 Git 仓库，修复仅本地落盘。
+
+原框架组与合并远端安全修复后的候选组**分别**完整执行了一次四仓验收。
+候选组每份副本的 go.mod 明确指向候选 worktree，而不是旧工作区或发布版本：
+
+| 项目 | 候选组 pass | skip | fail |
+|---|---:|---:|---:|
+| email | 116 | 0 | 0 |
+| notification | 70 | 0 | 0 |
+| rbac | 342 | 0 | 0 |
+| ledger | 492 | 2（仅性能播种） | 0 |
+
+四仓 build 及 PostgreSQL 集成包全部通过。330 个 Go/SQL 文件的测试副本与
+修复后的源文件逐字节一致。数量仍为 test/subtest 事件，不能把性能播种 skip
+计作功能通过。候选组日志目录为 `/tmp/appkit-downstream.gszr59bH`；原框架组
+为 `/tmp/appkit-downstream.gMIPDXBG`，两组证据不可混用。
+
+候选还通过：`make check`、隔离 PostgreSQL 18.6 上的全仓 `make test-db`
+（含 race）、`make test-lint`、真实 `make test-rules`（0 skip）、五种脚手架
+真实编译与架构检查、go.mod tidy 无漂移、相对 v0.7.2 的公开 API 零 incompatible。
+新增真实 App.Run/loopback 验证严格边界与 MultiIssuer；规则来源测试验证离线
+显式 SHA、上下文取消、锁外解析和拒绝把下游 HEAD 当作框架来源。
+
+业务工程门禁必须单列，不能把测试通过写成“所有门禁已过”：email/RBAC 使用
+各自原版本（v0.5.3/v0.7.2）的 lint 均通过；`GOWORK=off GOFLAGS=-mod=readonly`
+下的 `make check` 均因**既有 go.sum 缺少 CLI 的 x/mod 条目**失败。
+用同版本的独立检查器诊断，RBAC 通过，email 的三份物化规则存在既有漂移。
+此次没有借测试修复更新这些依赖元数据或规则。它们仍是业务仓库完整工程验收的
+待办，不影响已记录的候选 build/race 结果，也不能从那些结果推断待办已消失。
+
+候选合并的远端安全规则会改变默认启动行为；路由、安全配置、分区键与 RLS
+迁移要求见 [RELEASE_CANDIDATE.md](RELEASE_CANDIDATE.md)。本次没有替业务项目
+完成这些应用升级，更未上线或做生产数据迁移。
 
 ## 有意保持的边界
 
@@ -130,4 +177,5 @@ RBAC 的 `internal/postgres` 包 18 项全部通过。
 
 消费方绑定 manifest、完整 catalog/resolver、签名制品、沙箱及状态迁移平台不属于
 当前基线的前置条件。业务数据升级演练、生产发布仍需各项目自己的验收。
-框架变更仍在本地工作区，未默认提交、推送、打 tag 或发布版本。
+框架整合保存在本地候选分支 `codex/appkit-reuse-release`，原工作区不被覆盖。
+未推送、打 tag 或发布版本；正式发布仍需版本/范围确认、受保护 PR 与远端 CI。

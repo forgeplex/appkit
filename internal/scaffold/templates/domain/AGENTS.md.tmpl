@@ -7,9 +7,10 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 
 ## 分区域域（partitioned）——先读这段再动手
 
-本域一套代码、N 份数据分区：schema 由调用方确定（分区键由 authn.MultiIssuer
-按令牌签发方焊入 callctx、内部东西向经 X-Partition 头传播，组合根注入
-「分区键 → schema」映射，见 `internal/module/module.go`）。
+本域一套代码、N 份数据分区：schema 由调用方确定（authn.MultiIssuer 按令牌
+签发方确定分区，已验证 principal 把分区键重建进 `callctx.Meta.Partition`；
+unsigned `X-Partition` 只负责传输、不授信。组合根注入「分区键 → schema」
+映射，见 `internal/module/module.go`）。租户行级身份是独立的 `TenantID`。
 因此本仓库的 SQL 纪律与单 schema 域**恰好相反**：
 
 1. `db/migrations/` 与 `db/queries/` 一律**不带 schema 前缀**——落位由
@@ -38,7 +39,8 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
    响亮拒绝（`app.tenant_id 未设置`），这是特性不是故障；
 3. **租户身份只从 `callctx.From(ctx).TenantID` 取**——authn 已从令牌 tid
    焊入，业务代码读请求头即伪造面；
-4. **跨租户读只有一个入口**：管理面用例先过跨租户权限码（`reg.Require`），
+4. **跨租户读只有一个入口**：管理面用例先过跨租户权限码（根路由用
+   `reg.MountPermission`，内部子 mux 用 `reg.Require`），
    再 `ctx = tx.WithReadAllTenants(ctx)` 后 `Do`——只放开 SELECT{{if .Partitioned}}、只在本分区内{{end}}，
    写入仍只落当前租户；代某租户写要显式 `callctx.With` 切到目标租户。
    标记必须在最外层 Do 之前打，嵌套内切换会被拒。
@@ -118,8 +120,13 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 5. **handler** `internal/http/<功能>.go`：解码 → 调 Service → 编码；错误一律
    `httpserver.WriteError(log, w, err)`（自动 RFC 9457）。一个资源的全部端点与
    请求体类型放同一个文件，`handler.go` 只留公共件（decode/write）。
-6. **挂路由** `internal/module/module.go`：Setup 里构造 handler，
-   Register 里 `reg.Mount("POST /users", ...)`（照 ping 的现有样式）。
+6. **挂路由** `internal/module/module.go`：Setup 里构造 handler，Register 里
+   显式声明根路由的安全分类：公开端点用 `reg.MountPublic`，只要求登录用
+   `reg.MountAuthenticated`，绑定权限码用
+   `reg.MountPermission("POST /users", "{{.Name}}:write", handler)`，服务间端点
+   用 `reg.MountInternalService`。禁止新写裸 `reg.Mount`——严格安全模式会在
+   监听前拒绝未分类路由；模块内部子 mux 无法用 Mount 系列时才用
+   `reg.Require(code, handler)` 包裹。
 
 ## 文件怎么分（按功能，不按层）
 
@@ -155,6 +162,12 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 
 ## 惯用法（别自己发明）
 
+- **HTTP 安全模式**：每个监听进程必须显式配置 `security.mode`；生成的 dev
+  配置用 `disabled` 只为本地开发，staging/prod 禁用它。模块只负责给每条根
+  路由选安全分类，组合根负责按部署暴露面选择模式和装配验签器；不要把“内网”
+  当作身份校验。当前 bootstrap 阶段只有 `user_facing` 可在配好
+  `AuthnPublicKey`/`AuthnIssuer` 后启动；服务 JWT 验证器落地前，
+  `internal_service/mixed` 会有意 fail closed；
 - **金额**：存储与运算用 `decimal.Decimal`（sqlc 已把 NUMERIC 全局 override
   成它，无需注册任何 codec）；需要把"币种+金额"绑在一起时才用 `money.Money`
   （领域层值对象，不落库——币种另列存）。JSON/合约边界金额一律字符串，
@@ -193,7 +206,8 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 ```sh
 make gen        # sqlc 生成（改了 db/queries 后必跑）
 make schema     # 重新生成 db/SCHEMA.md 与 db/schema/（{{if .Partitioned}}logical-template；{{end}}改了迁移后必跑，需 docker）
-make run        # 本地起服（config/dev.yaml；database.url 留空 = 无 DB 最小模式）
+make run        # 正常起服；database.url 缺失时 fail closed
+make run-minimal # 显式无 DB 最小模式（仅 dev）
 make dev-db     # 一次性本地 Postgres（与 dev.yaml 匹配）
 make migrate    # 只应用迁移然后退出（生产上跑在 initContainer/Job 里）
 make check      # 架构检查：依赖/import 边界/跨 schema SQL/迁移序号/规则集漂移
@@ -214,8 +228,9 @@ appkit doctor   # 环境体检（GOPRIVATE/git 凭据/工作区）
 用例分别跑过 `WrapXxx(impl, 0)` 与指向 `httptest.Server` 的生成 client，比对错误码、
 返回值与边界语义。这是"拆成微服务行为不变"唯一的证明方式，不写就只有口头承诺。
 每个 `Binding` 顺手填上 `SeenMeta`（两个绑定共用一个记录 `callctx.From(ctx)` 的
-spy），把跨边界元数据也纳进来——那条走请求头，返回值里看不见，漏了的症状是
-进程内拿得到租户、远程拿不到，只在真拆分那天暴露。这项检查跑在声明了
+spy），把跨边界元数据也纳进来——远程路径跨网络后必须经已验证 principal
+重建，unsigned header 只负责传输、不授信。漏了的症状是进程内拿得到租户、
+远程拿不到，只在真拆分那天暴露。这项检查跑在声明了
 `Idempotent` 的成功用例上（它要额外发一次真实调用），至少留一条。
 文件放 `internal/http/`——`internal/{{.Name}}/` 连测试文件也禁 `net/http`（depguard 会拦）。
 

@@ -67,6 +67,7 @@ func TestReusedModule(t *testing.T) {
 			target := "all"
 			if mode == "http" { target = "consumer" }
 			app := appkit.New([]appkit.Module{primary, backup, consumer},
+				appkit.Security(appkit.SecurityUserFacing),
 				appkit.Target(target), appkit.HTTPAddr("127.0.0.1:0"),
 				appkit.Logger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 				appkit.RemoteNamed[sample.Service]("primary", func(*appkit.Registry) (sample.Service, error) {

@@ -36,6 +36,10 @@ type Options struct {
 	// "(devel)" 表示源码构建：go.mod 不 require appkit（对不存在版本的
 	// require 会让 go 命令去代理拉取而失败），改由 appkit dev 的 go.work 提供。
 	AppkitVersion string
+	// WorkflowRef 可显式传 appkit 源码的完整 commit；Domain 入口为空时由
+	// ruleset 从 AppkitVersion 的来源解析。纯 RenderDomain 必须显式传入，
+	// 不会执行外部 git/go 命令；RenderSystem 不消费 workflow ref。
+	WorkflowRef string
 	// Partitioned 生成「分区域域」形态（仅 domain）：一套代码、N 份数据分区，
 	// 迁移与查询全部无 schema 前缀，落位由组合根注入的分区映射（分区键 → schema）
 	// 经事务级 search_path 路由确定。分区映射的定义放组合根自己的配置文件。

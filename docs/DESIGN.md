@@ -88,6 +88,8 @@ appkit/                          # module github.com/forgeplex/appkit
 ├── run.go                       # App.Run：模块拓扑排序装配、-target 过滤、
 │                                #   signal.NotifyContext、正序启动/逆序优雅关停；
 │                                #   App.Migrate：只应用迁移即返回（initContainer 用）
+├── security.go                  # HTTP SecurityMode、四类 Mount 路由守卫、
+│                                #   identity boundary 与 ServicePrincipal 落点（见 §5.4）
 ├── worker.go                    # Registry.Worker：长驻后台任务的托管注册
 │                                #   （关停等待 + 异常退出上报，见 §8）
 ├── permission.go                # 权限抽象（★ 根包，零第三方类型）：
@@ -294,9 +296,14 @@ type Module interface {
 // Registry —— 模块向系统贡献能力（fx value groups 思想，手写实现，无反射魔法）
 func Provide[T any](reg *Registry, ctor func(*Registry) (T, error)) // 注册契约实现（惰性构造）
 func Resolve[T any](reg *Registry) (T, error)                       // 取依赖；启动期缺失 fail-fast、循环依赖报错
-func (r *Registry) Mount(prefix string, h http.Handler)             // 路由（http.Handler，非 gin 类型）
+func Security(mode SecurityMode) Option                              // HTTP 身份边界模式，Run 必须显式选择
+func (r *Registry) MountPublic(pattern string, h http.Handler)       // 明示公开路由
+func (r *Registry) MountAuthenticated(pattern string, h http.Handler)// 需用户主体
+func (r *Registry) MountPermission(pattern, code string, h http.Handler) // 需用户权限码
+func (r *Registry) MountInternalService(pattern string, h http.Handler) // 需已验服务主体
+func (r *Registry) Mount(pattern string, h http.Handler)             // 向后兼容；只在 disabled 模式允许未分类
 func (r *Registry) Permissions(decls ...PermissionDecl)             // 声明本模块权限码（仅 Register 阶段，§5.4）
-func (r *Registry) Require(code string, h http.Handler) http.Handler // 端点绑码（判定矩阵统一在框架，§5.4）
+func (r *Registry) Require(code string, h http.Handler) http.Handler // 内部 mux 低层绑码；根路由优先 MountPermission
 func (r *Registry) Migrations(schema string, fsys fs.FS)
 func (r *Registry) Consumer(topic string, h outbox.Handler)
 func (r *Registry) Health(name string, c health.Checker)
@@ -306,12 +313,14 @@ func (r *Registry) OnStart(stage int, fn func(context.Context) error) // OnStop 
 ### 5.2 组装（psp/cmd/psp/main.go）
 
 ```go
-app := appkit.New(cfg,
+modules := []appkit.Module{
+    auth.Module(), merchant.Module(),
+    ledger.Module(), gateway.Module(),
+}
+app := appkit.New(modules,
+    appkit.Security(appkit.SecurityUserFacing),       // 必须显式；零值拒绝 Run
+    appkit.Middleware(authn.Middleware(pub, issuer)), // user_facing 的主体重建器
     appkit.Target(cfg.Target),                       // "all" | "gateway" | "ledger,relay" …
-    appkit.Modules(
-        auth.Module(), merchant.Module(),
-        ledger.Module(), gateway.Module(),
-    ),
     // target 之外的契约自动落到 Remote 绑定（contracts 生成的 HTTP client，实现同一接口）：
     appkit.Remote[ledgerv1.Service](ledgerv1.NewClient),
     appkit.Remote[authv1.Service](authv1.NewClient),
@@ -355,7 +364,49 @@ contract.yaml 生成同一接口的进程内 wrapper 与 HTTP client，方法体
 跨模块一致性只有两条路：**同步契约调用**（视为可失败、须幂等）或 **outbox 事件**。
 禁止：跨模块共享事务、跨 schema JOIN、传指针。
 
-### 5.4 鉴权与权限：声明 / 绑定 / 判定 / step-up
+### 5.4 HTTP 信任边界、鉴权与权限
+
+HTTP 面先回答「这个进程信任哪种主体」，才能谈权限。`App.Run`
+要求通过 `appkit.Security` 显式选择模式；`SecurityUnspecified` 是拒绝
+启动的零值，不是匿名默认。`App.Migrate` 不监听 HTTP，故不受此限制。
+
+| 模式 | 信任面 | 允许的根路由分类 |
+|---|---|---|
+| `disabled` | bootstrap 的 `env=dev`，或直接构造 App 的测试 | 不校验分类，旧 `Mount` 仍可用 |
+| `user_facing` | 用户令牌 | Public / Authenticated / Permission |
+| `internal_service` | 服务凭证 | Public / InternalService |
+| `mixed` | 用户令牌 + 服务凭证 | 四类全部 |
+
+四类根路由分别由 `MountPublic`、`MountAuthenticated`、`MountPermission`、
+`MountInternalService` 表达。公开是显式安全决策，而不是「忘了包鉴权」的
+剩余状态。Register 和 Setup 都可挂路由；所有 Setup 完成后、构建 mux/监听
+之前，Registry 统一检查未分类路由与模式冲突。内建 `/healthz` 和
+`/readyz` 是框架自有的隐式 Public 路由。
+
+除 `disabled` 外，框架把 `identityBoundary` 强制放在用户可配中间件的
+最外层。每个入站请求先清空 ctx 里预置的 `Actor` / `ServicePrincipal`、
+`callctx` 的 TenantID / Caller，再删除 unsigned `X-Tenant-Id` / `X-Caller` /
+`X-Merchant-Id`；只保留不授权的 request id。边界内的验证中间件才能从
+签名凭证重建主体与委托范围。`HTTPServer` Option 也不能替换这条根
+handler：构建服务器后框架会强制恢复它。
+
+这道边界的信任根仍是组合根代码：配置的 Middleware 在边界内执行，它可以
+合法地注入验过的 principal，也可因错误实现而信任 unsigned header 或短路
+`next`。Registry 分类是运行时守卫，不是对恶意 wiring 的沙箱；bootstrap 收走
+标准装配，是降低这个信任面的主要手段。
+
+bootstrap 从 `security.mode` 读模式，并对部署配置再收紧一层：`disabled`
+仅 `env=dev`；`user_facing` 必须同时提供恰好 32 字节的 Ed25519 公钥
+与非空 issuer，然后自动挂 `authn.Middleware`。当前第一阶段已有
+`ServicePrincipal` 的 ctx 落点与路由 guard，但服务 JWT 的 iss/aud/sub/exp/iat/kid
+验证配置尚未落地；因此 `internal_service` 与 `mixed` 在 bootstrap 中
+fail-closed，不接受「内网就算可信」作为替代。`-migrate` 因不启 HTTP，
+豁免模式与凭证配置。
+
+pprof 也纳入同一矩阵：`user_facing` 与 `Pprof` 同时出现就在启动期
+拒绝；`internal_service` / `mixed` 中每个 `/debug/pprof/*` handler 都包上
+InternalService guard。`disabled` 下它无 guard，只用于 bootstrap `env=dev` 或
+直接 App 测试。由于 bootstrap 当前不开 internal/mixed，线上 pprof 也刻意暂不可用。
 
 鉴权是每个系统都要、但语义人人不同的一块。框架的切法是**机制与语义分离**：
 
@@ -374,11 +425,13 @@ contract.yaml 生成同一接口的进程内 wrapper 与 HTTP client，方法体
 `reg.PermissionDecls()` 读**全应用目录**同步落库。目录完整性从「组合根记得
 注入」变成「各域自声明」，组合根这个环节退役。
 
-**绑定（Register/Setup 两阶段皆可）**：`reg.Require("files:delete", handler)`
-返回带判定的 handler。模块内部 mux 通常在 Setup 期装配，所以两个阶段都收；
-全部 Setup 跑完后框架统一校验**绑定 ⊆ 声明**——拼错的码在监听之前曝光
-（报错点名模块与码），而不是等到运行时 403。跨模块绑码合法（gateway 绑
-别域的码）。
+**绑定（Register/Setup 两阶段皆可）**：根路由用
+`reg.MountPermission("DELETE /files/{id}", "files:delete", handler)` 一次表达
+分类与权限码。`reg.Require` 保留给模块内部 mux 做低层绑码，但 mux
+挂到根时仍须选一个 `Mount*` 分类。模块内部 mux 通常在 Setup 期装配，
+所以两个阶段都收；全部 Setup 跑完后框架统一校验**绑定 ⊆ 声明**——
+拼错的码在监听之前曝光（报错点名模块与码），而不是等到运行时 403。
+跨模块绑码合法（gateway 绑别域的码）。
 
 **Actor（主体快照）**：验签中间件注入 ctx 的主体最小形态
 `{UserID, TenantID, Perms []string, StepUpAt}`。判定永远是**集合包含**
@@ -399,9 +452,11 @@ contract.yaml 生成同一接口的进程内 wrapper 与 HTTP client，方法体
 **验签（authn 包，机制件）**：`authn.Middleware(pub, issuer)` 解析 Bearer
 访问令牌与 `X-Step-Up` 证明——EdDSA 算法白名单（防算法混淆攻击）、iss、
 exp 必填，全部过验后注入 Actor。无 Authorization 头原样放行（判公开与否是
-Require 的职责——公开端点是合法状态）；**有头但验不过必须 401**：坏凭证是
-攻击不是匿名，静默降级会掩盖问题。依赖方向单向：authn → 根包，组合根挂链
-（或 bootstrap 两行配置），根包不 import authn。
+`Mount*` guard 的职责——只有 Public 是合法匿名状态）；**有头但验不过
+必须 401**：坏凭证是攻击不是匿名，静默降级会掩盖问题。内建 `/healthz` /
+`/readyz` 是特例：即使夹带坏 Authorization 也旁路验签，探针只表达存活/
+就绪状态。依赖方向单向：authn → 根包，组合根挂链（或 bootstrap 两行配置），
+根包不 import authn。
 
 多分区同进程（每个 rbac 分区一个 iss=`rbac-<分区键>`，可各配一把密钥）用
 `authn.MultiIssuer(map[iss]Issuer{Key, Partition})`：按令牌 iss 选公钥（伪造
@@ -424,8 +479,9 @@ Require 验**策略**（该码是否标了 Challenge、证明是否新鲜）。�
 客户端引导用户完成挑战 → 带 `X-Step-Up` 头重试同一请求。无广播、无消费
 注册——check 是中间件，不是事件。
 
-拆分部署时每个服务自挂 Authn（Authorization/X-Step-Up 头本来就在线路上，
+拆分部署时每个用户面服务自挂 Authn（Authorization/X-Step-Up 头本来就在线路上，
 下游不靠上游「帮忙认证过了」）；Actor 不进 `callctx` 白名单，也不该进。
+纯服务面和 mixed 部署须等后续服务 JWT 验证机制，不得用传播头替代。
 
 ### 5.5 租户隔离：三种形态，机制归框架、语义归域
 
@@ -435,9 +491,9 @@ Require 验**策略**（该码是否标了 Challenge、证明是否新鲜）。�
 
 - **语义归域与 rbac/identity**：租户模型（扁平/层级）、生命周期（开通/
   冻结/注销）、目录表、配额——产品决策，框架不预设；
-- **机制归框架**：租户身份的**来源唯一化**（authn 从令牌 tid 焊入
-  callctx，头只是东西向传播的载体）与**存储层强制**（RLS，漏 WHERE 从
-  泄漏变成查不到行/写入被拒）。
+- **机制归框架**：租户身份的**来源唯一化**（严格 HTTP 边界先清空
+  unsigned 头与 ctx，authn 再从已验令牌 tid 焊入 callctx）与**存储层强制**
+  （RLS，漏 WHERE 从泄漏变成查不到行/写入被拒）。
 
 四种形态，`appkit new domain` 一次选定：
 
@@ -458,10 +514,10 @@ Require 验**策略**（该码是否标了 Challenge、证明是否新鲜）。�
 tenant 形态的机制四件（全部在 `pgtx`，DDL 库函数是唯一事实源；partitioned +
 tenant 用无前缀的 `TenantScopeSQLBare` / `TenantPolicySQLBare`，逐分区校验）：
 
-1. **身份焊接**（authn）：验过的令牌 `tid` 覆盖或清零 callctx 里的
-   TenantID——认证请求以令牌为准，「无租户令牌 + 伪造的 X-Tenant-Id」
-   不能成立。头只在**未认证**入口存活（那是内部东西向的合法形态：
-   Transport 注入 → Extract 读出）；边缘剥头是网关的职责，框架不越位。
+1. **身份焊接**（信任边界 + authn）：最外层先删除 `X-Tenant-Id`、
+   清空 ctx 的 TenantID；验过的令牌 `tid` 再焊入 callctx。无 `tid`
+   就是无租户，不能用 unsigned header 补上。未认证公开端点同样看不到
+   该头，本就不应读写租户数据。
 2. **GUC 下沉**（`pgtx.NewTenant`）：每次 `Do` 开事务后把租户身份落成
    事务级 GUC `app.tenant_id`（`set_config(..., true)`，连接归池即净）；
    无租户则不设——基础设施表（outbox/idem/audit）的 relay、claim 不带
@@ -488,9 +544,9 @@ tenant 用无前缀的 `TenantScopeSQLBare` / `TenantPolicySQLBare`，逐分区�
    此时返回 NULL 而非 RAISE，读靠 read_all 策略放行，写的 WITH CHECK 比对
    NULL 恒不成立。
 
-诚实标注的洞：未认证公开端点仍信任头值（公开端点本就不该查租户数据，
-边缘剥头归网关）；superuser 绕过靠 Setup 期角色检查兜住（运行时 RLS 挡
-不了 superuser，这是 Postgres 语义）；schema 文档如实渲染 RLS DDL
+诚实标注的洞：组合根可配 Middleware 仍是受信代码，若它在边界内重新
+信任 unsigned 头，框架不是恶意 wiring 的沙箱；superuser 绕过靠 Setup 期
+角色检查兜住（运行时 RLS 挡不了 superuser，这是 Postgres 语义）；schema 文档如实渲染 RLS DDL
 （策略被删/FORCE 被摘，漂移检查跟着变红），未 ENABLE 的「装饰态」点名
 而非装作没有。
 
@@ -502,7 +558,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 
 | # | 层 | 做什么 | 禁止什么（执行手段） |
 |---|---|---|---|
-| 1 | httpserver 中间件链 | recover → otelgin(排除 healthz) → auth（调 authv1.Service 契约）→ **idem claim**（独立短事务 `INSERT…ON CONFLICT` 占位：已完成→回放缓存响应；进行中→409；同 key 异 payload→422）→ 出口统一 error 映射 RFC 9457、只 log 一次 | 业务逻辑（框架代码，业务写不进去） |
+| 1 | HTTP 根链 | 最外层 identity boundary 清洗 unsigned 身份 → httpserver Base（request id / recover / OTel / access log）→ authn 验用户令牌重建 Actor/tenant → `Mount*` 路由守卫 → **idem claim**（独立短事务 `INSERT…ON CONFLICT` 占位：已完成→回放缓存响应；进行中→409；同 key 异 payload→422） | 绕过根路由分类（启动守卫）；业务逻辑写进标准中间件 |
 | 2 | internal/http | 实现 contracts 生成的 server 接口；解码、结构校验、DTO↔ledger 类型映射 | SQL、pgx、import internal/postgres、业务规则（depguard + arch-lint） |
 | 3 | internal/ledger（service.go 编排） | `tx.Do(ctx, fn)` 开事务；调不变量；经 Store 接口读写；经消费方接口发事件（wiring 注入 outbox.Publisher，同事务落表）；recovery point；审计 | import gin/pgx（depguard）；事务内跨模块调用（**运行时守卫**） |
 | 4 | internal/ledger（类型与不变量） | 纯函数/实体方法：借贷平衡、币种一致、Money 精度 | 一切 I/O、float64（arch-lint + analyzer） |
@@ -528,14 +584,19 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 跨域只经契约类型 | 唯一可见类型就是 contracts 生成接口 | ★ 编译器级 |
 | 契约/事件/错误码单一事实源 | 只有生成物，无手写类型 | ★ 生成级 + drift check |
 | http 包不写 SQL、业务包零 infra import | depguard + go-arch-lint：配置由 `appkit sync` 物化（同时解决 IDE 集成与 golangci-lint 无配置继承），CI 先验未漂移**再按它跑这两个检查器**，版本与域仓库 `make lint` 同源（`ruleset.GolangciLintVersion` / `ArchLintVersion`） | ▲ CI 级，nolint 需写理由 |
-| 金额禁 float、ctx 不进 struct、decimal 不上 JSON 面 | appkit-lint 自研 analyzer（moneyfloat[-scope 圈定业务包] / ctxstruct / decjson）；domain-ci.yml 与域仓库 `make lint` 都跑它，版本随 go.mod 钉的 appkit 走（规则与依赖同版本升级，不搞 @main 惊喜；go.work 联调仓库退 @main） | ▲ CI 级：默认只查生产代码——测试夹具低一档，且存量域的测试不该被规则升级卡红（`-<name>.tests=true` 可连测试查） |
+| 金额禁 float、ctx 不进 struct、decimal 不上 JSON 面 | appkit-lint 自研 analyzer（moneyfloat[-scope 圈定业务包] / ctxstruct / decjson）；domain-ci.yml 与域仓库 `make lint` 都跑它，版本随 go.mod 钉的 appkit 走（规则与依赖同版本升级；go.work 联调须显式给版本，不回退 main） | ▲ CI 级：默认只查生产代码——测试夹具低一档，且存量域的测试不该被规则升级卡红（`-<name>.tests=true` 可连测试查） |
 | 事务不泄漏到业务代码 | pgtx 回调式 API，业务只见 ctx | ★ API 设计级 |
 | 事务内禁跨模块调用 | contract.Call 运行时守卫（HasTx 检查）；前提是调用经生成 wrapper（ProvideContract 强制包裹；生成物由 `appkit gen contract` 产出） | ▲ 运行时级，测试即暴露 |
 | 忘发事件不可能 | outbox.Publish 是事务 API 的一等公民 | ★ API 设计级 |
 | 生成物禁手改 | CI 重新生成后 `git diff --exit-code` | ▲ CI 级 |
 | appkit/contracts 向后兼容 | apidiff / oasdiff 门禁 | ▲ CI 级 |
-| CI 本身不可绕过 | reusable workflow + branch protection required checks | 组织级 |
+| CI 本身不可绕过 | reusable workflow 从 appkit module provenance 解析并固定完整 commit SHA、第三方 Action 固定 commit SHA、默认 `contents: read`；main/release tag protection + required checks | 组织级（仓库 ruleset 必须另行配置，见 `docs/CI_SECURITY.md`） |
 | 启动装配改不坏 | `bootstrap.Main` 收走 main() 的固定装配，代码在 module cache（0444 只读）；用户仓库的 main 只声明模块清单 | ▲ 物理级：改不动，但可绕开自己写 main（骨架默认不绕） |
+| HTTP 安全模式不能遗漏 | `App.Run` 在进入迁移/Setup/监听前验证 `SecurityMode`；bootstrap 还要求 `security.mode`，并把 `disabled` 限于 `env=dev`；`App.Migrate` 显式豁免 | ▲ 运行时 + 装配级：零值不能 Run，但直接构造 App 的调用方可显式选 `SecurityDisabled`（测试需要这个逃生口） |
+| 严格模式没有未分类根路由 | Registry 记录 Public/Authenticated/Permission/InternalService，全部 Setup 后、listen 前校验模式矩阵；分类 API 同时包上用户/权限/服务 guard | ▲ 运行时守卫：受信组合根的 Middleware 仍可短路 `next` 或在边界内注入 principal，不是对任意 wiring 的沙箱 |
+| 网络身份输入不继承为可信 ctx | 严格模式的 `identityBoundary` 强制在可配 Middleware 最外层，清 Actor/ServicePrincipal/partition/tenant/caller 及四个 unsigned 头；`HTTPServer` Option 之后强制恢复根 handler | ▲ 运行时信任边界：中间件顺序和 Handler Option 不能把边界挪掉，但边界内的受信 Middleware 若重新信头仍可自伤 |
+| 服务身份验证 | 已有 `ServicePrincipal` 落点、InternalService guard 与模式矩阵；bootstrap 对 internal/mixed fail-closed | ✗ 验证器尚未落地：待补 service JWT 的 iss/aud/sub/exp/iat/kid 与委托范围 |
+| pprof 不暴露在用户面 | `user_facing + Pprof` 启动拒绝；internal/mixed 的每个 pprof handler 包 InternalService guard；disabled 仅作 bootstrap `env=dev` / 直接 App 测试 | ▲ 运行时：服务主体守卫已在，但 bootstrap 在验证器落地前不启用 internal/mixed |
 | 规则集不被改松 | `appkit check` 内联 `ruleset.Check`（配置缺失同样算漂移），不再只靠 CI 那一步 | ▲ 本地+CI 级 |
 | 已应用的迁移不可变 | 历史表存内容 sha256，启动期逐个比对，不符即 `MIGRATION_DRIFT` 拒绝启动；`.gitattributes` 钉 `*.sql eol=lf` 消除跨平台误报 | ★ 运行时级，启动即暴露 |
 | 分区域域的 schema 由调用方确定 | 迁移/查询无前缀 + 事务级 `SET LOCAL search_path`（`pgtx.NewRouted` 按 `callctx.Meta.Partition` 查组合根注入的映射）；查询必须经 `tx.Do`，事务外落默认 search_path 即「表不存在」报错 | ★ 运行时级：路由失败（查无分区）即回滚 422，无法静默落到错误分区 |
@@ -543,10 +604,10 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 分区域域的 SQL 无前缀纪律 | `partitioned: true` 时 archcheck 前缀规则翻转（任何 schema 前缀违规，无 DB 即拦）；sqlc 编译器兜底——带前缀与无前缀两个世界各自封闭，混写双向都是编译错误 | ▲ CI 级 + ★ 编译器级 |
 | 租户域跨租户泄漏 | RLS（ENABLE+FORCE+隔离策略+读全部策略，`pgtx.TenantPolicySQL`）+ 事务级 GUC（`pgtx.NewTenant` / `NewRoutedTenant` 的 Do）；Setup 期 `pgtx.VerifyTenantRLS` 校验完整性（缺任一件/角色 superuser 或 BYPASSRLS 即拒启，点名表并附修复 SQL） | ★ 运行时级：漏写 WHERE 只会查不到行/写入被拒，且缺件启动即暴露 |
 | 跨租户读只能是显式、只读、不传播 | `tx.WithReadAllTenants` 是进程内 ctx 标记（不进 callctx：防火墙剥掉、事件不带）；落成第二个 GUC `app.tenant_scope`，与租户值那条通道（令牌 tid）分离；策略只对 SELECT 放开，写入的 WITH CHECK 不变；标记须在最外层 Do 之前打，嵌套内切换报错 | ★ 存储级：写全部模式不存在；「谁能打标记」归 `reg.Require` 跨租户码 + 用例纪律（约定级） |
-| 租户身份来源唯一（令牌 tid） | authn 验签后把 tid 焊进 callctx（有值覆盖、无值清零）——伪造的 X-Tenant-Id 在认证请求里活不下来；分区键同理：`authn.MultiIssuer` 按令牌签发方焊入 `Meta.Partition` | ★ 中间件级；未认证入口仍信头（东西向合法形态），边缘剥头归网关——这是文档级边界，不是机检 |
+| 分区与租户身份只能来自已验证凭证 | 严格 HTTP 边界先清除 ctx partition/tenant 与 `X-Partition` / `X-Tenant-Id`，authn 验签后把 tid 焊进 callctx（无值清零）；`authn.MultiIssuer` 从签发方配置重建 Partition；公开端点也看不到 unsigned 身份 | ▲ 中间件级：标准 bootstrap 链路可执行；自写受信 Middleware 仍可错误地从头重建；服务身份验证器尚未落地 |
 | schema 文档支持分区域域 | `partitioned: true` 自动生成 logical-template：无前缀迁移在代表 schema 回放一次，全部文档显式标记；分区＋tenant 的 RLS 同步呈现 | ▲ 工具/CI 级；只证明逻辑模板，未枚举或检查运行中分区；未启用文档的仓库仍 notice 放行 |
 | 没人跑迁移不可能 | 登记了迁移却既无 `Migrator` 又无 `SkipMigrations()` → 启动报错；`-migrate` 无 `database.url` 亦报错 | ★ 装配级 fail-fast |
-| schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`；在固定数据库环境、可复现迁移下生成确定性文档，不承诺跨 PostgreSQL/扩展/模板库或随机 SQL 的绝对纯函数。CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（原生分区表、生成列、继承…）点名报错；RLS 如实渲染（策略被删/FORCE 被摘即漂移） | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行——`domain-ci.yml` 经 `@main` 被全部存量域仓库共享，硬加检查会让它们在合并那一刻集体变红。代价是从不启用的仓库永远不被检查；跑过一次 `make schema` 就永久转严 |
+| schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`；在固定数据库环境、可复现迁移下生成确定性文档，不承诺跨 PostgreSQL/扩展/模板库或随机 SQL 的绝对纯函数。CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（原生分区表、生成列、继承…）点名报错；RLS 如实渲染（策略被删/FORCE 被摘即漂移） | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行；从不启用的仓库永远不被检查，跑过一次 `make schema` 就永久转严。新增检查随 appkit release + sync 显式进入下游，不会由 main 突然扩散。 |
 | 表有说明（`COMMENT ON TABLE`） | 缺的表在 `db/SCHEMA.md` 表清单里标 ⚠ 缺说明并给出该补的那一句；`appkit schema -check` 在 CI 里逐表打 `::warning` 注解 | ▲ 软约束：不阻断 CI（刻意的，存量仓库不会突然红），且 `db/SCHEMA.md` 带 `linguist-generated` 在 PR diff 里默认折叠——⚠ 没人主动打开就看不见，::warning 注解是让它浮出水面的那一半 |
 | 长驻任务死了必被发现 | `Registry.Worker` 托管：异常退出上报主循环并触发关停（不再是"探针绿着、事件停摆"） | ★ API 设计级 |
 | ctx 只能传白名单元数据 | `callctx.Meta` 是具名字段的 struct 而非 map，防火墙剥值后只放回它 | ★ 编译器级：塞不进去 |
@@ -557,7 +618,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 脚手架的 sqlc NUMERIC override 真能过 pgx | override 只指向 decimal.Decimal（pgx 经 Valuer/Scanner 原生编解码）；`internal/scaffold` 的 `TestDomainNumericOverrideRoundTrips` 把渲染后声明的类型真库读写一遍（27 位小数 + NULL）。编译测试对"扫描不了 OID 1700"结构性失明——money.Money 那次教训就是编译全绿、运行即炸 | ▲ 测试级：需 `TEST_DATABASE_URL`（`make test-db`），无 DB 时 skip |
 | 出站 HTTP 也带上 `callctx` 白名单 | `callctx.Transport` 装进 `http.Client` 一次即可（不必逐调用点写 `Inject`）；`apptest.Conform` 填了 `Binding.SeenMeta` 就当场验请求头 | ▲ API 设计级 + 测试级：漏点从「每个调用点」收敛到「一处装配」，且验得到。但两者都得自己接——不填 `SeenMeta` 就仍是口头承诺 |
 | 端点权限绑定 ⊆ 已声明码 | Registry 收集绑定（Register/Setup 期都可能产生，模块内部 mux 在 Setup 装配），全部 Setup 之后、监听之前统一校验，拼错的码点名（模块、码）报错 | ★ 装配期硬失败 |
-| 权限判定语义统一（集合包含 + step-up 新鲜度） | `reg.Require` 是唯一判定入口，401/403/STEP_UP 矩阵在框架；业务域不再各写一份会漂移的判定 | ★ API 设计级 |
+| 权限判定语义统一（集合包含 + step-up 新鲜度） | `MountPermission` / `reg.Require` 共用唯一判定实现，401/403/STEP_UP 矩阵在框架；业务域不再各写一份会漂移的判定 | ★ API 设计级 |
 | 验签只在 authn 一处、模块不自解凭证 | 组合根挂链 + 脚手架注释教学 | ▲ 提高绕过成本：模块仍可自解 Authorization 头绕过，无机制挡 |
 | 列表端点分页形态统一（limit 解析/游标编码/响应信封） | `page` 包：`Parse` 值域校验（畸形 422，不静默裁剪）+ 游标不透明编解码（JSON→base64url）+ `List` 信封 + `Trim` 的 limit+1 多取一行技巧；机制归框架，排序键与 keyset SQL 归域 | 约定级：用不用在域，自写手翻页无机检——形态统一靠采纳与 review |
 | 业务包 / transport 文件按功能成簇、子包只嵌套在业务包下 | 脚手架 AGENTS.md「文件怎么分」+ §4；三条方向性约束的机检（depguard / go-arch-lint / archcheck）都按 `internal/<domain>/**` 圈定业务包，嵌套子包自动纳入 | 约定级：文件命名与「不按层拆」没有 lint 落点；「不拆平级包」的后果（逃出机检）是靠规程点名的，不是工具拦的——文件行数检查器不存在，别假装有 |
@@ -616,9 +677,14 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   做不到这点）。换规范化口径是单向门：存量 payload_hash 全部失配而 completed
   记录不过期，旧键持续 422 到客户端换键为止。
 - **Bus 可插拔**：单体单库用 directbus（relay 直投各域 inbox，无 broker）；
-  拆分部署切 NATS/Kafka——同一 Bus 接口，部署形态切换不改业务代码。
+  拆分部署切 NATS/Kafka——同一 Bus 接口，部署形态切换不改业务代码。DirectBus
+  对无订阅 topic 返回 `ErrNoSubscriber`，relay 不会把空投递标记成功；bootstrap
+  默认拒绝 `target != all` 继续隐式使用 DirectBus，特殊场景必须明确 opt-in。
   模块经 `reg.Consumer(topic, handler)` 声明消费（handler 用 outbox.Inbox 包去重），
   App 以 `appkit.Bus(...)` 装配；声明了消费者却未配 Bus 属启动错误（fail-fast）。
+  持久化 Broker 可额外实现 `appkit.ManagedSubscriber`：`Connect` 在监听前完成，
+  `Run` 作为受管 Worker 传播消费循环错误，`Ready` 接入 readiness；关停按
+  `Drain → 等待 Run → Close` 执行。其 `Publish` 只有拿到 durable ack 才能返回成功。
 - **业务层发事件不碰 infra 类型**：wiring 期构造 `outbox.NewPublisher(pool, schema)`，
   业务包按"接口放消费方"依赖单方法接口 `Publish(ctx, evt) error`。
 - **长驻任务一律经 `reg.Worker(name, run)`**：框架起 goroutine、关停等它退出、异常退出
@@ -628,12 +694,13 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   四条路径由框架产出 RED 指标（HTTP 入站由 otelhttp 出，不重复埋）；outbox 积压深度与
   最老待投递年龄以 gauge 观测（告警看年龄而不是条数）。标签集在 `internal/metrics` 钉死，
   业务无法追加维度——指标事故几乎都源于"顺手加一个标签"。
-- **跨边界元数据走 `callctx` 白名单**：ctx 防火墙剥掉一切值，只有 request/tenant/caller
-  三个具名字段被放回。HTTP 入站（中间件）与事件 meta（outbox/relay）两条由框架自动
-  接好，异步链路也串得起 request id；**出站 HTTP 那一段要自己接**：把
-  `callctx.Transport` 装进 `http.Client`（一处），而不是逐调用点写 `Inject`。
-  appkit 不生成 client，但装没装上验得到：给 `apptest.Conform` 的 Binding 填
-  `SeenMeta`，服务端交出「这次看到了什么」，漏了的形态当场红——见 §7 表末。
+- **跨边界元数据走 `callctx` 白名单**：契约 ctx 防火墙剥掉一切值，
+  只有 request/tenant/caller 三个具名字段被放回；事件 meta 也由 outbox/relay
+  快照与还原。但 HTTP 根入站是另一道信任边界：严格模式只保留 request id，
+  unsigned tenant/caller 会被清空；用户 tenant 由 authn 从已验 tid 重建，服务
+  caller/租户委托待服务 JWT 机制落地。生成 client 会自动焊上 `callctx.Transport`，
+  但传播头只是候选数据，不是身份证明。`apptest.Conform` 的 `SeenMeta` 仍可验证
+  生成 client/server 的传输映射；应用级信任行为由根边界测试单独覆盖。
 - **本地开发**：`appkit dev` 自动 `go work init/use`（go.work 不提交）；
   发版联动用 Renovate 自动升 require。私有库配 `GOPRIVATE=github.com/forgeplex/*`。
 - **对账（reconciliation）是 PSP 一等公民**：appkit 提供 recovery point 表约定与
@@ -683,11 +750,17 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
    - `bootstrap`（main() 的全部装配，位于只读 module cache）、`Registry.Worker`
      （长驻任务托管）、`App.Migrate` + `-migrate` + `SkipMigrations`
    - `pgmigrate` 迁移内容 sha256 不可变守卫（配 `.gitattributes` 的 `*.sql eol=lf`）
-   - `callctx`（穿越 ctx 防火墙的元数据白名单，HTTP 头 ↔ ctx ↔ 事件 meta 三向传播）
+   - `callctx`（穿越契约 ctx 防火墙的元数据白名单，事件 meta 也可快照/还原；
+     HTTP 根入站另受身份信任边界约束）
    - `job`（advisory lock 跨副本互斥的周期任务）
    - `internal/metrics`（四条路径的 RED 指标 + outbox 积压 gauge，标签集框架内钉死）
    - `apptest.Conform`（契约一致性套件：同一批用例过每个绑定，比对错误码/返回值/
      边界语义）+ `contract.Call` 在进 fn 前拦掉已死的 ctx——**§5.3 的四件套至此
      既是承诺也是可运行的断言**
-6. ⬜ **试点迁移 ledger**（已有最清晰的数据层：sqlc + outbox 已在用），验证约束体系。
-7. ⬜ **psp 组合 repo**：先 `-target=all` 单体上线，拆分是之后的部署决策而非架构决策。
+6. 🚧 **HTTP 安全边界（Issue #3）**：第一阶段已落地显式 `SecurityMode`、
+   四类 `Mount*` 与启动矩阵、最外层身份清洗、user-facing Ed25519
+   配置收口、pprof 分类与 migrate-only 豁免。待完成服务 JWT 的
+   iss/aud/sub/exp/iat/kid 验证与委托 claims；此前 bootstrap 对
+   `internal_service` / `mixed` fail-closed。
+7. ⬜ **试点迁移 ledger**（已有最清晰的数据层：sqlc + outbox 已在用），验证约束体系。
+8. ⬜ **psp 组合 repo**：先 `-target=all` 单体上线，拆分是之后的部署决策而非架构决策。

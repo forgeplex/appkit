@@ -40,10 +40,11 @@ func Base(log *slog.Logger) []func(http.Handler) http.Handler {
 	}
 }
 
-// RequestID 从请求头提取跨边界元数据白名单（callctx.Meta：request id、
-// 租户、caller）存进 ctx，request id 缺省时生成 uuid 并回写响应头。
-// 放在链最外层，保证 Recover/AccessLog 的日志都带得上这些字段，
-// 也保证后续的契约调用与事件发布能把它们传下去。
+// RequestID 从请求头提取跨边界元数据白名单并存进 ctx，request id 缺省时
+// 生成 uuid 并回写响应头。严格安全模式的 identity boundary 位于本链之外，
+// 已先清除 unsigned 租户/caller 头，因此这里只会读到可追踪但不授权的
+// request id；SecurityDisabled 保留历史的原样提取行为。
+// 放在链最外层，保证 Recover/AccessLog 的日志都带 request id。
 func RequestID() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

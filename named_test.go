@@ -230,7 +230,7 @@ func TestNamedBindingMissingDependencyFailsBeforeSetup(t *testing.T) {
 		ProvideNamed(reg, "primary", func(r *Registry) (int, error) { return ResolveNamed[int](r, "missing") })
 		reg.Setup(func(context.Context) error { setup = true; return nil })
 		return nil
-	})}, HTTPAddr("127.0.0.1:0"))
+	})}, Security(SecurityUserFacing), HTTPAddr("127.0.0.1:0"))
 	if err := app.Run(context.Background()); err == nil || !strings.Contains(err.Error(), `int["missing"]`) {
 		t.Fatalf("expected missing named dependency at startup: %v", err)
 	}

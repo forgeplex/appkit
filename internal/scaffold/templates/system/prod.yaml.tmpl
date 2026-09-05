@@ -1,6 +1,11 @@
 # {{.Name}} 生产环境配置。密钥不进配置文件，一律走 {{.EnvPrefix}}_* 环境变量注入。
 addr: ":8080"
 env: prod
+security:
+  # 必须按该部署的暴露面显式选择严格模式，留空会在监听端口前失败；不能以
+  # disabled 绕过生产身份边界。当前 bootstrap 阶段可完整配置 user_facing；
+  # internal_service/mixed 在服务 JWT 验证器落地前仍会 fail closed。
+  mode: ""
 database:
   # 生产库地址含密钥，走 {{.EnvPrefix}}_DATABASE__URL 环境变量注入，此处留空。
   url: ""
@@ -8,6 +13,6 @@ log:
   level: info
   format: json
 debug:
-  # pprof 排障端点默认关闭。生产开启（排障时改配置重启即可，不必发版）前
-  # 先确认服务端口不暴露公网：/debug/pprof/* 泄露 goroutine 栈与堆内容。
+  # pprof 排障端点默认关闭；user_facing 模式禁止启用。internal_service/mixed
+  # 下端点必须由已验证的服务身份保护（当前 bootstrap 尚未开放这两种模式）。
   pprof: false

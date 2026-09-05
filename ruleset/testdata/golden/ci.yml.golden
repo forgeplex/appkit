@@ -7,6 +7,10 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   ci:
-    uses: forgeplex/appkit/.github/workflows/domain-ci.yml@main
+    # appkit v1.2.3；完整 SHA 由 sync 从该版本的 Go module provenance 解析。
+    uses: forgeplex/appkit/.github/workflows/domain-ci.yml@0123456789abcdef0123456789abcdef01234567

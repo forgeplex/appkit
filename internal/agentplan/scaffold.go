@@ -12,6 +12,7 @@ import (
 
 	"github.com/forgeplex/appkit/internal/scaffold"
 	"github.com/forgeplex/appkit/internal/workspace"
+	"github.com/forgeplex/appkit/ruleset"
 )
 
 // New renders a domain/system scaffold into a new or empty target directory
@@ -27,6 +28,18 @@ func New(ctx context.Context, root, target, kind string, opts scaffold.Options) 
 	}
 	if kind == "system" && (opts.Tenant || opts.Partitioned) {
 		return workspace.Plan{}, fmt.Errorf("%w: tenant/partitioned only apply to domains", workspace.ErrInvalidChange)
+	}
+	// Resolve before taking the workspace lock; pure renderers only consume the
+	// pinned value, and apply never re-resolves it.
+	if kind == "domain" {
+		if opts.WorkflowRef == "" {
+			opts.WorkflowRef, err = ruleset.ResolveWorkflowRefContext(ctx, opts.AppkitVersion)
+		} else {
+			opts.WorkflowRef, err = ruleset.NormalizeWorkflowRef(opts.WorkflowRef)
+		}
+		if err != nil {
+			return workspace.Plan{}, err
+		}
 	}
 	err = workspace.WithReadLock(ctx, root, func() error {
 		// Probe through the same confined reader before inspecting target entries:
