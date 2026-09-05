@@ -3,6 +3,9 @@ package gen
 import (
 	"bytes"
 	"fmt"
+	"go/format"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -66,7 +69,7 @@ var rePath = regexp.MustCompile(`^/[a-zA-Z0-9/_-]*[a-zA-Z0-9_-]$`)
 // Contract 读取契约 yaml，在 outDir 生成契约包的全套文件：
 //
 //	service.gen.go  Service 接口 + 传值 DTO（本文件渲染）
-//	wrap.gen.go     进程内 wrapper（复用 Wrap 链路，扫刚写出的 service.gen.go）
+//	wrap.gen.go     进程内 wrapper（复用 Wrap 的接口校验与渲染链路）
 //	client.gen.go   远程 client：同一接口，contract.Call + 幂等有界重试
 //	server.gen.go   HTTP 暴露：与 client 互为镜像的编解码
 //	openapi.yaml    派生导出（文档 / oasdiff 门禁；非事实源）
@@ -77,37 +80,93 @@ func Contract(inPath, outDir string) error {
 	if inPath == "" || outDir == "" {
 		return fmt.Errorf("gen contract 需要 -in <contract.yaml> 与 -dir <pkgdir>")
 	}
-	doc, err := parseContractDoc(inPath)
+	files, err := RenderContract(inPath)
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return fmt.Errorf("创建输出目录: %w", err)
 	}
-	if err := writeGo(filepath.Join(outDir, "service.gen.go"), renderService(doc)); err != nil {
-		return err
-	}
-	// wrap 复用既有链路：扫刚写出的 service.gen.go，wrap.go 自身零改动。
-	if err := Wrap(outDir, "Service", doc.System, filepath.Join(outDir, "wrap.gen.go")); err != nil {
-		return err
-	}
-	if err := writeGo(filepath.Join(outDir, "client.gen.go"), renderClient(doc)); err != nil {
-		return err
-	}
-	if err := writeGo(filepath.Join(outDir, "server.gen.go"), renderServer(doc)); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(outDir, "openapi.yaml"), renderOpenAPI(doc), 0o644); err != nil {
-		return fmt.Errorf("写出 openapi.yaml: %w", err)
+	for _, name := range contractFilenames {
+		outPath := filepath.Join(outDir, name)
+		if err := os.WriteFile(outPath, files[name], 0o644); err != nil {
+			return fmt.Errorf("写出 %s: %w", outPath, err)
+		}
 	}
 	return nil
 }
 
-func parseContractDoc(inPath string) (*contractDoc, error) {
+// contractFilenames gives both generation and drift diagnostics a stable order.
+var contractFilenames = []string{
+	"client.gen.go", "openapi.yaml", "server.gen.go", "service.gen.go", "wrap.gen.go",
+}
+
+// RenderContract reads and validates contract.yaml, returning every generated
+// filename and its exact contents. It performs no writes and does not inspect an
+// output directory. Callers can use the same rendering for generation, checking,
+// or a reviewable workspace plan. Returned buffers belong to the caller.
+func RenderContract(inPath string) (map[string][]byte, error) {
+	if inPath == "" {
+		return nil, fmt.Errorf("gen contract 需要 -in <contract.yaml>")
+	}
 	data, err := os.ReadFile(inPath)
 	if err != nil {
 		return nil, fmt.Errorf("读取输入: %w", err)
 	}
+	return RenderContractSource(inPath, data)
+}
+
+// RenderContractSource renders exactly the supplied contract bytes without
+// reading or writing files. sourceName is used only for validation diagnostics;
+// it need not name an existing file. This lets a workspace plan render the same
+// input snapshot whose digest it records, without reopening a mutable path.
+func RenderContractSource(sourceName string, data []byte) (map[string][]byte, error) {
+	doc, err := parseContractSource(sourceName, data)
+	if err != nil {
+		return nil, err
+	}
+	service := renderService(doc)
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "service.gen.go", service, parser.SkipObjectResolution)
+	if err != nil {
+		return nil, fmt.Errorf("解析生成的 service.gen.go 失败: %w", err)
+	}
+	decl, err := findInterfaceDecl(fset, file, "Service")
+	if err != nil {
+		return nil, err
+	}
+	if decl == nil {
+		return nil, fmt.Errorf("生成的 service.gen.go 缺少 Service 接口")
+	}
+	methods, err := checkMethods(fset, "Service", decl)
+	if err != nil {
+		return nil, err
+	}
+	imports, err := collectImports(fset, file, "Service", methods)
+	if err != nil {
+		return nil, err
+	}
+	files := map[string][]byte{
+		"service.gen.go": service,
+		"wrap.gen.go":    renderWrap(doc.Package, "Service", doc.System, methods, imports),
+		"client.gen.go":  renderClient(doc),
+		"server.gen.go":  renderServer(doc),
+		"openapi.yaml":   renderOpenAPI(doc),
+	}
+	for _, name := range contractFilenames {
+		if !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		formatted, err := format.Source(files[name])
+		if err != nil {
+			return nil, fmt.Errorf("格式化生成代码失败（生成器 bug，目标 %s）: %w", name, err)
+		}
+		files[name] = formatted
+	}
+	return files, nil
+}
+
+func parseContractSource(inPath string, data []byte) (*contractDoc, error) {
 	var doc contractDoc
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("%s: 解析 yaml: %w", inPath, err)

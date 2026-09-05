@@ -37,8 +37,8 @@ func Wrap(srcDir, iface, system, outPath string) error {
 	if srcDir == "" || iface == "" || system == "" || outPath == "" {
 		return fmt.Errorf("gen wrap 需要 -src <pkgdir> -iface <Name> -system <name> -out <file.go>")
 	}
-	if !regexp.MustCompile(`^[a-z][a-z0-9]*$`).MatchString(system) {
-		return fmt.Errorf("-system %q 非法（须匹配 ^[a-z][a-z0-9]*$，如 ledger）", system)
+	if err := validateWrapArguments(iface, system); err != nil {
+		return err
 	}
 
 	fset := token.NewFileSet()
@@ -46,15 +46,81 @@ func Wrap(srcDir, iface, system, outPath string) error {
 	if err != nil {
 		return err
 	}
-	methods, err := checkMethods(fset, iface, decl)
+	source, err := renderWrapInterface(fset, file, decl, iface, system)
 	if err != nil {
 		return err
+	}
+	return writeGenerated(outPath, source)
+}
+
+// RenderWrapSources renders a wrapper from a captured package-source snapshot
+// without accessing the filesystem. Keys are diagnostic filenames; only .go
+// files other than *_test.go are considered, in lexical filename order. As with
+// Wrap, the first matching interface is used and later files are not parsed.
+// Callers supply the files of one package, without traversing subdirectories.
+// Neither the map nor its contents are modified; the result belongs to the caller.
+func RenderWrapSources(files map[string][]byte, iface, system string) ([]byte, error) {
+	if err := validateWrapArguments(iface, system); err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(files))
+	for name := range files {
+		if eligibleWrapSource(name) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	fset := token.NewFileSet()
+	for _, name := range names {
+		file, decl, err := parseInterfaceSource(fset, name, files[name], iface)
+		if err != nil {
+			return nil, err
+		}
+		if decl != nil {
+			return renderWrapInterface(fset, file, decl, iface, system)
+		}
+	}
+	return nil, fmt.Errorf("在源码快照中未找到接口 %s（检查 -src 与 -iface）", iface)
+}
+
+func validateWrapArguments(iface, system string) error {
+	if iface == "" || system == "" {
+		return fmt.Errorf("gen wrap 需要 -iface <Name> 与 -system <name>")
+	}
+	if !rePackage.MatchString(system) {
+		return fmt.Errorf("-system %q 非法（须匹配 ^[a-z][a-z0-9]*$，如 ledger）", system)
+	}
+	return nil
+}
+
+func renderWrapInterface(fset *token.FileSet, file *ast.File, decl *ast.InterfaceType, iface, system string) ([]byte, error) {
+	methods, err := checkMethods(fset, iface, decl)
+	if err != nil {
+		return nil, err
 	}
 	imports, err := collectImports(fset, file, iface, methods)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return writeGo(outPath, renderWrap(file.Name.Name, iface, system, methods, imports))
+	return formatGo(file.Name.Name+" wrapper", renderWrap(file.Name.Name, iface, system, methods, imports))
+}
+
+func eligibleWrapSource(name string) bool {
+	return strings.HasSuffix(name, ".go") && !strings.HasSuffix(name, "_test.go")
+}
+
+func parseInterfaceSource(fset *token.FileSet, name string, data []byte, iface string) (*ast.File, *ast.InterfaceType, error) {
+	// Even a nil byte slice must mean empty captured content, never ParseFile's
+	// nil-interface sentinel that asks the parser to read name from disk.
+	file, err := parser.ParseFile(fset, name, bytes.NewReader(data), parser.SkipObjectResolution)
+	if err != nil {
+		return nil, nil, fmt.Errorf("解析源码: %w", err)
+	}
+	decl, err := findInterfaceDecl(fset, file, iface)
+	if err != nil {
+		return nil, nil, err
+	}
+	return file, decl, nil
 }
 
 // findInterface 逐文件解析 srcDir（跳过 _test.go），定位 iface 的接口声明。
@@ -65,35 +131,49 @@ func findInterface(fset *token.FileSet, srcDir, iface string) (*ast.File, *ast.I
 	}
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+		if e.IsDir() || !eligibleWrapSource(name) {
 			continue
 		}
-		f, err := parser.ParseFile(fset, filepath.Join(srcDir, name), nil, parser.SkipObjectResolution)
+		path := filepath.Join(srcDir, name)
+		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, nil, fmt.Errorf("解析源码: %w", err)
 		}
-		for _, d := range f.Decls {
-			gd, ok := d.(*ast.GenDecl)
-			if !ok || gd.Tok != token.TYPE {
-				continue
-			}
-			for _, spec := range gd.Specs {
-				ts, ok := spec.(*ast.TypeSpec)
-				if !ok || ts.Name.Name != iface {
-					continue
-				}
-				it, ok := ts.Type.(*ast.InterfaceType)
-				if !ok {
-					return nil, nil, fmt.Errorf("%s: %s 不是接口类型", fset.Position(ts.Pos()), iface)
-				}
-				if ts.TypeParams != nil {
-					return nil, nil, fmt.Errorf("%s: 不支持泛型接口 %s（契约接口必须是具体类型）", fset.Position(ts.Pos()), iface)
-				}
-				return f, it, nil
-			}
+		f, it, err := parseInterfaceSource(fset, path, data, iface)
+		if err != nil {
+			return nil, nil, err
+		}
+		if it != nil {
+			return f, it, nil
 		}
 	}
 	return nil, nil, fmt.Errorf("在 %s 中未找到接口 %s（检查 -src 与 -iface）", srcDir, iface)
+}
+
+// findInterfaceDecl also serves in-memory contract generation, so checking a
+// contract never has to write service.gen.go just to parse its interface.
+func findInterfaceDecl(fset *token.FileSet, file *ast.File, iface string) (*ast.InterfaceType, error) {
+	for _, d := range file.Decls {
+		gd, ok := d.(*ast.GenDecl)
+		if !ok || gd.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			ts, ok := spec.(*ast.TypeSpec)
+			if !ok || ts.Name.Name != iface {
+				continue
+			}
+			it, ok := ts.Type.(*ast.InterfaceType)
+			if !ok {
+				return nil, fmt.Errorf("%s: %s 不是接口类型", fset.Position(ts.Pos()), iface)
+			}
+			if ts.TypeParams != nil {
+				return nil, fmt.Errorf("%s: 不支持泛型接口 %s（契约接口必须是具体类型）", fset.Position(ts.Pos()), iface)
+			}
+			return it, nil
+		}
+	}
+	return nil, nil
 }
 
 // checkMethods 校验每个方法的契约形态并抽取 req/resp 类型。

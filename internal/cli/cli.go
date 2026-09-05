@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime/debug"
@@ -51,6 +52,10 @@ func Main(args []string) int {
 		return 2
 	}
 	if err := c.Run(args[1:]); err != nil {
+		var agentErr *agentExit
+		if errors.As(err, &agentErr) {
+			return agentErr.code
+		}
 		fmt.Fprintf(os.Stderr, "appkit %s: %v\n", c.Name, err)
 		return 1
 	}

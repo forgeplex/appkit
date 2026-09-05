@@ -213,9 +213,10 @@ CREATE TABLE sd_test.child () INHERITS (sd_test.base);`,
 	}
 }
 
-// TestRLSRendering 锁住 RLS 的如实渲染：租户域靠它做行级隔离，策略三件套
-// 必须出现在 db/schema/<表>.sql 里——策略被删、FORCE 被摘，漂移检查要能
-// 看出来。装饰态（挂了策略但没 ENABLE）点名而非装作没有。
+// TestRLSRendering 锁住 RLS 的如实渲染：租户域靠它做行级隔离，ENABLE/FORCE
+// 与两条策略（隔离 + 只读的读全部）必须出现在 db/schema/<表>.sql 里——
+// 策略被删、FORCE 被摘，漂移检查要能看出来。装饰态（挂了策略但没 ENABLE）
+// 点名而非装作没有。
 // 回放（TestRoundTrip）不含 RLS：策略表达式引用的函数不进 DDL 渲染
 // （函数体事实源在迁移），这里单独验渲染文本。
 func TestRLSRendering(t *testing.T) {
@@ -232,7 +233,7 @@ CREATE TABLE sd_test.documents (id text PRIMARY KEY, tenant_id text NOT NULL);
 			doc = tb
 		}
 	}
-	if doc.RLS == nil || !doc.RLS.Enabled || !doc.RLS.Force || len(doc.RLS.Policies) != 1 {
+	if doc.RLS == nil || !doc.RLS.Enabled || !doc.RLS.Force || len(doc.RLS.Policies) != 2 {
 		t.Fatalf("RLS 读取不符: %+v", doc.RLS)
 	}
 	files, err := Render(s)
@@ -247,6 +248,9 @@ CREATE TABLE sd_test.documents (id text PRIMARY KEY, tenant_id text NOT NULL);
 		// 表达式是 pg_policies 的原文（含 Postgres 自己加的外层括号）。
 		"USING ((tenant_id = sd_test.appkit_current_tenant()))",
 		"WITH CHECK ((tenant_id = sd_test.appkit_current_tenant()))",
+		// 读全部策略只限 SELECT：FOR 子句必须渲染出来，否则回放会放开写。
+		"CREATE POLICY tenant_isolation_read_all ON sd_test.documents FOR SELECT",
+		"USING (sd_test.appkit_read_all_tenants())",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("渲染缺 %q：\n%s", want, sql)

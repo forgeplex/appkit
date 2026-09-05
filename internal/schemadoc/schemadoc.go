@@ -66,6 +66,14 @@ type Options struct {
 	Dir    string // 仓库根目录
 	DSN    string // 任一 Postgres 连接串；迁移会应用到由它派生的一次性临时库
 	Schema string // 域 schema 名（.appkit.yml 的 domain）
+	// Partitioned documents one logical template in Schema, not live partitions.
+	// Prefixless migrations are applied once through the normal migration runner.
+	Partitioned bool
+	// Migrations supplies a caller-captured filesystem rooted at migration SQL
+	// filenames. When non-nil, Introspect never reads Dir or reopens source paths.
+	// The caller must keep this snapshot immutable for the duration of the call.
+	// Nil retains the existing Dir/db/migrations behavior.
+	Migrations fs.FS
 }
 
 // Schema 是一个域 schema 的完整结构快照，也是全部渲染的唯一输入。
@@ -74,6 +82,9 @@ type Schema struct {
 	Tables    []Table    // 按 Name 升序
 	Enums     []Enum     // 按 Name 升序
 	Functions []Function // 按 Name 升序
+	// LogicalTemplate marks a representative partitioned-domain model. It does
+	// not claim that any deployed partition exists or matches this snapshot.
+	LogicalTemplate bool
 }
 
 // TableKind 区分普通表与（物化）视图。本包只渲染这三种，其余一律报错。

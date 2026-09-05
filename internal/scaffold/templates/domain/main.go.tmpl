@@ -21,7 +21,8 @@ func main() {
 		Modules: func(d bootstrap.Deps) ([]appkit.Module, error) {
 			return []appkit.Module{
 				{{.Name}}.Module({{.Name}}.Options{Log: d.Log, Pool: d.Pool, Bus: d.Bus{{if .Partitioned}},
-					// 演示分区映射：租户 "tenant" → schema "{{.Name}}_tenant"。
+					// 演示分区映射：已验证分区键 "tenant" → schema "{{.Name}}_tenant"；
+					// 与行级租户 TenantID 独立，不能直接信任 unsigned 请求头。
 					// 真实部署改成从本服务的配置文件读取注入（config.Load 支持
 					// map[string]string），例如三体系：
 					//   {"merchant": "rbac_merchant", "ops": "rbac_ops", "agent": "rbac_agent"}

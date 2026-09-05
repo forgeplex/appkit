@@ -5,19 +5,24 @@ github.com/forgeplex/appkit，设计文档 docs/DESIGN.md）。
 {{- if .Partitioned}}
 
 **本仓库是分区域域**：一套代码、N 份数据分区，schema 由调用方确定——组合根
-注入分区映射（租户身份 → schema，见 cmd/{{.Name}}d/main.go 的演示），每次
-事务开启后 `SET LOCAL search_path` 路由到当前分区，查询与迁移因此全部
+注入分区映射（分区键 → schema，见 cmd/{{.Name}}d/main.go 的演示；分区键由
+authn.MultiIssuer 按令牌签发方确定，并由已验证 principal 重建进 callctx；
+unsigned X-Partition 只负责传输、不授信），
+每次事务开启后 `SET LOCAL search_path` 路由到当前分区，查询与迁移因此全部
 **无 schema 前缀**。新分区 = 组合根的映射加一条 + 重启，迁移自动建 schema。
-`make schema` 不适用本形态（`appkit schema` 会明确报错）。
+`make schema` 自动生成 **logical-template（逻辑模板）**：无前缀迁移只在一次性
+临时库的代表 schema `{{.Name}}` 回放一遍，未枚举或检查运行时分区。
 {{- end}}
 {{- if .Tenant}}
 
-**本仓库是租户域**：单 schema、行级隔离——业务表带 `tenant_id` 列并挂
-RLS 三件套（样例见 `db/migrations/0002_demo_notes.sql`，建真表照抄），
+**本仓库是租户域**：{{if .Partitioned}}每个分区内再按行隔离{{else}}单 schema、行级隔离{{end}}——业务表带 `tenant_id` 列并挂
+RLS 策略（样例见 `db/migrations/0002_demo_notes.sql`，建真表照抄），
 每次事务把租户身份（令牌 tid 焊入 callctx）落成事务级 GUC，策略据此过滤。
 隔离在存储层强制：SQL 漏写租户 WHERE 只会查不到行/写入被拒，不再静默泄漏；
-漏挂三件套的表服务拒绝启动（`pgtx.VerifyTenantRLS`）。数据库角色要求
-**非 superuser 且不带 BYPASSRLS**（部署清单记得配套）。
+漏挂策略的表服务拒绝启动（`pgtx.VerifyTenantRLS`）。跨租户的管理面读路径
+（运营看{{if .Partitioned}}本分区{{end}}全部租户）在用例里 `tx.WithReadAllTenants` 放开 SELECT，
+写入永远只落当前租户。数据库角色要求**非 superuser 且不带 BYPASSRLS**
+（部署清单记得配套）。
 {{- end}}
 
 ## 快速开始
@@ -27,9 +32,7 @@ appkit dev     # 生成 go.work，联调本地 appkit / 各域仓库（go.work �
 make run-minimal # ★ 显式零依赖试跑（仅 /healthz /readyz /ping，数据面未启用）
 make run-db    # 完整模式：自动起一次性开发 Postgres（docker）并注入 database.url
 make migrate   # 只应用迁移然后退出（生产上这一步跑在 initContainer/Job 里）
-{{- if not .Partitioned}}
-make schema    # 从迁移重新生成 db/SCHEMA.md 与 db/schema/（表结构总览 + ER 图）
-{{- end}}
+make schema    # 从迁移重新生成 db/SCHEMA.md 与 db/schema/（{{if .Partitioned}}logical-template，非运行时分区检查{{else}}表结构总览 + ER 图{{end}}）
 make check     # 架构检查（依赖方向 + SQL 跨 schema + 规则集漂移）
 make lint      # golangci-lint + go-arch-lint（钉版本经 go run，无需预装）
 make test
@@ -47,13 +50,12 @@ CI 都会校验未漂移（改松规则不会让检查变绿）。CI 先验漂�
 
 **已应用的迁移不可再改**：历史表存着每个文件的 sha256，改动已应用的文件会让服务
 以 `MIGRATION_DRIFT` 拒绝启动（错误信息里带修复命令）。改结构一律新增 `000N_*.sql`。
-{{- if .Partitioned}}
-迁移是一条追加日志，读不出「这张表现在长什么样」——schema 文档暂不支持分区域
-形态，建表时把 `COMMENT ON TABLE` 写进迁移就是当前最好的自描述手段。
-{{- else}}
 迁移因此是一条追加日志，读不出「这张表现在长什么样」——`make schema` 把它重放一遍，
 产出 `db/SCHEMA.md`（表清单 + ER 图）与 `db/schema/<表>.{sql,md}`，提交进仓库。
+{{- if .Partitioned}}
+这些产物明确标为 logical-template，只描述共享的逻辑结构，不证明各运行时分区一致。
 {{- end}}
+建表时在迁移里写 `COMMENT ON TABLE`；文档从迁移中的说明生成，不另存一份事实源。
 
 ## 结构
 
@@ -66,10 +68,8 @@ internal/http/           transport：实现合约生成的 server 接口，只�
 internal/inbox/          外域事件消费者：inbox 去重后调业务包
 internal/module/         装配层：Provide / Mount / Migrations / Health
 db/migrations/           {{if .Partitioned}}全无前缀（落位由分区路由）；0001 为 appkit 基础设施表{{else}}只允许操作 "{{.Name}}" schema；0001 为 appkit 基础设施表{{end}}
-{{- if not .Partitioned}}
-db/SCHEMA.md             ★ 看表结构从这进：表清单 + ER 图（make schema 生成，禁手改）
+db/SCHEMA.md             ★ 看表结构从这进：{{if .Partitioned}}逻辑模板总览 + ER 图{{else}}表清单 + ER 图{{end}}（make schema 生成，禁手改）
 db/schema/               每表一份 DDL 与详情页；框架表隔在 _appkit/
-{{- end}}
 db/queries/              sqlc 查询源；make gen 生成 internal/postgres/sqlc
 ```
 

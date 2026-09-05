@@ -218,19 +218,22 @@ ledger/                          # module github.com/forgeplex/ledger
 │                                #   外域契约一律绑 Remote client（见 §5）
 ├── internal/
 │   ├── ledger/                  # ★ 业务包：领域类型 + 不变量 + 业务逻辑/编排 + 所需接口
-│   │   ├── account.go           #   按功能分【文件】；域真的大了再按功能拆子包
-│   │   ├── posting.go  hold.go  #   （internal/account、internal/posting），而不是按层拆
-│   │   ├── service.go           #   编排：tx.Do 事务边界、outbox 发布、recovery point、审计
-│   │   ├── store.go             #   接口放消费方：Store 接口 + 外域窄接口（包住 contracts 类型）
-│   │   └── errors.go            #   错误 = apperr + contracts 错误码
+│   │   ├── account.go           #   按功能分【文件】，功能名前置成簇：account.go 放类型与
+│   │   ├── account_service.go   #   不变量，account_service.go 放该功能的用例（同一个 *Service）
+│   │   ├── posting.go  hold.go  #   域真的大了再按功能拆子包——嵌套在业务包下
+│   │   ├── service.go           #   （internal/ledger/account、internal/ledger/posting），
+│   │   ├── store.go             #   不按层拆、不拆成平级包（见下）
+│   │   └── errors.go            #   service.go 只留 Service 本体与公共件；store.go 接口放消费方
+│   │                            #   （Store 接口 + 外域窄接口）；errors.go = apperr + contracts 错误码
 │   │                            # 允许 import：stdlib、appkit 无驱动包（tx/money/apperr/outbox
 │   │                            #   接口面）、contracts 类型。禁止 pgx/gin/net/http（机检）
 │   ├── postgres/                # ★ 全 repo 唯一允许 import pgx/sqlc 的包；实现 ledger 包的接口
-│   │   ├── store.go
+│   │   ├── store.go             #   按表分文件，文件名 = 表名（复数）= db/queries 文件名
 │   │   └── sqlc/                #   sqlc 生成物，禁手改，CI drift check
 │   ├── http/                    # 对外 HTTP handler；契约端点直接挂 contracts 生成的
 │   │                            #   NewHTTPHandler(包 WrapService 的实现)；业务路由只做
 │   │                            #   DTO↔ledger 类型映射；禁业务规则/SQL（机检）
+│   │                            #   每个资源一个文件（account.go / posting.go），handler.go 只留装配与公共件
 │   ├── inbox/                   # 事件消费者：去重后调 ledger 业务包（处理外域事件）
 │   └── module/                  # Module 实现：Register 里装配路由/迁移/consumer/health
 ├── db/
@@ -256,6 +259,16 @@ ledger/                          # module github.com/forgeplex/ledger
 Go 惯例细节：`ledger.Service` 是具体 struct（accept interfaces, return structs），
 http 包直接依赖它，不为它预备接口；接口只出现在真正需要第二实现/测试替身的地方
 （Store、外部渠道、外域契约）。
+
+文件与子包怎么长（约定级，见 §7）：**按功能，不按层**。文件以功能名词前置成簇
+（`account.go` 类型与不变量、`account_service.go` 用例、`account_test.go`），
+`ls` 就按功能读得出结构；`service.go` 只留 Service 本体与公共件。域真的大了再把功能
+拆成**嵌套在业务包下**的子包（`internal/ledger/account`），父包留共享词汇，每个子包
+声明自己的窄 Store 接口、由 `internal/postgres` 一个结构体全部实现。两条禁令：
+不按层拆（`internal/ledger/model|service|repo` 是 DDD 楼阁回魂，包名读不出内容、
+必然 stutter）；不拆成平级包（`internal/account` 与 `internal/ledger` 平级会逃出
+上面三条约束的机检——depguard、go-arch-lint 与 `appkit check` 都按
+`internal/ledger/**` 圈定业务包，平级包里 import `net/http` 不会有任何告警）。
 
 ## 5. 组合 repo（psp）与组合机制
 
@@ -445,6 +458,12 @@ exp 必填，全部过验后注入 Actor。无 Authorization 头原样放行（�
 就绪状态。依赖方向单向：authn → 根包，组合根挂链（或 bootstrap 两行配置），
 根包不 import authn。
 
+多分区同进程（每个 rbac 分区一个 iss=`rbac-<分区键>`，可各配一把密钥）用
+`authn.MultiIssuer(map[iss]Issuer{Key, Partition})`：按令牌 iss 选公钥（伪造
+iss 只会取到别家的钥而验不过）、step-up 证明必须与访问令牌同一签发方；签发方
+配了 Partition 就把分区键焊进 `callctx.Meta.Partition`——与租户同一信任模型，
+令牌说了算。单签发方的 `Middleware` 是它的一个条目。
+
 **claims 布局 = 提供方契约**（照此签发即可写出第二个提供方、平替 rbac）：
 
 ```
@@ -476,15 +495,24 @@ Require 验**策略**（该码是否标了 Challenge、证明是否新鲜）。�
   unsigned 头与 ctx，authn 再从已验令牌 tid 焊入 callctx）与**存储层强制**
   （RLS，漏 WHERE 从泄漏变成查不到行/写入被拒）。
 
-三种形态，`appkit new domain` 一次选定（互斥）：
+四种形态，`appkit new domain` 一次选定：
 
 | 形态 | 生成 flag | 隔离方式 | 适用 |
 |---|---|---|---|
 | plain | （默认） | 单租户域，无隔离需求 | 域本身就是独占的 |
 | tenant | `-tenant` | 单 schema，行级（RLS） | 租户共享同一份数据模型，量级单库可容 |
-| partitioned | `-partitioned` | schema 级（每租户一套 schema） | 强隔离/合规要求，或单 schema 撑不住量级 |
+| partitioned | `-partitioned` | schema 级（每分区一套 schema） | 强隔离/合规要求，或单 schema 撑不住量级 |
+| partitioned + tenant | `-partitioned -tenant` | 两层：每分区一套 schema，分区内行级 | 「运营平台 + 多商户、每个平台一套数据」：分区 = 平台（部署期决定，加一个要重启），行 = 商户；运营是分区内 `tenant_id = platform` 的普通行，看全部商户走读全部模式 |
 
-tenant 形态的机制三件套（全部在 `pgtx`，DDL 库函数是唯一事实源）：
+两个维度在 `callctx` 里是两个字段：`Meta.Partition`（分区键，`pgtx.NewRouted`
+/ `NewRoutedTenant` 的路由函数读它）与 `Meta.TenantID`（业务租户，GUC 与 RLS
+读它）。曾经共用 TenantID 一个字段——rbac 的分区键 `demo` 经事件 meta 传播、
+被 email 域当业务租户查渠道，验证码邮件死信——是拆开的直接原因。分区键的
+可信来源与租户同构：`authn.MultiIssuer` 按令牌签发方焊入，X-Partition 头只在
+内部东西向存活。
+
+tenant 形态的机制四件（全部在 `pgtx`，DDL 库函数是唯一事实源；partitioned +
+tenant 用无前缀的 `TenantScopeSQLBare` / `TenantPolicySQLBare`，逐分区校验）：
 
 1. **身份焊接**（信任边界 + authn）：最外层先删除 `X-Tenant-Id`、
    清空 ctx 的 TenantID；验过的令牌 `tid` 再焊入 callctx。无 `tid`
@@ -496,12 +524,25 @@ tenant 形态的机制三件套（全部在 `pgtx`，DDL 库函数是唯一事�
    租户，不能被强租户卡死。策略函数 `appkit_current_tenant()` 在 GUC
    缺失时 RAISE（42501）而不是匹配零行：事务外直查业务表响亮失败，
    「查询成功但什么都看不见」才是危险形态。
-3. **RLS 三件套**（`pgtx.TenantPolicySQL`）：ENABLE + **FORCE** + 策略
-   （USING/WITH CHECK 都比对 tenant_id）。FORCE 必须有：应用角色通常
-   就是表主，不 FORCE 则 RLS 对它是装饰；WITH CHECK 拦住「把别家的
-   tenant_id 写进去」。启动期 `pgtx.VerifyTenantRLS` 校验完整性：有
-   tenant_id 列的表必须三件套齐，且连接角色不得 superuser/BYPASSRLS
-   （否则 RLS 静默不生效），缺一样拒绝启动、点名表并附修复 SQL。
+3. **RLS 策略**（`pgtx.TenantPolicySQL`）：ENABLE + **FORCE** + 隔离策略
+   （USING/WITH CHECK 都比对 tenant_id）+ 读全部策略（见 4）。FORCE 必须有：
+   应用角色通常就是表主，不 FORCE 则 RLS 对它是装饰；WITH CHECK 拦住「把
+   别家的 tenant_id 写进去」。启动期 `pgtx.VerifyTenantRLS` 校验完整性：有
+   tenant_id 列的表必须四件齐，且连接角色不得 superuser/BYPASSRLS
+   （否则 RLS 静默不生效），缺一样拒绝启动、点名表并附修复 SQL。输出可
+   重复应用（策略先 DROP IF EXISTS）：升级后在新迁移里再调一次即刷新。
+4. **读全部模式**（`tx.WithReadAllTenants`）：跨租户的管理面读路径——运营看
+   全部商户的订单、全局搜索、总览看板——在用例里过了跨租户权限码之后打
+   标记再 `Do`，事务落第二个 GUC `app.tenant_scope=all`，策略
+   `tenant_isolation_read_all` 只对 SELECT 放开全部行；写入仍走隔离策略，
+   永远只能落当前租户（"写全部"不存在——代某租户写要显式 `callctx.With`
+   切到目标）。三条边界是刻意的：标记是进程内 ctx 值、不进 callctx（防火墙
+   剥掉、事件不带，「读全部」不跨边界传播）；开关走独立 GUC、不走租户值那条
+   通道（否则一枚 tid 取特殊值的令牌就是全库可读）；标记须在最外层 Do 之前
+   打，嵌套 Do 内切换报错（SET LOCAL 延续到整个事务，savepoint 内切等于
+   静默扩权）。无租户 + 读全部是合法形态（系统级跨租户批处理）：策略函数
+   此时返回 NULL 而非 RAISE，读靠 read_all 策略放行，写的 WITH CHECK 比对
+   NULL 恒不成立。
 
 诚实标注的洞：组合根可配 Middleware 仍是受信代码，若它在边界内重新
 信任 unsigned 头，框架不是恶意 wiring 的沙箱；superuser 绕过靠 Setup 期
@@ -531,6 +572,14 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 
 | 规则 | 落点 | 强度 |
 |---|---|---|
+| 同契约的多个实例不误回退到无名绑定 | `ProvideContractNamed` / `ResolveNamed` 精确匹配 `(Go 类型, 实例名)`，共享启动期重复/缺失/循环检查 | ▲ 运行时装配级；名字不是租户隔离或消费方 binding manifest |
+| Agent 不用旧生成结果覆盖已修改的目标 | plan 绑定输入及全部输出的选定文件快照，`apply` 在协作锁内复核；schema 另绑定迁移/产出目录成员 | ▲ 工具运行时级；非整个仓库摘要，外部编辑器不受锁约束 |
+| 多文件生成失败可恢复 | 同文件系统暂存、备份、持久日志、回滚与 exact-plan replay | ▲ 工具运行时级；非外部读者的全局原子可见性，非授权/签名证明 |
+| 契约生成检查不改工作区 | `gen contract -check` 复用内存 renderer，比对五份产物 | ▲ 本地/CI 级；不等于跨版本语义兼容检查 |
+| 复用模块升级不靠肉眼猜测 | `internal/acceptance` 的四个独立 Go module 验证两消费者共享实现、兼容升级与指定编译拒绝；含本地/HTTP 边界断言 | ▲ 测试/CI 级；只证明夹具及断言范围，不是任意业务语义证明 |
+| 契约升级的结构性破坏可提前发现 | `contract-check` 比较 AppKit contract.yaml 模型的方法、字段、类型、路径及重试语义 | ▲ 本地/CI 级；候选模型门禁，不替代通用 OpenAPI、滚动版本或消费方测试 |
+| Agent 初始化/单文件生成共享同一事实源 | events/errors/wrap 使用捕获字节的纯 renderer；new 的直接生成和计划复用内置模板及 DDL 库函数 | ▲ 工具运行时级；new 只 create，wrap 显式选接口源文件 |
+| Schema 计划不漏掉新增迁移或误清手写文件 | 捕获迁移内容为不可变 fs.FS；v1alpha2 绑定迁移及输出目录成员；只为带生成头的旧文档规划删除 | ▲ 工具运行时级；SQL 在授权的临时库执行而非沙箱，apply 是离线文件变更 |
 | 域 repo 互不依赖、看不到彼此实现 | 独立 module + internal/ + CI 检查 go.mod require 清单 | ★ 编译器级，不可绕过 |
 | 跨域只经契约类型 | 唯一可见类型就是 contracts 生成接口 | ★ 编译器级 |
 | 契约/事件/错误码单一事实源 | 只有生成物，无手写类型 | ★ 生成级 + drift check |
@@ -545,18 +594,20 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 启动装配改不坏 | `bootstrap.Main` 收走 main() 的固定装配，代码在 module cache（0444 只读）；用户仓库的 main 只声明模块清单 | ▲ 物理级：改不动，但可绕开自己写 main（骨架默认不绕） |
 | HTTP 安全模式不能遗漏 | `App.Run` 在进入迁移/Setup/监听前验证 `SecurityMode`；bootstrap 还要求 `security.mode`，并把 `disabled` 限于 `env=dev`；`App.Migrate` 显式豁免 | ▲ 运行时 + 装配级：零值不能 Run，但直接构造 App 的调用方可显式选 `SecurityDisabled`（测试需要这个逃生口） |
 | 严格模式没有未分类根路由 | Registry 记录 Public/Authenticated/Permission/InternalService，全部 Setup 后、listen 前校验模式矩阵；分类 API 同时包上用户/权限/服务 guard | ▲ 运行时守卫：受信组合根的 Middleware 仍可短路 `next` 或在边界内注入 principal，不是对任意 wiring 的沙箱 |
-| 网络身份输入不继承为可信 ctx | 严格模式的 `identityBoundary` 强制在可配 Middleware 最外层，清 Actor/ServicePrincipal/tenant/caller 及三个 unsigned 头；`HTTPServer` Option 之后强制恢复根 handler | ▲ 运行时信任边界：中间件顺序和 Handler Option 不能把边界挪掉，但边界内的受信 Middleware 若重新信头仍可自伤 |
+| 网络身份输入不继承为可信 ctx | 严格模式的 `identityBoundary` 强制在可配 Middleware 最外层，清 Actor/ServicePrincipal/partition/tenant/caller 及四个 unsigned 头；`HTTPServer` Option 之后强制恢复根 handler | ▲ 运行时信任边界：中间件顺序和 Handler Option 不能把边界挪掉，但边界内的受信 Middleware 若重新信头仍可自伤 |
 | 服务身份验证 | 已有 `ServicePrincipal` 落点、InternalService guard 与模式矩阵；bootstrap 对 internal/mixed fail-closed | ✗ 验证器尚未落地：待补 service JWT 的 iss/aud/sub/exp/iat/kid 与委托范围 |
 | pprof 不暴露在用户面 | `user_facing + Pprof` 启动拒绝；internal/mixed 的每个 pprof handler 包 InternalService guard；disabled 仅作 bootstrap `env=dev` / 直接 App 测试 | ▲ 运行时：服务主体守卫已在，但 bootstrap 在验证器落地前不启用 internal/mixed |
 | 规则集不被改松 | `appkit check` 内联 `ruleset.Check`（配置缺失同样算漂移），不再只靠 CI 那一步 | ▲ 本地+CI 级 |
 | 已应用的迁移不可变 | 历史表存内容 sha256，启动期逐个比对，不符即 `MIGRATION_DRIFT` 拒绝启动；`.gitattributes` 钉 `*.sql eol=lf` 消除跨平台误报 | ★ 运行时级，启动即暴露 |
-| 分区域域的 schema 由调用方确定 | 迁移/查询无前缀 + 事务级 `SET LOCAL search_path`（`pgtx.NewRouted` 按 `callctx.Meta.TenantID` 查组合根注入的映射）；查询必须经 `tx.Do`，事务外落默认 search_path 即「表不存在」报错 | ★ 运行时级：路由失败（查无分区）即回滚 422，无法静默落到错误分区 |
+| 分区域域的 schema 由调用方确定 | 迁移/查询无前缀 + 事务级 `SET LOCAL search_path`（`pgtx.NewRouted` 按 `callctx.Meta.Partition` 查组合根注入的映射）；查询必须经 `tx.Do`，事务外落默认 search_path 即「表不存在」报错 | ★ 运行时级：路由失败（查无分区）即回滚 422，无法静默落到错误分区 |
+| 分区键与业务租户不共用一个字段 | `callctx.Meta.Partition` 与 `Meta.TenantID` 各自一个字段、各自的头（X-Partition / X-Tenant-Id）与事件 meta 键；分区路由只读前者、RLS 只读后者。此前共用 TenantID 的判例：rbac 的分区键经事件 meta 传播、被 email 域当业务租户查渠道，验证码邮件死信 | ★ 编译器级：两个维度类型上就分开；存量域改读 `Partition` 是一次性迁移（rbac 尚未切） |
 | 分区域域的 SQL 无前缀纪律 | `partitioned: true` 时 archcheck 前缀规则翻转（任何 schema 前缀违规，无 DB 即拦）；sqlc 编译器兜底——带前缀与无前缀两个世界各自封闭，混写双向都是编译错误 | ▲ CI 级 + ★ 编译器级 |
-| 单 schema 域跨租户泄漏 | RLS 三件套（ENABLE+FORCE+策略，`pgtx.TenantPolicySQL`）+ 事务级 GUC（`pgtx.NewTenant` 的 Do）；Setup 期 `pgtx.VerifyTenantRLS` 校验完整性（缺三件套/角色 superuser 或 BYPASSRLS 即拒启，点名表并附修复 SQL） | ★ 运行时级：漏写 WHERE 只会查不到行/写入被拒，且缺件启动即暴露 |
-| 租户身份来源唯一（令牌 tid） | 严格 HTTP 边界先清除 ctx tenant 与 `X-Tenant-Id`，authn 验签后再把 tid 焊进 callctx；公开端点也看不到 unsigned tenant 头 | ▲ 中间件级：标准 bootstrap 链路可执行；自写受信 Middleware 仍可错误地从头重建 |
-| schema 文档支持分区域域 | 暂无：`appkit schema` 对 `partitioned: true` 明确报错（分区映射由组合根注入，域仓库无从枚举；先想清楚「按分区画还是按逻辑模型画」再补） | ✗ 尚未落地（写在这里是为了不假装它已生效） |
+| 租户域跨租户泄漏 | RLS（ENABLE+FORCE+隔离策略+读全部策略，`pgtx.TenantPolicySQL`）+ 事务级 GUC（`pgtx.NewTenant` / `NewRoutedTenant` 的 Do）；Setup 期 `pgtx.VerifyTenantRLS` 校验完整性（缺任一件/角色 superuser 或 BYPASSRLS 即拒启，点名表并附修复 SQL） | ★ 运行时级：漏写 WHERE 只会查不到行/写入被拒，且缺件启动即暴露 |
+| 跨租户读只能是显式、只读、不传播 | `tx.WithReadAllTenants` 是进程内 ctx 标记（不进 callctx：防火墙剥掉、事件不带）；落成第二个 GUC `app.tenant_scope`，与租户值那条通道（令牌 tid）分离；策略只对 SELECT 放开，写入的 WITH CHECK 不变；标记须在最外层 Do 之前打，嵌套内切换报错 | ★ 存储级：写全部模式不存在；「谁能打标记」归 `reg.Require` 跨租户码 + 用例纪律（约定级） |
+| 分区与租户身份只能来自已验证凭证 | 严格 HTTP 边界先清除 ctx partition/tenant 与 `X-Partition` / `X-Tenant-Id`，authn 验签后把 tid 焊进 callctx（无值清零）；`authn.MultiIssuer` 从签发方配置重建 Partition；公开端点也看不到 unsigned 身份 | ▲ 中间件级：标准 bootstrap 链路可执行；自写受信 Middleware 仍可错误地从头重建；服务身份验证器尚未落地 |
+| schema 文档支持分区域域 | `partitioned: true` 自动生成 logical-template：无前缀迁移在代表 schema 回放一次，全部文档显式标记；分区＋tenant 的 RLS 同步呈现 | ▲ 工具/CI 级；只证明逻辑模板，未枚举或检查运行中分区；未启用文档的仓库仍 notice 放行 |
 | 没人跑迁移不可能 | 登记了迁移却既无 `Migrator` 又无 `SkipMigrations()` → 启动报错；`-migrate` 无 `database.url` 亦报错 | ★ 装配级 fail-fast |
-| schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`，产出因此是迁移的纯函数；CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（分区、生成列、继承…）点名报错而非静默输出残缺 DDL；RLS 如实渲染成 DDL（含策略三件套，策略被删/FORCE 被摘即漂移），未 ENABLE 的装饰态点名标注 | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行。代价是从不启用的仓库永远不被检查；跑过一次 `make schema` 就永久转严。新增检查随 appkit release + sync 显式进入下游，不会由 main 突然扩散。 |
+| schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`；在固定数据库环境、可复现迁移下生成确定性文档，不承诺跨 PostgreSQL/扩展/模板库或随机 SQL 的绝对纯函数。CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（原生分区表、生成列、继承…）点名报错；RLS 如实渲染（策略被删/FORCE 被摘即漂移） | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行；从不启用的仓库永远不被检查，跑过一次 `make schema` 就永久转严。新增检查随 appkit release + sync 显式进入下游，不会由 main 突然扩散。 |
 | 表有说明（`COMMENT ON TABLE`） | 缺的表在 `db/SCHEMA.md` 表清单里标 ⚠ 缺说明并给出该补的那一句；`appkit schema -check` 在 CI 里逐表打 `::warning` 注解 | ▲ 软约束：不阻断 CI（刻意的，存量仓库不会突然红），且 `db/SCHEMA.md` 带 `linguist-generated` 在 PR diff 里默认折叠——⚠ 没人主动打开就看不见，::warning 注解是让它浮出水面的那一半 |
 | 长驻任务死了必被发现 | `Registry.Worker` 托管：异常退出上报主循环并触发关停（不再是"探针绿着、事件停摆"） | ★ API 设计级 |
 | ctx 只能传白名单元数据 | `callctx.Meta` 是具名字段的 struct 而非 map，防火墙剥值后只放回它 | ★ 编译器级：塞不进去 |
@@ -570,6 +621,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 权限判定语义统一（集合包含 + step-up 新鲜度） | `MountPermission` / `reg.Require` 共用唯一判定实现，401/403/STEP_UP 矩阵在框架；业务域不再各写一份会漂移的判定 | ★ API 设计级 |
 | 验签只在 authn 一处、模块不自解凭证 | 组合根挂链 + 脚手架注释教学 | ▲ 提高绕过成本：模块仍可自解 Authorization 头绕过，无机制挡 |
 | 列表端点分页形态统一（limit 解析/游标编码/响应信封） | `page` 包：`Parse` 值域校验（畸形 422，不静默裁剪）+ 游标不透明编解码（JSON→base64url）+ `List` 信封 + `Trim` 的 limit+1 多取一行技巧；机制归框架，排序键与 keyset SQL 归域 | 约定级：用不用在域，自写手翻页无机检——形态统一靠采纳与 review |
+| 业务包 / transport 文件按功能成簇、子包只嵌套在业务包下 | 脚手架 AGENTS.md「文件怎么分」+ §4；三条方向性约束的机检（depguard / go-arch-lint / archcheck）都按 `internal/<domain>/**` 圈定业务包，嵌套子包自动纳入 | 约定级：文件命名与「不按层拆」没有 lint 落点；「不拆平级包」的后果（逃出机检）是靠规程点名的，不是工具拦的——文件行数检查器不存在，别假装有 |
 
 逃生舱（防止约束被政治性推翻）：带理由的 `//nolint`（nolintlint 强制）、
 go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走**事件驱动读模型**
@@ -583,10 +635,10 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
 - **分区域域（`appkit new domain <name> -partitioned`）**：一套代码、N 份数据分区，
   schema 由调用方确定。场景是 psp 的商户/运营/代理商三套独立用户体系共用一份
   rbac 域代码但数据要强隔离——体系 A 的查询根本看不到体系 B 的表，漏过滤的失败
-  形态是「表不存在」而不是「数据泄露」。机制三件套：① 分区映射（租户身份 →
+  形态是「表不存在」而不是「数据泄露」。机制三件套：① 分区映射（分区键 →
   schema）**定义在组合根自己的配置文件**（koanf 原生支持 `map[string]string`），
   由组合根读取后经 `module.Options.Schemas` 注入——框架不暗读全局配置；②
-  `pgtx.NewRouted` 每次 `Do` 开启事务后按 `callctx.Meta.TenantID` 解析分区并
+  `pgtx.NewRouted` 每次 `Do` 开启事务后按 `callctx.Meta.Partition` 解析分区并
   `SET LOCAL search_path`（事务结束自动还原，连接归还池时不带走）；③ 迁移与
   查询全部无 schema 前缀，同一份无前缀 FS 经 `reg.Migrations` 注册到每个分区，
   pgmigrate 应用前同样 `SET LOCAL` 并自动建 schema——**新分区 = 组合根映射加一条
@@ -594,12 +646,13 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   `pgtx.From` 落在默认 search_path 上，无前缀表不存在即报错（失败响亮，绝不
   静默读写错误分区）。带前缀世界与无前缀世界各自封闭：混写形态在 sqlc 编译
   与 `appkit check` 双向都是硬错误，跨域访问的静态保证从 archcheck 前缀扫描
-  **转移**为 sqlc 编译解析，强度不降级。已知的洞：`appkit schema` 暂不支持
-  该形态（明确报错而非产出误导内容，见 §7）。
-- **租户域（`appkit new domain <name> -tenant`）**：单 schema、行级隔离，
-  机制与边界见 §5.5。选型对照：租户共享同一份数据模型、量级单库可容 →
-  tenant；强隔离/合规或单 schema 撑不住量级 → partitioned；域本身独占 →
-  默认。三种形态一次选定、互斥生成。
+  **转移**为 sqlc 编译解析，强度不降级。`appkit schema` 对该形态生成明确标记的
+  logical-template，仅检查迁移定义的逻辑模型，不枚举组合根的运行时分区，见 §7。
+- **租户域（`appkit new domain <name> -tenant`）**：行级隔离，机制与边界见
+  §5.5。选型对照：租户共享同一份数据模型、量级单库可容 → tenant；强隔离/
+  合规或单 schema 撑不住量级 → partitioned；平台级物理隔离 + 平台内多商户
+  → 两个 flag 同给（`pgtx.NewRoutedTenant`，租户 DDL 用无前缀形态，逐分区
+  校验）；域本身独占 → 默认。形态一次选定。
 - **迁移的施加时机是部署决策**：默认随进程启动（多副本经 advisory lock 串行，安全但
   N 个副本同时改 schema）；规模上来后改为 initContainer/Job 里跑 `<svc> -migrate`
   （只应用迁移即退出，不监听端口），服务副本再以 `appkit.SkipMigrations()` 起来。

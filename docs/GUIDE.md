@@ -156,11 +156,14 @@ appkit new domain rbac -partitioned -dir rbac
 与普通域的三点不同：
 
 1. **schema 由调用方确定**。迁移与查询全部**不带 schema 前缀**；每次 `tx.Do`
-   开启事务后按可信的 `callctx.Meta.TenantID` 执行
-   `SET LOCAL search_path` 路由到对应分区。严格 HTTP 模式会在最外层删掉
-   `X-Tenant-Id` 并清空 ctx 的预置值；租户只能由边界内的验签器从已签名
-   凭证重建，不能把头当身份。漏过滤的失败形态是「表不存在」，
-   而不是「看到了别家的数据」。
+   开启事务后按调用方的分区键（`callctx.Meta.Partition`）`SET LOCAL search_path`
+   路由到对应分区。分区键的来源与租户同构：认证请求由 `authn.MultiIssuer`
+   按令牌签发方焊入（iss=`rbac-a` ↔ 分区 `a`）。严格 HTTP 模式会在最外层
+   清除 `X-Partition` / `X-Tenant-Id` 及预置的分区/租户，必须由已验证凭证
+   重建，不能只凭东西向头信任身份。事件 meta 可以携带分区，但消费者须
+   保证消息来自可信链路。它与 `Meta.TenantID`（业务租户）是两个字段——分区
+   决定落哪个 schema，租户决定看哪些行，别混。漏过滤的失败形态是「表不
+   存在」，而不是「看到了别家的数据」。
 2. **分区映射由组合根注入**，定义放组合根自己的配置文件：
 
    ```yaml
@@ -181,8 +184,9 @@ appkit new domain rbac -partitioned -dir rbac
    落在默认 search_path 上，无前缀表不存在即报错。这是响亮失败的安全网，
    但纪律本身不例外。
 
-已知的洞：`make schema`（schema 文档）暂不支持该形态，`appkit schema` 会明确
-报错；`COMMENT ON TABLE` 写进迁移就是当前的自描述手段。跨域调用的静态保证
+`make schema` 对该形态生成明确标记的逻辑模板（logical-template）：在代表 schema
+回放一次无前缀迁移，不枚举运行中的分区；`COMMENT ON TABLE` 仍应写进迁移。
+跨域调用的静态保证
 不降级：带前缀与无前缀两个世界各自封闭，混写在 sqlc 编译与 `appkit check`
 双向都是硬错误（DESIGN §8）。
 
@@ -208,12 +212,15 @@ appkit new domain docs -tenant -dir docs
 2. **事务自动带租户**：`pgtx.NewTenant(pool)` 的 `Do` 开事务后把租户身份落成
    事务级 GUC `app.tenant_id`（连接归池即净）。基础设施表（outbox/幂等/审计）
    无租户、不受影响。
-3. **RLS 三件套**：建租户表的迁移里，`tenant_id text NOT NULL` 列 + 以
+3. **RLS 策略**：建租户表的迁移里，`tenant_id text NOT NULL` 列 + 以
    tenant_id 打头的索引 + `pgtx.TenantPolicySQL` 的输出（ENABLE + **FORCE** +
-   策略）——生成物 `db/migrations/0002_demo_notes.sql` 就是照抄模板。含义：
-   SQL 里漏写租户 WHERE，只会**查不到**别的租户的行；把别家的 tenant_id
-   写进去，直接被拒。漏挂三件套的表，服务启动时被 `pgtx.VerifyTenantRLS`
-   点名拒绝（module.go 的 Setup，错误信息附修复 SQL）。
+   隔离策略 + 读全部策略）——生成物 `db/migrations/0002_demo_notes.sql` 就是
+   照抄模板。含义：SQL 里漏写租户 WHERE，只会**查不到**别的租户的行；把
+   别家的 tenant_id 写进去，直接被拒。漏挂的表，服务启动时被
+   `pgtx.VerifyTenantRLS` 点名拒绝（module.go 的 Setup，错误信息附修复 SQL）。
+   输出可重复应用：升级 appkit 后在新迁移里对每张租户表再调一次
+   `TenantScopeSQL` + `TenantPolicySQL` 即刷新（旧形态只有隔离策略的表，
+   verify 会点名要求补）。
 4. **角色要求**：连接角色必须是**非 superuser 且不带 BYPASSRLS**——否则 RLS
    静默不生效，verify 同样会拦。一条 SQL 的事：
 
@@ -223,16 +230,58 @@ appkit new domain docs -tenant -dir docs
    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA docs TO docs_app;
    ```
 
-逃生舱（不在 API 里，写在这里）：跨租户批处理逐租户 `callctx.With(ctx,
+跨租户的**读**有正门：管理面用例（运营看全部商户的订单、全局搜索、总览
+看板）先过跨租户权限码，再打标记后开事务——
+
+```go
+// internal/order/service_admin.go —— 运营视角：跨租户分页
+func (s *Service) AllOrders(ctx context.Context, f AdminFilter, page Page) ([]AdminOrderView, error) {
+    ctx = tx.WithReadAllTenants(ctx) // handler 已 Require("order:read_all")
+    return s.txr.Do(ctx, func(ctx context.Context) error { /* 照常查，RLS 对 SELECT 放开全部行 */ })
+}
+```
+
+只放开 SELECT：写入仍只能落当前租户，代某商户写要显式
+`callctx.With(ctx, callctx.Meta{TenantID: 目标})` 切过去再 `Do`。标记是进程内
+ctx 值——不进 callctx、契约防火墙剥掉、事件不带，「读全部」不跨边界传播；
+标记必须在最外层 `Do` 之前打，嵌套 `Do` 内切换直接报错。无租户 + 读全部
+是合法形态（系统级跨租户批处理），此时写入照样被拒。
+
+逃生舱（不在 API 里，写在这里）：逐租户写的批处理 `callctx.With(ctx,
 callctx.Meta{TenantID: t})` + `Do`，循环即得；迁移内跨租户回填数据时，把
-回填语句放在挂 policy 的三件套**之前**（同一文件内 DDL 顺序自控）。
+回填语句放在挂 policy 的语句**之前**（同一文件内 DDL 顺序自控）。
 
 schema 文档支持本形态：RLS 如实渲染进 `db/schema/<表>.sql`，策略被删或
 FORCE 被摘，CI 漂移检查跟着变红。租户模型本身（层级、生命周期、目录表）
 是业务语义，归各域与 rbac/identity——框架只管「身份从哪来、存储怎么隔」。
 
-三种形态怎么选：域本身就是独占的 → 默认；租户共模型、量级可容 → `-tenant`；
-强隔离/合规要求或单 schema 撑不住 → `-partitioned`（§3.1）。互斥，一次选定。
+### 3.3 变体：分区 + 行级（每个平台一套 schema，平台内多商户）
+
+「N 个运营平台、每个平台下 M 个商户、平台之间数据各自独立」——两个 flag
+同给：
+
+```sh
+appkit new domain order -partitioned -tenant -dir order
+```
+
+分区 = 平台（schema 级，`Meta.Partition` 路由），行 = 商户（`tenant_id` + RLS，
+`Meta.TenantID`）。装配用 `pgtx.NewRoutedTenant(pool, route)`：每次 `Do` 先
+`SET LOCAL search_path` 到分区，再落租户 GUC；迁移全无前缀，租户 DDL 用
+`pgtx.TenantScopeSQLBare` / `TenantPolicySQLBare`（生成物已就位）；Setup 期
+逐分区 `VerifyTenantRLS`。运营人员是分区内 `tenant_id = platform` 的普通
+用户，看本平台全部商户走 §3.2 的读全部模式——「全部」的边界是 schema，
+平台 a 的运营在任何模式下都碰不到平台 b 的表。
+
+判据只有一条：**平台是部署期决定的**（分区映射是组合根配置，加一个要
+重启）。平台要运行时入驻、数量无上界的系统不该用这个形态，那是单 schema
+两级租户模型的活（层级路径列），本框架暂未提供。
+
+四种形态怎么选：域本身就是独占的 → 默认；租户共模型、量级可容 → `-tenant`；
+强隔离/合规要求或单 schema 撑不住 → `-partitioned`（§3.1）；平台级物理隔离
++ 平台内多商户 → 两个同给（§3.3）。一次选定。
+多个租户域 + 分区域的 rbac 怎么拼成「运营平台 + 多商户」的完整系统
+（租户身份分层、跨租户管理、组合根拆分），见进阶教程
+[TENANTS.md](TENANTS.md)。
 
 ## 4. 第三步：写第一个用例（identity 的"创建用户"）
 
@@ -434,11 +483,19 @@ COMMENT ON COLUMN identity.credentials.secret IS '密文，明文永不落库。
 ```
 
 **产出禁手改**：`appkit schema -check` 在 CI 里比对，缺文件、被手改、以及删表之后
-残留的陈旧文件都算漂移。渲染不了的特性（分区表、生成列、RLS、表继承……）不会被
+残留的陈旧文件都算漂移。RLS 开关、FORCE 与策略会如实渲染；渲染不了的特性
+（PostgreSQL 原生分区表、生成列、表继承……）不会被
 静默略过——命令会点名那张表并失败，因为一份看起来像 DDL 却漏了约束的文件比没有更危险。
 
 还没启用的仓库（`db/SCHEMA.md` 与 `db/schema/` 都不存在）CI 只打一条提示后放行；
 跑过一次 `make schema` 并提交产出，这个仓库就永久转严。
+
+`partitioned: true` 的域同样支持，但产物明确标为 `logical-template`：无前缀迁移
+在代表 schema（domain 名）回放一次，表示每个分区应有的逻辑模型，不枚举或检查
+运行中的分区。`-partitioned -tenant` 的 RLS 也包含在模板中。这与 PostgreSQL
+原生分区表是两回事；直接命令可用 `-mode logical-template` 断言模式，`-timeout 2m`
+控制回放期限。需要先审查再改文件时，使用 `appkit plan schema -allow-temp-db`，
+流程与可信 SQL/临时库权限边界见 [AGENT_WORKFLOW.md](AGENT_WORKFLOW.md)。
 
 启用之后，缺 `COMMENT ON TABLE` 的业务表有两处会被点名：生成文档里的 ⚠ 缺说明，
 以及 CI 里 `appkit schema -check` 逐表打的 `::warning` 注解（GitHub 摘要与 PR
@@ -1055,6 +1112,20 @@ appkit.Middleware(authn.Middleware(pub, issuer)),
 appkit.Security(appkit.SecurityUserFacing),
 ```
 
+多分区同进程（N 个 rbac 分区，每个一个 iss=`rbac-<分区键>`）用多签发方形态，
+同时显式配置安全模式；分区键焊进 `callctx`（分区域 / 分区 + 行级的域据此路由）：
+
+```go
+appkit.Middleware(authn.MultiIssuer(map[string]authn.Issuer{
+    "rbac-a": {Key: pubA, Partition: "a"},
+    "rbac-b": {Key: pubB, Partition: "b"}, // 可各配一把密钥，缩小泄露半径
+})),
+appkit.Security(appkit.SecurityUserFacing),
+```
+
+按令牌 iss 选公钥（伪造 iss 只会取到别家的钥而验不过）；step-up 证明必须与
+访问令牌同一签发方；未知 iss 401。
+
 行为约定：无 Authorization 头时，验签中间件本身不报错；`MountPublic`
 可继续，`MountAuthenticated` / `MountPermission` 的守卫返回 401。有头但
 验不过必须 401——坏凭证是攻击不是匿名，不静默降级。唯一例外是内建
@@ -1082,7 +1153,7 @@ step-up 令牌），重试时放进 `X-Step-Up` 头；框架验它的签名、is
 - **step-up 令牌**（`X-Step-Up`）：JWT / EdDSA；`iss`、`sub`（与访问令牌
   一致）、`exp`、`purpose="step-up"`、`iat`；
 - **密钥与 iss**：Ed25519 公钥交组合根配置，iss 唯一标识提供方（多分区
-  各自一个 iss）。
+  各自一个 iss，组合根经 `authn.MultiIssuer` 把 iss 映射到分区键）。
 
 两个注意：权限是令牌快照，变更（授/撤）在令牌过期后才生效——需要即时
 生效的码，提供方把对应令牌的 `exp` 签短一点；拆分部署时每个服务**自己**
@@ -1181,8 +1252,8 @@ keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可
 | 改数据库结构 | 新增 `000N_xxx.sql`（建表同一文件里写 `COMMENT ON TABLE`）+ `make schema` | 改已应用的迁移文件（启动报 MIGRATION_DRIFT）；手改 `db/schema/`（CI 报漂移） |
 | 搞清楚现有表长什么样 | 读 `db/SCHEMA.md` / `db/schema/<表>.sql` | 翻整条迁移历史在脑子里重放 |
 | 加业务指标 | `otel.Meter("你的域名")` 自建 | 往框架指标上加标签（基数无界） |
-| 传 request id / 租户 | 用 `callctx.Meta`；严格 HTTP 入站仅保留 request id，tenant/caller 必须由已验凭证重建 | 把 unsigned `X-Tenant-Id` / `X-Caller` 当身份（最外层边界删除） |
-| 多租户的数据隔离 | 生成时选形态：`-tenant`（RLS 行级）/ `-partitioned`（schema 级，§3.1）；建租户表照抄 0002 样例（tenant_id + 索引 + 三件套） | 手写 `WHERE tenant_id = ...` 满代码（漏一条就是静默泄漏）；业务代码读 `X-Tenant-Id` 头（严格边界删除） |
+| 传 request id / 分区 / 租户 | 用 `callctx.Meta`；严格 HTTP 入站仅保留 request id，partition/tenant/caller 必须由已验凭证重建 | 把 unsigned `X-Partition` / `X-Tenant-Id` / `X-Caller` 当身份（最外层边界删除） |
+| 多租户的数据隔离 | 生成时选形态：`-tenant`（RLS 行级）/ `-partitioned`（schema 级，§3.1）/ 两个同给（平台一套 schema + 平台内商户分行，§3.3）；建租户表照抄 0002 样例；跨租户读用 `tx.WithReadAllTenants`（只放开 SELECT） | 手写 `WHERE tenant_id = ...` 满代码（漏一条就是静默泄漏）；业务代码信任 unsigned 身份头；靠 BYPASSRLS 角色或「缺 GUC = 看全部」给运营开口子 |
 | 列表端点 | `page.Parse` + `page.Decode[T]` + keyset SQL + `page.Trim` + `page.List` 信封（排序键必加 id 兜住同刻并列） | 自发明游标格式/自解析 limit（一个仓库很快两三种格式并存）；OFFSET 深翻页（线性变慢 + 页间漂移） |
 | 确认拆分部署不会变行为 | 提供方域仓库里写一条 `apptest.Conform`（local + remote 两个绑定） | 只测本地实现（远程那条路径第一次跑就是在生产） |
 
@@ -1217,3 +1288,17 @@ keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可
 （lint/CI 配置、sqlc 产物、基础迁移）留在你仓库里但带生成头，改了会被
 `appkit check` 拦下——包括"把规则改松"这一手。你写的代码在 `internal/`，
 和上面两类不共处一处。
+
+## Agent 的计划/应用与命名实例
+
+对多个 AI Agent 维护的仓库，流程是 `appkit plan sync|contract|events|errors|wrap|new` 先生成只读计划，
+审查后 `appkit apply -plan <file>`；存在输入/输出漂移就拒绝应用。
+schema 文档使用 `appkit plan schema -allow-temp-db`：临时库执行需显式授权，
+不写目标文件；计划还绑定迁移/输出目录成员，apply 无需数据库。
+`appkit gen contract -check` 可独立检查契约产物，无需先覆盖生成文件。
+`appkit contract-check -base <yaml> -candidate <yaml>` 检查 AppKit 契约模型的保守兼容规则；
+真实跨项目复用/升级与 PostgreSQL 验收入口见 [FRAMEWORK_ACCEPTANCE.md](FRAMEWORK_ACCEPTANCE.md)。
+同一契约需要多份实现时使用 `ProvideContractNamed` / `ResolveNamed` / `RemoteNamed`，
+保持实例名与 tenant / partition / merchant 身份分离。
+
+完整可执行示例、JSON 协议、退出码和恢复限制见 [AGENT_WORKFLOW.md](AGENT_WORKFLOW.md)。

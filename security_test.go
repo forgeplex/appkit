@@ -178,10 +178,12 @@ func TestIdentityBoundaryDropsUnverifiedIdentityAndAllowsVerifiedRebuild(t *test
 			_, hasActor := ActorFrom(r.Context())
 			_, hasService := ServicePrincipalFrom(r.Context())
 			m := callctx.From(r.Context())
-			verifierSawUntrusted = hasActor || hasService || m.TenantID != "" || m.Caller != "" ||
+			verifierSawUntrusted = hasActor || hasService || m.Partition != "" || m.TenantID != "" || m.Caller != "" ||
+				r.Header.Get(callctx.HeaderPartition) != "" ||
 				r.Header.Get(callctx.HeaderTenantID) != "" || r.Header.Get(callctx.HeaderCaller) != "" ||
 				r.Header.Get("X-Merchant-Id") != ""
 
+			m.Partition = "verified-partition"
 			m.TenantID = "verified-tenant"
 			ctx := callctx.With(WithActor(r.Context(), Actor{UserID: "verified-user", TenantID: m.TenantID}), m)
 			next.ServeHTTP(w, r.WithContext(ctx))
@@ -200,11 +202,12 @@ func TestIdentityBoundaryDropsUnverifiedIdentityAndAllowsVerifiedRebuild(t *test
 	h := app.wrap(target)
 
 	req := httptest.NewRequest(http.MethodGet, "/private", nil)
+	req.Header.Set(callctx.HeaderPartition, "forged-header-partition")
 	req.Header.Set(callctx.HeaderTenantID, "forged-header-tenant")
 	req.Header.Set(callctx.HeaderCaller, "forged-caller")
 	req.Header.Set("X-Merchant-Id", "forged-merchant")
 	ctx := callctx.With(req.Context(), callctx.Meta{
-		RequestID: "req-1", TenantID: "forged-context-tenant", Caller: "forged-context-caller",
+		RequestID: "req-1", Partition: "forged-context-partition", TenantID: "forged-context-tenant", Caller: "forged-context-caller",
 	})
 	ctx = WithActor(ctx, Actor{UserID: "forged-user"})
 	ctx = WithServicePrincipal(ctx, ServicePrincipal{Subject: "forged-service"})
@@ -218,7 +221,7 @@ func TestIdentityBoundaryDropsUnverifiedIdentityAndAllowsVerifiedRebuild(t *test
 	if verifierSawUntrusted {
 		t.Fatal("验签中间件看到 unsigned header 或边界外预置 principal")
 	}
-	if !gotActorOK || gotActor.UserID != "verified-user" || gotMeta.TenantID != "verified-tenant" {
+	if !gotActorOK || gotActor.UserID != "verified-user" || gotMeta.Partition != "verified-partition" || gotMeta.TenantID != "verified-tenant" {
 		t.Fatalf("验签中间件应能在边界内重建身份，actor=%+v ok=%v meta=%+v", gotActor, gotActorOK, gotMeta)
 	}
 	if gotMeta.RequestID != "req-1" || gotMeta.Caller != "" {

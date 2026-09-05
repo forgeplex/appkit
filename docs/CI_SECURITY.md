@@ -4,8 +4,14 @@
 
 `appkit sync` 从 `go mod download -json` 的 module provenance 读取 appkit release
 对应的 Git commit，把完整 40 位 SHA 写进域仓库的 reusable workflow；release 版本只保留
-在同一行上方作为审计注释。源码联调同样解析当前 appkit worktree 的 `HEAD`，不会生成
-`@main`。解析不到完整 commit 时 sync 直接失败。
+在同一行上方作为审计注释。源码联调使用 AppKit 自身构建来源，或在校验工作区及
+HEAD 的 module 身份后读取 AppKit worktree 的 `HEAD`；不使用下游仓库的提交。
+不会生成 `@main`，解析不到完整 commit 时直接失败。
+
+`sync` / `new domain` 及其 `plan` 形态支持显式 `-workflow-ref`，只接受完整
+40 位 SHA；适合经人工核验的离线构建。显式值通过格式检查不等于来源证明，
+使用者仍须核验它属于 AppKit 且可获取。自动解析在工作区锁外执行，支持取消与
+超时；Go 下载在隔离临时目录执行，不修改调用方 go.mod/go.sum，但可能更新模块缓存。
 
 appkit 自身 workflow 的第三方 Action、Go 工具和 Postgres service image 也固定到
 commit 或 digest。Dependabot 每周更新 GitHub Actions 与两个 Go module；Renovate 的

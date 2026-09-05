@@ -21,8 +21,15 @@ func runGen(args []string) error {
 	case "contract":
 		in := fs.String("in", "", "输入 contract.yaml 文件")
 		dir := fs.String("dir", "", "契约包输出目录")
+		check := fs.Bool("check", false, "只检查生成物是否与契约一致，不写文件")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
+		}
+		if fs.NArg() != 0 {
+			return errors.New("gen contract 不接受位置参数（使用 -in 与 -dir）")
+		}
+		if *check {
+			return gen.CheckContract(*in, *dir)
 		}
 		return gen.Contract(*in, *dir)
 	case "events", "errors":

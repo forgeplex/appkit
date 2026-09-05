@@ -267,3 +267,102 @@ func TestMiddlewareRejectsInvalid(t *testing.T) {
 		t.Fatalf("非 Bearer 凭证应视同匿名放行，实际 %d", rec.Code)
 	}
 }
+
+// TestMultiIssuer 锁住多签发方形态：按 iss 选钥、分区焊接、跨签发方的
+// step-up 证明不互认、未知 iss 拒收。
+func TestMultiIssuer(t *testing.T) {
+	pubA, privA, _ := ed25519.GenerateKey(nil)
+	pubB, privB, _ := ed25519.GenerateKey(nil)
+	var meta callctx.Meta
+	var actor appkit.Actor
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		meta = callctx.From(r.Context())
+		actor, _ = appkit.ActorFrom(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+	inner := MultiIssuer(map[string]Issuer{
+		"rbac-a": {Key: pubA, Partition: "a"},
+		"rbac-b": {Key: pubB}, // 不配分区：不动 callctx 里的分区
+	})(next)
+	// 模拟真实链：入站先 Extract 头进 ctx，authn 在内层覆盖。
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner.ServeHTTP(w, r.WithContext(callctx.Merge(r.Context(), callctx.Extract(r.Header.Get))))
+	})
+	claims := func(iss, sub string) jwt.MapClaims {
+		return jwt.MapClaims{"iss": iss, "sub": sub, "tid": "t-" + sub, "perms": []string{"x:read"},
+			"iat": now().Unix(), "exp": time.Now().Add(time.Hour).Unix()}
+	}
+	serve := func(bearer, stepUp, partitionHeader string) int {
+		meta, actor = callctx.Meta{}, appkit.Actor{}
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		if stepUp != "" {
+			req.Header.Set(HeaderStepUp, stepUp)
+		}
+		if partitionHeader != "" {
+			req.Header.Set(callctx.HeaderPartition, partitionHeader)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// a 的令牌：用 a 的钥验过，分区焊成 a（伪造的 X-Partition 头被覆盖）。
+	if s := serve(sign(t, privA, claims("rbac-a", "u1")), "", "forged"); s != 200 {
+		t.Fatalf("a 的令牌应放行，实际 %d", s)
+	}
+	if meta.Partition != "a" || meta.TenantID != "t-u1" || actor.UserID != "u1" {
+		t.Fatalf("a 的分区/租户/主体焊接不符: %+v %+v", meta, actor)
+	}
+	// b 的令牌：用 b 的钥验过；签发方没配分区，头带来的分区值存活。
+	if s := serve(sign(t, privB, claims("rbac-b", "u2")), "", "from-header"); s != 200 {
+		t.Fatalf("b 的令牌应放行，实际 %d", s)
+	}
+	if meta.Partition != "from-header" || meta.TenantID != "t-u2" {
+		t.Fatalf("b 未配分区时应保留头值: %+v", meta)
+	}
+	// iss 说自己是 a、却用 b 的钥签：按 iss 取到 a 的公钥，签名验不过。
+	if s := serve(sign(t, privB, claims("rbac-a", "u1")), "", ""); s != 401 {
+		t.Fatalf("冒充 a 的 iss 应 401，实际 %d", s)
+	}
+	// 未知 iss / 空 iss。
+	if s := serve(sign(t, privA, claims("rbac-c", "u1")), "", ""); s != 401 {
+		t.Fatalf("未知 iss 应 401，实际 %d", s)
+	}
+	noIss := jwt.MapClaims{"sub": "u1", "exp": time.Now().Add(time.Hour).Unix()}
+	if s := serve(sign(t, privA, noIss), "", ""); s != 401 {
+		t.Fatalf("空 iss 应 401，实际 %d", s)
+	}
+	// step-up 证明必须与访问令牌同一签发方：b 签的证明配 a 的访问令牌不认。
+	su := func(priv ed25519.PrivateKey, iss string) string {
+		return sign(t, priv, jwt.MapClaims{"iss": iss, "sub": "u1", "purpose": "step-up",
+			"iat": now().Unix(), "exp": time.Now().Add(time.Hour).Unix()})
+	}
+	access := sign(t, privA, claims("rbac-a", "u1"))
+	if s := serve(access, su(privA, "rbac-a"), ""); s != 200 || actor.StepUpAt.IsZero() {
+		t.Fatalf("同签发方的 step-up 应放行并记 StepUpAt，实际 %d", s)
+	}
+	if s := serve(access, su(privB, "rbac-b"), ""); s != 401 {
+		t.Fatalf("别家签发方的 step-up 应 401，实际 %d", s)
+	}
+}
+
+func TestMultiIssuerBadConfigPanics(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(nil)
+	for name, issuers := range map[string]map[string]Issuer{
+		"空表":    {},
+		"空 iss": {"": {Key: pub}},
+		"缺公钥":   {"rbac-a": {}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("装配错误应 panic")
+				}
+			}()
+			MultiIssuer(issuers)
+		})
+	}
+}

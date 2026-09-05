@@ -167,6 +167,7 @@ func (r *Registry) validateRouteSecurity(mode SecurityMode, pprof bool) error {
 func identityBoundary(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		meta := callctx.From(req.Context())
+		meta.Partition = ""
 		meta.TenantID = ""
 		meta.Caller = ""
 		ctx := callctx.With(req.Context(), meta)
@@ -175,6 +176,7 @@ func identityBoundary(next http.Handler) http.Handler {
 		ctx = WithServicePrincipal(ctx, ServicePrincipal{})
 
 		clean := req.Clone(ctx)
+		clean.Header.Del(callctx.HeaderPartition)
 		clean.Header.Del(callctx.HeaderTenantID)
 		clean.Header.Del(callctx.HeaderCaller)
 		// Merchant header 会在 merchant principal 正式落地前就按同一信任规则

@@ -4,13 +4,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/forgeplex/appkit/ruleset"
 )
 
-// rulesE2EEnv 是这个测试的开关：跑一次要拉起两个真检查器，慢且要网络。
+// rulesE2EEnv 是这个测试的开关：跑一次要拉起两个真检查器，慢且需要
+// 已缓存的工具依赖或网络；显式选择执行后，环境失败不能降级为跳过。
 const rulesE2EEnv = "APPKIT_RULES_E2E"
 
 // e2eDomain 是测试域名。刻意不叫 ledger——与其它测试的临时仓库区分开，
@@ -296,6 +298,30 @@ func TestRulesE2EWiredIntoCI(t *testing.T) {
 	}
 }
 
+// Explicit opt-in must mean both real tools ran. A failed download used to
+// mark each acceptance subtest skipped and incorrectly return a green gate.
+func TestRulesE2ESetupFailureDoesNotSkip(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake tool uses a POSIX shell")
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "go"), []byte("#!/bin/sh\necho 'proxy: simulated TLS setup failure' >&2\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	completed := false
+	t.Run("failed-tool", func(t *testing.T) {
+		out, err := runLinter(t, t.TempDir(), "off", "golangci")
+		completed = true
+		if err == nil || !strings.Contains(out, "simulated TLS setup failure") {
+			t.Fatalf("setup failure was not returned: %v\n%s", err, out)
+		}
+	})
+	if !completed {
+		t.Fatal("an explicitly selected rules acceptance test skipped instead of reporting tool setup failure")
+	}
+}
+
 // writeFiles 把 path→内容 写进生成仓库（按需建目录）。
 func writeFiles(t *testing.T, dir string, files map[string]string) {
 	t.Helper()
@@ -324,7 +350,9 @@ func mustCompile(t *testing.T, dir, workFile string) {
 
 // runLinter 在生成仓库里跑一个钉版本的检查器，返回合并输出与退出状态。
 // 版本取自 ruleset——与域仓库 Makefile、domain-ci.yml 同源。
-// 拉不到检查器（无网络等）降级为跳过，与 buildGenerated 同策略。
+// 拉不到检查器也返回失败：make test-rules 已显式要求执行，不能假绿。
+// 已缓存工具可设 GOPROXY=file://<go env GOMODCACHE>/cache/download 离线运行；
+// 与 GOPROXY=off 不同，本地文件代理也能满足 go run 的版本弃用查询。
 func runLinter(t *testing.T, dir, workFile, which string) (string, error) {
 	t.Helper()
 	var args []string
@@ -342,18 +370,7 @@ func runLinter(t *testing.T, dir, workFile, which string) (string, error) {
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GOWORK="+workFile, "GOFLAGS=")
 	out, err := cmd.CombinedOutput()
-	msg := string(out)
-	if err != nil {
-		for _, marker := range []string{
-			"dial tcp", "connection refused", "no such host", "lookup ",
-			"proxy", "certificate",
-		} {
-			if strings.Contains(msg, marker) {
-				t.Skipf("环境拉不到 %s（%v）：\n%s", which, err, msg)
-			}
-		}
-	}
-	return msg, err
+	return string(out), err
 }
 
 // hasLineWith 报告输出里是否有某一行同时含 a 与 b。

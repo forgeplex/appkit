@@ -37,3 +37,26 @@ func Strip(ctx context.Context) context.Context {
 	}
 	return context.WithValue(ctx, ctxKey{}, nil)
 }
+
+type readAllKey struct{}
+
+// WithReadAllTenants 标记：由此 ctx 开启的事务以「读全部租户」模式运行——
+// 租户域的 RLS 对 SELECT 放开全部行，写入仍只能落在当前租户（写永远要
+// 显式目标，"写全部"不存在）。用途是跨租户的管理面读路径：运营看全部
+// 商户的订单、全局搜索、总览看板。
+//
+// 这是进程内的 ctx 值，不进 callctx 白名单：contract 防火墙会剥掉它，
+// 事件 meta 不带它——「读全部」不跨边界传播，下游域不会因上游持有该
+// 权限而连带放开。调用方须先过权限门（reg.Require 跨租户码）再打标记，
+// 且标记必须在最外层 Do 之前打：嵌套事务内切模式会让 SET LOCAL 延续到
+// 外层事务结束，实现方对此报错拒绝（见 pgtx）。
+func WithReadAllTenants(ctx context.Context) context.Context {
+	return context.WithValue(ctx, readAllKey{}, true)
+}
+
+// ReadsAllTenants 报告 ctx 是否带「读全部租户」标记。由 Transactor 实现方
+// 在开启事务时读取；业务代码不需要它。
+func ReadsAllTenants(ctx context.Context) bool {
+	v, _ := ctx.Value(readAllKey{}).(bool)
+	return v
+}

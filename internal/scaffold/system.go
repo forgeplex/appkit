@@ -3,7 +3,6 @@ package scaffold
 import (
 	"fmt"
 	"io"
-	"strings"
 )
 
 // systemFiles 是组合仓库骨架的模板清单（DESIGN §5：只做 wiring + 配置 + 部署）。
@@ -29,8 +28,11 @@ func System(o Options, out io.Writer) error {
 	if err := ensureFreshDir(o.Dir); err != nil {
 		return fmt.Errorf("new system: %w", err)
 	}
-	d := newData(o, strings.ToUpper(o.Name))
-	if err := renderAll("system", systemFiles, d, o.Dir); err != nil {
+	files, err := RenderSystem(o)
+	if err != nil {
+		return err
+	}
+	if err := writeRenderedFiles(o.Dir, files); err != nil {
 		return fmt.Errorf("new system %s: %w", o.Name, err)
 	}
 	summarize(out, "组合仓库", o.Dir, []string{

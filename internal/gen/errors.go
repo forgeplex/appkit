@@ -40,18 +40,29 @@ func Errors(inPath, outPath string) error {
 	if inPath == "" || outPath == "" {
 		return fmt.Errorf("gen errors 需要 -in <codes.yaml> 与 -out <file.go>")
 	}
-	doc, err := parseCodesDoc(inPath)
+	data, err := os.ReadFile(inPath)
+	if err != nil {
+		return fmt.Errorf("读取输入: %w", err)
+	}
+	source, err := RenderErrorsSource(inPath, data)
 	if err != nil {
 		return err
 	}
-	return writeGo(outPath, renderCodes(doc))
+	return writeGenerated(outPath, source)
 }
 
-func parseCodesDoc(inPath string) (*codesDoc, error) {
-	data, err := os.ReadFile(inPath)
+// RenderErrorsSource renders exactly the supplied codes.yaml snapshot. It
+// performs no filesystem access; sourceName is used only for diagnostics. The
+// formatted result belongs to the caller and does not alias data.
+func RenderErrorsSource(sourceName string, data []byte) ([]byte, error) {
+	doc, err := parseCodesSource(sourceName, data)
 	if err != nil {
-		return nil, fmt.Errorf("读取输入: %w", err)
+		return nil, err
 	}
+	return formatGo(sourceName, renderCodes(doc))
+}
+
+func parseCodesSource(inPath string, data []byte) (*codesDoc, error) {
 	var doc codesDoc
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("%s: 解析 yaml: %w", inPath, err)

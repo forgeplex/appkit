@@ -14,9 +14,14 @@
 //     还原进 ctx——异步链路上 request id 同样连得起来。
 //
 // 租户的信任模型：Extract 只负责传输，不赋予可信语义。App 的严格安全模式
-// 在最外层清除 X-Tenant-Id/X-Caller 与预置 principal；随后用户 token 或
+// 在最外层清除 X-Partition/X-Tenant-Id/X-Caller 与预置身份；随后用户 token 或
 // 服务凭证验证器从已验证声明重建 Meta。因而匿名请求即使伪造身份头也不会
 // 得到可信租户；Disabled 仅供 dev/test，保留旧的原样传播行为。
+//
+// 分区键（Partition）是租户之外的第二个数据维度：分区域域按它选 schema，
+// 租户域按 TenantID 过滤行，一个请求可以同时带两者（分区 a 里的商户 a1）。
+// 信任模型与租户同构：外部入口以令牌签发方所属的分区为准（authn.MultiIssuer
+// 按 iss 焊入）；严格 HTTP 入站不会信任 X-Partition，内部调用也须重新验凭证。
 //
 // 剩下的半条是出站 HTTP：合约仓库的 client 是手写的（appkit gen 只生成
 // events/errors/wrap，不生成 client），得自己接上。装配 Transport 一次即可：
@@ -46,7 +51,14 @@ import (
 type Meta struct {
 	// RequestID 串起一次外部请求在全链路上的所有日志与 span。
 	RequestID string
-	// TenantID 是多租户下的租户标识。下游据此选数据边界，不可由请求体覆盖。
+	// Partition 是分区键：分区域域（一套代码、N 份数据分区）据此把事务
+	// 路由到对应 schema。与 TenantID 是两个维度——分区决定「落哪个 schema」，
+	// 租户决定「落哪些行」；一个字段装两样东西的代价是下游按错的维度查数据
+	// （rbac 的分区键经事件 meta 传播、被租户域当业务租户查渠道，就是判例）。
+	// 认证请求以令牌签发方所属的分区为准（authn.MultiIssuer 焊入）。
+	Partition string
+	// TenantID 是多租户下的业务租户标识。下游据此选数据边界（租户域的
+	// RLS 行过滤），不可由请求体覆盖。
 	TenantID string
 	// Caller 是直接调用方的服务名，用于归因与限流。
 	// 语义是「谁调的我」而不是「链路最初是谁」——出站 client 应写自己的
@@ -57,6 +69,7 @@ type Meta struct {
 // HTTP 传播用的请求头名。
 const (
 	HeaderRequestID = "X-Request-Id"
+	HeaderPartition = "X-Partition"
 	HeaderTenantID  = "X-Tenant-Id"
 	HeaderCaller    = "X-Caller"
 )
@@ -64,6 +77,7 @@ const (
 // 事件传播用的 appkit.Event.Meta 键名。带前缀是为了与业务自己写的 meta 分开。
 const (
 	KeyRequestID = "appkit.request_id"
+	KeyPartition = "appkit.partition"
 	KeyTenantID  = "appkit.tenant_id"
 	KeyCaller    = "appkit.caller"
 )
@@ -93,6 +107,9 @@ func Merge(ctx context.Context, m Meta) context.Context {
 	if m.RequestID != "" {
 		cur.RequestID = m.RequestID
 	}
+	if m.Partition != "" {
+		cur.Partition = m.Partition
+	}
 	if m.TenantID != "" {
 		cur.TenantID = m.TenantID
 	}
@@ -104,9 +121,12 @@ func Merge(ctx context.Context, m Meta) context.Context {
 
 // LogAttrs 返回非空字段的 slog 属性，便于把元数据统一带进日志。
 func (m Meta) LogAttrs() []slog.Attr {
-	attrs := make([]slog.Attr, 0, 3)
+	attrs := make([]slog.Attr, 0, 4)
 	if m.RequestID != "" {
 		attrs = append(attrs, slog.String("request_id", m.RequestID))
+	}
+	if m.Partition != "" {
+		attrs = append(attrs, slog.String("partition", m.Partition))
 	}
 	if m.TenantID != "" {
 		attrs = append(attrs, slog.String("tenant_id", m.TenantID))
@@ -122,6 +142,7 @@ func (m Meta) LogAttrs() []slog.Attr {
 //	callctx.Inject(callctx.From(ctx), req.Header.Set)
 func Inject(m Meta, set func(key, value string)) {
 	setNonEmpty(set, HeaderRequestID, m.RequestID)
+	setNonEmpty(set, HeaderPartition, m.Partition)
 	setNonEmpty(set, HeaderTenantID, m.TenantID)
 	setNonEmpty(set, HeaderCaller, m.Caller)
 }
@@ -132,6 +153,7 @@ func Inject(m Meta, set func(key, value string)) {
 func Extract(get func(key string) string) Meta {
 	return Meta{
 		RequestID: get(HeaderRequestID),
+		Partition: get(HeaderPartition),
 		TenantID:  get(HeaderTenantID),
 		Caller:    get(HeaderCaller),
 	}
@@ -191,9 +213,10 @@ func ToMap(m Meta, dst map[string]string) map[string]string {
 		return dst
 	}
 	if dst == nil {
-		dst = make(map[string]string, 3)
+		dst = make(map[string]string, 4)
 	}
 	setNonEmpty(func(k, v string) { dst[k] = v }, KeyRequestID, m.RequestID)
+	setNonEmpty(func(k, v string) { dst[k] = v }, KeyPartition, m.Partition)
 	setNonEmpty(func(k, v string) { dst[k] = v }, KeyTenantID, m.TenantID)
 	setNonEmpty(func(k, v string) { dst[k] = v }, KeyCaller, m.Caller)
 	return dst
@@ -203,6 +226,7 @@ func ToMap(m Meta, dst map[string]string) map[string]string {
 func FromMap(src map[string]string) Meta {
 	return Meta{
 		RequestID: src[KeyRequestID],
+		Partition: src[KeyPartition],
 		TenantID:  src[KeyTenantID],
 		Caller:    src[KeyCaller],
 	}

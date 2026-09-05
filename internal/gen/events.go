@@ -70,18 +70,29 @@ func Events(inPath, outPath string) error {
 	if inPath == "" || outPath == "" {
 		return fmt.Errorf("gen events 需要 -in <events.yaml> 与 -out <file.go>")
 	}
-	doc, err := parseEventsDoc(inPath)
+	data, err := os.ReadFile(inPath)
+	if err != nil {
+		return fmt.Errorf("读取输入: %w", err)
+	}
+	source, err := RenderEventsSource(inPath, data)
 	if err != nil {
 		return err
 	}
-	return writeGo(outPath, renderEvents(doc))
+	return writeGenerated(outPath, source)
 }
 
-func parseEventsDoc(inPath string) (*eventsDoc, error) {
-	data, err := os.ReadFile(inPath)
+// RenderEventsSource renders exactly the supplied events.yaml snapshot. It
+// performs no filesystem access; sourceName is used only for diagnostics. The
+// formatted result belongs to the caller and does not alias data.
+func RenderEventsSource(sourceName string, data []byte) ([]byte, error) {
+	doc, err := parseEventsSource(sourceName, data)
 	if err != nil {
-		return nil, fmt.Errorf("读取输入: %w", err)
+		return nil, err
 	}
+	return formatGo(sourceName, renderEvents(doc))
+}
+
+func parseEventsSource(inPath string, data []byte) (*eventsDoc, error) {
 	var doc eventsDoc
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("%s: 解析 yaml: %w", inPath, err)

@@ -36,17 +36,19 @@ type Options struct {
 	// "(devel)" 表示源码构建：go.mod 不 require appkit（对不存在版本的
 	// require 会让 go 命令去代理拉取而失败），改由 appkit dev 的 go.work 提供。
 	AppkitVersion string
-	// WorkflowRef 可显式传 appkit 源码的完整 commit；空时由 ruleset 从
-	// AppkitVersion 的 Go module provenance（devel 时为当前 git）解析。
+	// WorkflowRef 可显式传 appkit 源码的完整 commit；Domain 入口为空时由
+	// ruleset 从 AppkitVersion 的来源解析。纯 RenderDomain 必须显式传入，
+	// 不会执行外部 git/go 命令；RenderSystem 不消费 workflow ref。
 	WorkflowRef string
 	// Partitioned 生成「分区域域」形态（仅 domain）：一套代码、N 份数据分区，
-	// 迁移与查询全部无 schema 前缀，落位由组合根注入的分区映射（租户 → schema）
+	// 迁移与查询全部无 schema 前缀，落位由组合根注入的分区映射（分区键 → schema）
 	// 经事务级 search_path 路由确定。分区映射的定义放组合根自己的配置文件。
 	Partitioned bool
-	// Tenant 生成「租户域」形态（仅 domain）：单 schema、行级隔离——业务表
-	// 带 tenant_id 列并挂 RLS 三件套（pgtx.TenantPolicySQL），每次事务把
-	// 租户身份落成事务级 GUC（pgtx.NewTenant）。与 Partitioned 互斥：
-	// schema 隔离与行级隔离不组合。
+	// Tenant 生成「租户域」形态（仅 domain）：行级隔离——业务表带 tenant_id
+	// 列并挂 RLS 策略（pgtx.TenantPolicySQL），每次事务把租户身份落成事务级
+	// GUC（pgtx.NewTenant）。与 Partitioned 同给即「分区 + 行级」双层：每个
+	// 分区一套 schema，分区内再按 tenant_id 分行（pgtx.NewRoutedTenant，
+	// 租户 DDL 用无前缀形态）。
 	Tenant bool
 }
 
@@ -79,9 +81,6 @@ func (o *Options) normalize() error {
 	}
 	if o.AppkitVersion == "" {
 		o.AppkitVersion = "(devel)"
-	}
-	if o.Tenant && o.Partitioned {
-		return fmt.Errorf("-tenant 与 -partitioned 互斥：行级隔离与 schema 隔离不组合，先选一种隔离形态")
 	}
 	return nil
 }
@@ -141,16 +140,17 @@ type fileSpec struct {
 	path string // 仓库内相对路径
 }
 
-// renderAll 渲染 kind 目录下的模板集并写盘。
-func renderAll(kind string, files []fileSpec, d tmplData, dir string) error {
+// renderFiles uses embedded templates only, with no output filesystem access.
+func renderFiles(kind string, files []fileSpec, d tmplData) (map[string][]byte, error) {
 	tset, err := template.ParseFS(templatesFS, "templates/"+kind+"/*.tmpl")
 	if err != nil {
-		return fmt.Errorf("解析内置模板 templates/%s: %w", kind, err)
+		return nil, fmt.Errorf("解析内置模板 templates/%s: %w", kind, err)
 	}
+	contents := make(map[string][]byte, len(files))
 	for _, f := range files {
 		var buf bytes.Buffer
 		if err := tset.ExecuteTemplate(&buf, f.tmpl, d); err != nil {
-			return fmt.Errorf("渲染模板 %s: %w", f.tmpl, err)
+			return nil, fmt.Errorf("渲染模板 %s: %w", f.tmpl, err)
 		}
 		content := buf.Bytes()
 		rel := strings.ReplaceAll(f.path, "NAME", d.Name)
@@ -159,15 +159,13 @@ func renderAll(kind string, files []fileSpec, d tmplData, dir string) error {
 		if strings.HasSuffix(rel, ".go") {
 			formatted, err := format.Source(content)
 			if err != nil {
-				return fmt.Errorf("模板 %s 渲染出的 %s 不是合法 Go 源码: %w", f.tmpl, rel, err)
+				return nil, fmt.Errorf("模板 %s 渲染出的 %s 不是合法 Go 源码: %w", f.tmpl, rel, err)
 			}
 			content = formatted
 		}
-		if err := writeFile(filepath.Join(dir, rel), content); err != nil {
-			return err
-		}
+		contents[rel] = content
 	}
-	return nil
+	return contents, nil
 }
 
 // ensureFreshDir 确保输出目录不存在或为空，避免覆盖既有仓库。
