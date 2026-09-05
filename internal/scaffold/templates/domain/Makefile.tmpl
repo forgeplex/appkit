@@ -5,7 +5,16 @@
 GO ?= go
 DEV_DB_URL := postgres://postgres:dev@127.0.0.1:54329/{{.Name}}_dev?sslmode=disable
 
-.PHONY: run run-minimal dev-db run-db migrate gen schema lint check test
+# CLI 使用独立工具 module，不把 CLI 的额外依赖加入业务 go.mod/go.sum。
+# 版本从本仓 go.mod 取，忽略联调 go.work；绝不静默追随 main。
+# devel/v0.0.0 占位或未发布源码联调：显式 APPKIT=/绝对路径/已构建appkit；
+# 需要已发布工具时显式 APPKIT_VERSION=vX.Y.Z。业务 run/test 的 GOFLAGS 不变。
+APPKIT_VERSION ?= $(filter v%,$(shell GOWORK=off $(GO) list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $$2}'))
+APPKIT_FROM_VERSION := $(if $(filter undefined,$(origin APPKIT)),yes,no)
+APPKIT ?= GOWORK=off $(GO) run github.com/forgeplex/appkit/cmd/appkit@$(APPKIT_VERSION)
+APPKITLINT_VERSION ?= $(APPKIT_VERSION)
+
+.PHONY: run run-minimal dev-db run-db migrate gen schema lint check test check-tool-version check-appkit-version
 
 # 正常启动必须有 database.url；缺配置时 fail closed。
 run:
@@ -39,8 +48,8 @@ gen:
 
 # 重新生成 db/SCHEMA.md 与 db/schema/（表结构总览 + ER 图）。改过迁移就跑一次。
 # 迁移会被应用到一次性临时库再读回结构，开发库本身不受影响（生成物禁手改）。
-schema: dev-db
-	$(GO) run github.com/forgeplex/appkit/cmd/appkit schema -dsn '$(DEV_DB_URL)'
+schema: check-tool-version dev-db
+	$(APPKIT) schema -dsn '$(DEV_DB_URL)'
 
 # lint：golangci-lint（depguard 等）+ go-arch-lint（组件依赖矩阵）。
 # 配置由 appkit sync 物化，勿手改；版本与 CI 钉在同一个，本地绿 = CI 绿。
@@ -48,20 +57,27 @@ schema: dev-db
 GOLANGCI ?= $(GO) run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GolangciVersion}}
 ARCHLINT ?= $(GO) run github.com/fe3dback/go-arch-lint@{{.ArchLintVersion}}
 # appkit-lint 是嵌套 module（不进业务依赖图），@版本直接拉取。版本随
-# go.mod 钉的 appkit——规则与依赖同版本升级，与 domain-ci.yml 同一套取法；
-# go.work 联调取不到版本时必须显式传 APPKITLINT_VERSION，禁止静默追随 main。
-# 用 make 函数而不是 shell case：
-# case 分支模式里的 ) 不配平会被 make 的 $(shell) 解析器提前截断。
-APPKITLINT_VERSION ?= $(filter v%,$(shell $(GO) list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $$2}'))
-lint:
-	@if [ -z "$(APPKITLINT_VERSION)" ]; then echo "APPKITLINT_VERSION 为空：go.work 联调请显式指定已发布版本" >&2; exit 1; fi
+# go.mod 钉的 appkit——与 CLI、domain-ci.yml 同版，禁止静默追随 main。
+lint: check-appkit-version
+	@test '$(APPKITLINT_VERSION)' = '$(APPKIT_VERSION)' || { echo "APPKITLINT_VERSION 必须与 APPKIT_VERSION 相同" >&2; exit 1; }
 	$(GOLANGCI) run ./...
 	$(ARCHLINT) check
-	$(GO) run github.com/forgeplex/appkit/lint/cmd/appkit-lint@$(APPKITLINT_VERSION) ./...
+	GOWORK=off $(GO) run github.com/forgeplex/appkit/lint/cmd/appkit-lint@$(APPKITLINT_VERSION) ./...
 
 # appkit 架构检查：依赖方向、go.mod require 清单、SQL 跨 schema 引用。
-check:
-	$(GO) run github.com/forgeplex/appkit/cmd/appkit check
+check: check-tool-version
+	$(APPKIT) check
 
 test:
 	$(GO) test ./...
+
+check-appkit-version:
+	@if [ -z "$(APPKIT_VERSION)" ]; then echo "APPKIT_VERSION / APPKITLINT_VERSION 为空：请显式指定已发布版本" >&2; exit 1; fi
+	@printf '%s\n' '$(APPKIT_VERSION)' | LC_ALL=C grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$$' || { echo "APPKIT_VERSION 必须为固定版本，禁止 branch/main" >&2; exit 1; }
+
+ifeq ($(APPKIT_FROM_VERSION),yes)
+check-tool-version: check-appkit-version
+else
+check-tool-version:
+	@test -n '$(strip $(APPKIT))' || { echo "显式 APPKIT 命令不能为空" >&2; exit 1; }
+endif

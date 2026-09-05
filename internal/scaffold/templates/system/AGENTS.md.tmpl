@@ -8,8 +8,9 @@
 
 1. **装配模块**（`cmd/{{.Name}}/main.go`）：`go.mod` require 域仓库 →
    `appkit.Modules(a.Module(...), b.Module(...))`，共享连接池按数据库注入。
-2. **绑定跨域契约的远程兜底**：`appkit.Remote[av1.Service](av1.NewClient)`
-   ——target 集内的域进程内直调，集外的自动落到该 client（同一接口）。
+2. **绑定跨域契约的远程兜底**：`appkit.Remote[av1.Service]` 的构造器返回
+   `av1.NewSecureClient`，配置 HTTPS、Audience 与 Credentials；target 集内
+   的域进程内直调，集外的落到该 client（同一接口）。
 3. **注入事件总线**：单体单库 `appkit.Bus(outbox.NewDirectBus())`；
    拆分部署换 NATS/Kafka 实现（同一接口，业务零改动）。
 4. **配置与部署**（`config/*.yaml`、`deploy/`）：同一镜像不同 `-target`
@@ -22,9 +23,9 @@
 - mode 是**每个部署实例**的暴露面，不是编译时常量：用户入口选
   `user_facing`，服务入口最终选 `internal_service`，同时承载两类入口才选
   `mixed`；
-- 当前 bootstrap 阶段只有 `user_facing` 可在配好 `AuthnPublicKey` 与
-  `AuthnIssuer` 后启动；服务 JWT 验证器落地前，`internal_service/mixed`
-  会有意 fail closed；
+- `user_facing` 需要 `AuthnPublicKey` 与 `AuthnIssuer`（多签发方用
+  SecurityOptions.UserIssuers）；`internal_service/mixed` 需要 `security.service`
+  或 ServiceVerifier，缺失时 fail closed。服务委托默认拒绝非空范围；
 - `/healthz`、`/readyz` 是隐式公开探针；pprof 不得挂在 `user_facing`，在
   `internal_service/mixed` 下也必须经过已验证的服务身份。
 

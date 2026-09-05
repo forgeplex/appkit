@@ -23,16 +23,17 @@
 // 信任模型与租户同构：外部入口以令牌签发方所属的分区为准（authn.MultiIssuer
 // 按 iss 焊入）；严格 HTTP 入站不会信任 X-Partition，内部调用也须重新验凭证。
 //
-// 剩下的半条是出站 HTTP：合约仓库的 client 是手写的（appkit gen 只生成
-// events/errors/wrap，不生成 client），得自己接上。装配 Transport 一次即可：
+// 生成的契约 NewSecureClient 通过服务凭证传递已授权的 Partition/TenantID，
+// Caller 由接收端验签后的 sub 重建，RequestID 可明文传播。下述 Transport
+// 只供 legacy/dev 或明确可信的自定义传播，不是生产服务身份验证器：
 //
 //	client := &http.Client{Transport: callctx.Transport{Caller: "ledger"}}
 //
 // 也可以在构造每个请求时手写 callctx.Inject(callctx.From(ctx), req.Header.Set)，
 // 但那把「会不会漏」摊到了每一个调用点上，而 Transport 只有装配处一处。
 //
-// 两条路都仍然靠人接：漏了的话，进程内绑定拿得到 tenant、远程 client 拿不到，
-// 恰好是「部署形态是启动参数」失效的形态，而且只在真拆分部署那天暴露。
+// 生成客户端会接好传播层；手写客户端仍须自行接入。Transport 只表达候选
+// 元数据，不授权。严格入站不会把这些 unsigned 身份头当作可信数据。
 //
 // 要验它接没接上，给 apptest.Conform 的每个 Binding 填上 SeenMeta——服务端把
 // 「我这次看到了什么」交出来，漏了白名单的那个形态当场就红。填不填仍是自愿的，

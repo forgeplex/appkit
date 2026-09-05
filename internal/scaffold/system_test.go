@@ -50,9 +50,15 @@ func TestSystemScaffold(t *testing.T) {
 			"bootstrap.Main(bootstrap.Options{",
 			`Service: "psp"`,
 			"ledger.Module(",     // Modules 注释样例
-			"appkit.Remote(",     // Remote 注释样例
+			"appkit.Remote[",     // Remote 注释样例
 			"bootstrap.EventBus", // 换总线注释样例
+			"ledgerv1.NewSecureClient(endpoint, secureOptions)",
+			"contract.SecureClientOptions",
+			"MountInternalService",
 		)
+		if strings.Contains(main, "appkit.Remote(ledgerv1.NewClient)") {
+			t.Fatal("system scaffold must not recommend unauthenticated remote bindings")
+		}
 	})
 
 	t.Run("go.mod devel 提示联调", func(t *testing.T) {
@@ -83,7 +89,8 @@ func TestSystemScaffold(t *testing.T) {
 			"HTTP 身份边界", "security.mode", "disabled", "user_facing",
 			"internal_service", "mixed", "AuthnPublicKey", "AuthnIssuer", "pprof")
 		mustContain(t, "README.md", readFile(t, dir, "README.md"),
-			"security.mode: disabled", "user_facing", "internal_service/mixed", "fail closed")
+			"security.mode: disabled", "user_facing", "internal_service/mixed", "fail closed",
+			"NewSecureClient", "ServiceVerifier", "security.service")
 	})
 }
 

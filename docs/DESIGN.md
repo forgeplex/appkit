@@ -322,9 +322,10 @@ app := appkit.New(modules,
     appkit.Middleware(authn.Middleware(pub, issuer)), // user_facing 的主体重建器
     appkit.Target(cfg.Target),                       // "all" | "gateway" | "ledger,relay" …
     // target 之外的契约自动落到 Remote 绑定（contracts 生成的 HTTP client，实现同一接口）：
-    appkit.Remote[ledgerv1.Service](ledgerv1.NewClient),
-    appkit.Remote[authv1.Service](authv1.NewClient),
-    appkit.Remote[merchantv1.Service](merchantv1.NewClient),
+    appkit.Remote[ledgerv1.Service](func(*appkit.Registry) (ledgerv1.Service, error) {
+        return ledgerv1.NewSecureClient(cfg.LedgerHTTPS, ledgerCredentials)
+    }),
+    // 其他远程绑定同样使用 NewSecureClient；credentials 的 Audience 与接收端一致。
 )
 app.Run(ctx)
 ```
@@ -385,7 +386,7 @@ HTTP 面先回答「这个进程信任哪种主体」，才能谈权限。`App.R
 
 除 `disabled` 外，框架把 `identityBoundary` 强制放在用户可配中间件的
 最外层。每个入站请求先清空 ctx 里预置的 `Actor` / `ServicePrincipal`、
-`callctx` 的 TenantID / Caller，再删除 unsigned `X-Tenant-Id` / `X-Caller` /
+`callctx` 的 Partition / TenantID / Caller，再删除 unsigned `X-Partition` / `X-Tenant-Id` / `X-Caller` /
 `X-Merchant-Id`；只保留不授权的 request id。边界内的验证中间件才能从
 签名凭证重建主体与委托范围。`HTTPServer` Option 也不能替换这条根
 handler：构建服务器后框架会强制恢复它。
@@ -397,16 +398,16 @@ handler：构建服务器后框架会强制恢复它。
 
 bootstrap 从 `security.mode` 读模式，并对部署配置再收紧一层：`disabled`
 仅 `env=dev`；`user_facing` 必须同时提供恰好 32 字节的 Ed25519 公钥
-与非空 issuer，然后自动挂 `authn.Middleware`。当前第一阶段已有
-`ServicePrincipal` 的 ctx 落点与路由 guard，但服务 JWT 的 iss/aud/sub/exp/iat/kid
-验证配置尚未落地；因此 `internal_service` 与 `mixed` 在 bootstrap 中
-fail-closed，不接受「内网就算可信」作为替代。`-migrate` 因不启 HTTP，
-豁免模式与凭证配置。
+与非空 issuer（或显式 UserIssuers），然后自动挂用户验签。`internal_service`
+需要 `security.service` 或 ServiceVerifier；`mixed` 需要两类配置。
+服务 JWT 验证 iss/aud/sub/exp/iat/kid、互斥类型与最长生命周期，委托默认拒绝。
+配置缺失或无效仍 fail-closed，不接受「内网就算可信」作为替代。`-migrate`
+因不启 HTTP，豁免模式与凭证配置。详细配置与轮换见 [SERVICE_AUTH.md](SERVICE_AUTH.md)。
 
 pprof 也纳入同一矩阵：`user_facing` 与 `Pprof` 同时出现就在启动期
 拒绝；`internal_service` / `mixed` 中每个 `/debug/pprof/*` handler 都包上
 InternalService guard。`disabled` 下它无 guard，只用于 bootstrap `env=dev` 或
-直接 App 测试。由于 bootstrap 当前不开 internal/mixed，线上 pprof 也刻意暂不可用。
+直接 App 测试。启用 internal/mixed 的 pprof 必须同时配置有效服务验证器。
 
 鉴权是每个系统都要、但语义人人不同的一块。框架的切法是**机制与语义分离**：
 
@@ -481,7 +482,8 @@ Require 验**策略**（该码是否标了 Challenge、证明是否新鲜）。�
 
 拆分部署时每个用户面服务自挂 Authn（Authorization/X-Step-Up 头本来就在线路上，
 下游不靠上游「帮忙认证过了」）；Actor 不进 `callctx` 白名单，也不该进。
-纯服务面和 mixed 部署须等后续服务 JWT 验证机制，不得用传播头替代。
+纯服务面和 mixed 使用独立服务 JWT；生成的 `NewSecureClient` 强制 HTTPS 与
+显式凭证 provider，不自动转发用户 Actor 或令牌，不得用 unsigned 传播头替代。
 
 ### 5.5 租户隔离：三种形态，机制归框架、语义归域
 
@@ -595,16 +597,17 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | HTTP 安全模式不能遗漏 | `App.Run` 在进入迁移/Setup/监听前验证 `SecurityMode`；bootstrap 还要求 `security.mode`，并把 `disabled` 限于 `env=dev`；`App.Migrate` 显式豁免 | ▲ 运行时 + 装配级：零值不能 Run，但直接构造 App 的调用方可显式选 `SecurityDisabled`（测试需要这个逃生口） |
 | 严格模式没有未分类根路由 | Registry 记录 Public/Authenticated/Permission/InternalService，全部 Setup 后、listen 前校验模式矩阵；分类 API 同时包上用户/权限/服务 guard | ▲ 运行时守卫：受信组合根的 Middleware 仍可短路 `next` 或在边界内注入 principal，不是对任意 wiring 的沙箱 |
 | 网络身份输入不继承为可信 ctx | 严格模式的 `identityBoundary` 强制在可配 Middleware 最外层，清 Actor/ServicePrincipal/partition/tenant/caller 及四个 unsigned 头；`HTTPServer` Option 之后强制恢复根 handler | ▲ 运行时信任边界：中间件顺序和 Handler Option 不能把边界挪掉，但边界内的受信 Middleware 若重新信头仍可自伤 |
-| 服务身份验证 | 已有 `ServicePrincipal` 落点、InternalService guard 与模式矩阵；bootstrap 对 internal/mixed fail-closed | ✗ 验证器尚未落地：待补 service JWT 的 iss/aud/sub/exp/iat/kid 与委托范围 |
-| pprof 不暴露在用户面 | `user_facing + Pprof` 启动拒绝；internal/mixed 的每个 pprof handler 包 InternalService guard；disabled 仅作 bootstrap `env=dev` / 直接 App 测试 | ▲ 运行时：服务主体守卫已在，但 bootstrap 在验证器落地前不启用 internal/mixed |
+| 服务身份验证 | `authn.ServiceVerifier` 验证固定类型的短期服务 JWT，静态 iss+kid+sub、单一 aud、exp/iat；非空委托默认拒绝；bootstrap 先验配置 | ▲ 运行时 + 装配级：策略/公钥配置属于受信组合根；不提供任意 wiring 沙箱 |
+| 安全远程契约 | `NewSecureClient` 需要凭证 provider 与 HTTPS，绑定 origin、禁止重定向/弱 TLS、清除上游凭证 | ▲ 构造 + 出站守卫：旧 NewClient 保留兼容，不能据此宣称已认证；应用不得替换已验证 transport |
+| pprof 不暴露在用户面 | `user_facing + Pprof` 启动拒绝；internal/mixed 的每个 pprof handler 包 InternalService guard；disabled 仅作 bootstrap `env=dev` / 直接 App 测试 | ▲ 运行时：内部模式还须配置有效服务验签器 |
 | 规则集不被改松 | `appkit check` 内联 `ruleset.Check`（配置缺失同样算漂移），不再只靠 CI 那一步 | ▲ 本地+CI 级 |
 | 已应用的迁移不可变 | 历史表存内容 sha256，启动期逐个比对，不符即 `MIGRATION_DRIFT` 拒绝启动；`.gitattributes` 钉 `*.sql eol=lf` 消除跨平台误报 | ★ 运行时级，启动即暴露 |
 | 分区域域的 schema 由调用方确定 | 迁移/查询无前缀 + 事务级 `SET LOCAL search_path`（`pgtx.NewRouted` 按 `callctx.Meta.Partition` 查组合根注入的映射）；查询必须经 `tx.Do`，事务外落默认 search_path 即「表不存在」报错 | ★ 运行时级：路由失败（查无分区）即回滚 422，无法静默落到错误分区 |
-| 分区键与业务租户不共用一个字段 | `callctx.Meta.Partition` 与 `Meta.TenantID` 各自一个字段、各自的头（X-Partition / X-Tenant-Id）与事件 meta 键；分区路由只读前者、RLS 只读后者。此前共用 TenantID 的判例：rbac 的分区键经事件 meta 传播、被 email 域当业务租户查渠道，验证码邮件死信 | ★ 编译器级：两个维度类型上就分开；存量域改读 `Partition` 是一次性迁移（rbac 尚未切） |
+| 分区键与业务租户不共用一个字段 | `callctx.Meta.Partition` 与 `Meta.TenantID` 各自一个字段、各自的头与事件 meta 键；分区路由只读前者、RLS 只读后者。此前共用 TenantID 的判例：rbac 分区经事件 meta 被 email 当业务租户查询 | ▲ 具名字段降低误用；两者仍是 string，编译器不保证业务赋值正确，存量域须迁移并做回归 |
 | 分区域域的 SQL 无前缀纪律 | `partitioned: true` 时 archcheck 前缀规则翻转（任何 schema 前缀违规，无 DB 即拦）；sqlc 编译器兜底——带前缀与无前缀两个世界各自封闭，混写双向都是编译错误 | ▲ CI 级 + ★ 编译器级 |
 | 租户域跨租户泄漏 | RLS（ENABLE+FORCE+隔离策略+读全部策略，`pgtx.TenantPolicySQL`）+ 事务级 GUC（`pgtx.NewTenant` / `NewRoutedTenant` 的 Do）；Setup 期 `pgtx.VerifyTenantRLS` 校验完整性（缺任一件/角色 superuser 或 BYPASSRLS 即拒启，点名表并附修复 SQL） | ★ 运行时级：漏写 WHERE 只会查不到行/写入被拒，且缺件启动即暴露 |
 | 跨租户读只能是显式、只读、不传播 | `tx.WithReadAllTenants` 是进程内 ctx 标记（不进 callctx：防火墙剥掉、事件不带）；落成第二个 GUC `app.tenant_scope`，与租户值那条通道（令牌 tid）分离；策略只对 SELECT 放开，写入的 WITH CHECK 不变；标记须在最外层 Do 之前打，嵌套内切换报错 | ★ 存储级：写全部模式不存在；「谁能打标记」归 `reg.Require` 跨租户码 + 用例纪律（约定级） |
-| 分区与租户身份只能来自已验证凭证 | 严格 HTTP 边界先清除 ctx partition/tenant 与 `X-Partition` / `X-Tenant-Id`，authn 验签后把 tid 焊进 callctx（无值清零）；`authn.MultiIssuer` 从签发方配置重建 Partition；公开端点也看不到 unsigned 身份 | ▲ 中间件级：标准 bootstrap 链路可执行；自写受信 Middleware 仍可错误地从头重建；服务身份验证器尚未落地 |
+| 分区与租户身份只能来自已验证凭证 | 严格 HTTP 边界先清除 ctx partition/tenant 与 unsigned 头；MultiIssuer 从签发方配置重建 Partition，ServiceVerifier 从授权后的签名委托重建范围 | ▲ 中间件级：标准 bootstrap 可执行；自写受信 Middleware 仍可错误地授予权限 |
 | schema 文档支持分区域域 | `partitioned: true` 自动生成 logical-template：无前缀迁移在代表 schema 回放一次，全部文档显式标记；分区＋tenant 的 RLS 同步呈现 | ▲ 工具/CI 级；只证明逻辑模板，未枚举或检查运行中分区；未启用文档的仓库仍 notice 放行 |
 | 没人跑迁移不可能 | 登记了迁移却既无 `Migrator` 又无 `SkipMigrations()` → 启动报错；`-migrate` 无 `database.url` 亦报错 | ★ 装配级 fail-fast |
 | schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`；在固定数据库环境、可复现迁移下生成确定性文档，不承诺跨 PostgreSQL/扩展/模板库或随机 SQL 的绝对纯函数。CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（原生分区表、生成列、继承…）点名报错；RLS 如实渲染（策略被删/FORCE 被摘即漂移） | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行；从不启用的仓库永远不被检查，跑过一次 `make schema` 就永久转严。新增检查随 appkit release + sync 显式进入下游，不会由 main 突然扩散。 |
@@ -695,12 +698,13 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   最老待投递年龄以 gauge 观测（告警看年龄而不是条数）。标签集在 `internal/metrics` 钉死，
   业务无法追加维度——指标事故几乎都源于"顺手加一个标签"。
 - **跨边界元数据走 `callctx` 白名单**：契约 ctx 防火墙剥掉一切值，
-  只有 request/tenant/caller 三个具名字段被放回；事件 meta 也由 outbox/relay
+  只有 request/partition/tenant/caller 四个具名字段被放回；事件 meta 也由 outbox/relay
   快照与还原。但 HTTP 根入站是另一道信任边界：严格模式只保留 request id，
-  unsigned tenant/caller 会被清空；用户 tenant 由 authn 从已验 tid 重建，服务
-  caller/租户委托待服务 JWT 机制落地。生成 client 会自动焊上 `callctx.Transport`，
-  但传播头只是候选数据，不是身份证明。`apptest.Conform` 的 `SeenMeta` 仍可验证
-  生成 client/server 的传输映射；应用级信任行为由根边界测试单独覆盖。
+  unsigned 身份头会被清空；用户 tenant 由 authn 从已验 tid 重建，服务 caller
+  来自已验 sub，租户/分区委托须通过显式策略。生成的 `NewSecureClient` 使用
+  HTTPS 和每跳新服务凭证，不转发用户令牌；旧 `NewClient` 的 `callctx.Transport`
+  仅传播候选元数据，不是身份证明。`apptest.ConformWithMeta` 可使用合法业务
+  租户/分区对拍；真实严格 App + TLS 集成另验证完整身份链。
 - **本地开发**：`appkit dev` 自动 `go work init/use`（go.work 不提交）；
   发版联动用 Renovate 自动升 require。私有库配 `GOPRIVATE=github.com/forgeplex/*`。
 - **对账（reconciliation）是 PSP 一等公民**：appkit 提供 recovery point 表约定与
@@ -757,10 +761,13 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
    - `apptest.Conform`（契约一致性套件：同一批用例过每个绑定，比对错误码/返回值/
      边界语义）+ `contract.Call` 在进 fn 前拦掉已死的 ctx——**§5.3 的四件套至此
      既是承诺也是可运行的断言**
-6. 🚧 **HTTP 安全边界（Issue #3）**：第一阶段已落地显式 `SecurityMode`、
+6. **HTTP 安全边界（Issue #3）**：已落地显式 `SecurityMode`、
    四类 `Mount*` 与启动矩阵、最外层身份清洗、user-facing Ed25519
-   配置收口、pprof 分类与 migrate-only 豁免。待完成服务 JWT 的
-   iss/aud/sub/exp/iat/kid 验证与委托 claims；此前 bootstrap 对
-   `internal_service` / `mixed` fail-closed。
-7. ⬜ **试点迁移 ledger**（已有最清晰的数据层：sqlc + outbox 已在用），验证约束体系。
-8. ⬜ **psp 组合 repo**：先 `-target=all` 单体上线，拆分是之后的部署决策而非架构决策。
+   配置收口、pprof 分类与 migrate-only 豁免；新增短期服务 JWT 的
+   iss/aud/sub/exp/iat/kid 验证、显式委托及安全 HTTPS 契约客户端。
+   internal/mixed 仍在配置缺失/无效时 fail-closed；机制与限制见 SERVICE_AUTH.md。
+7. ✅ **ledger 等四项目代码试点**：完成接入代码修复及源码副本上的编译、隔离
+   PostgreSQL race 验收；保留原业务模型与历史 SQL。详细范围及工程门禁见
+   FRAMEWORK_ACCEPTANCE.md；此状态不表示业务已上线或迁移了现有数据。
+8. ⬜ **psp 组合 repo（后续业务项目，非本轮框架发布前置）**：可先 `-target=all`
+   单体上线，拆分是之后的部署决策而非架构决策；本轮不执行部署。

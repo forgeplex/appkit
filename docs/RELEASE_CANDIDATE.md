@@ -1,5 +1,9 @@
 # v0.9.0 模块复用版本：升级清单
 
+这是 v0.9.0 的历史升级记录。v0.9.1 已补齐下文当时未交付的服务认证与安全客户端，
+当前接入方式见 [SERVICE_AUTH.md](SERVICE_AUTH.md)，新增验收见
+[FRAMEWORK_ACCEPTANCE.md](FRAMEWORK_ACCEPTANCE.md)。历史版本限制不代表当前能力。
+
 本文件对应已确认的 **v0.9.0** 发布范围；历史上撤回的 v0.8.0 不可重新使用。
 实际发布状态以 GitHub 的 tag / Release 为准。本文件不是 annotated tag message
 或 CHANGELOG 的替代；按 AGENTS.md 以 annotated tag 正文为版本说明的事实源。

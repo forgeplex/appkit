@@ -3,7 +3,15 @@
 
 GO ?= go
 
-.PHONY: build run run-minimal dev check test
+# CLI 使用独立工具 module，不把工具依赖加入业务 go.mod/go.sum。
+# 从本仓 go.mod 取固定版本，忽略 go.work；绝不静默追随 main。
+# devel/v0.0.0 占位或未发布源码联调：显式 APPKIT=/绝对路径/已构建appkit；
+# 需要已发布工具时显式 APPKIT_VERSION=vX.Y.Z。业务 run/test 的 GOFLAGS 不变。
+APPKIT_VERSION ?= $(filter v%,$(shell GOWORK=off $(GO) list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $$2}'))
+APPKIT_FROM_VERSION := $(if $(filter undefined,$(origin APPKIT)),yes,no)
+APPKIT ?= GOWORK=off $(GO) run github.com/forgeplex/appkit/cmd/appkit@$(APPKIT_VERSION)
+
+.PHONY: build run run-minimal dev check test check-tool-version check-appkit-version
 
 build:
 	$(GO) build -o bin/{{.Name}} ./cmd/{{.Name}}
@@ -17,11 +25,22 @@ run-minimal:
 	$(GO) run ./cmd/{{.Name}} -target=all -config=config/dev.yaml -minimal
 
 # 生成/刷新 go.work，纳入同级目录全部子模块（go.work 不提交）。
-dev:
-	$(GO) run github.com/forgeplex/appkit/cmd/appkit dev
+# GOWORK=off 只隔离工具构建；dev 按当前目录扫描并显式指定新 go.work 执行 go work。
+dev: check-tool-version
+	$(APPKIT) dev
 
-check:
-	$(GO) run github.com/forgeplex/appkit/cmd/appkit check
+check: check-tool-version
+	$(APPKIT) check
 
 test:
 	$(GO) test ./...
+
+check-appkit-version:
+	@printf '%s\n' '$(APPKIT_VERSION)' | LC_ALL=C grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$$' || { echo "APPKIT_VERSION 必须为固定版本；go.work 联调请显式指定，禁止 branch/main" >&2; exit 1; }
+
+ifeq ($(APPKIT_FROM_VERSION),yes)
+check-tool-version: check-appkit-version
+else
+check-tool-version:
+	@test -n '$(strip $(APPKIT))' || { echo "显式 APPKIT 命令不能为空" >&2; exit 1; }
+endif

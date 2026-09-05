@@ -165,9 +165,9 @@ unsigned `X-Partition` 只负责传输、不授信。组合根注入「分区键
 - **HTTP 安全模式**：每个监听进程必须显式配置 `security.mode`；生成的 dev
   配置用 `disabled` 只为本地开发，staging/prod 禁用它。模块只负责给每条根
   路由选安全分类，组合根负责按部署暴露面选择模式和装配验签器；不要把“内网”
-  当作身份校验。当前 bootstrap 阶段只有 `user_facing` 可在配好
-  `AuthnPublicKey`/`AuthnIssuer` 后启动；服务 JWT 验证器落地前，
-  `internal_service/mixed` 会有意 fail closed；
+  当作身份校验。`user_facing` 配置 `AuthnPublicKey`/`AuthnIssuer`；
+  `internal_service/mixed` 配置 `security.service` 或 ServiceVerifier，缺失时
+  fail closed。服务 JWT 的租户/分区委托必须显式授权；
 - **金额**：存储与运算用 `decimal.Decimal`（sqlc 已把 NUMERIC 全局 override
   成它，无需注册任何 codec）；需要把"币种+金额"绑在一起时才用 `money.Money`
   （领域层值对象，不落库——币种另列存）。JSON/合约边界金额一律字符串，

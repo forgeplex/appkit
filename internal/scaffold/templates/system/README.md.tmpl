@@ -22,13 +22,15 @@ deploy/              部署说明：同一镜像、不同 -target（见 deploy/R
 ```
 
 `config/dev.yaml` 的 `security.mode: disabled` 只用于本地开发。生产配置故意
-留空并拒绝启动，直到部署者按入口类型选择严格模式并装配对应验签器；当前
-bootstrap 阶段可完整配置 `user_facing`，`internal_service/mixed` 在服务 JWT
-验证器落地前保持 fail closed。
+留空并拒绝启动，直到部署者按入口类型选择严格模式并装配对应验签器。
+`user_facing` 需要用户公钥与 issuer；`internal_service/mixed` 需要
+`security.service` 或 `bootstrap.MainWithSecurity` 的 ServiceVerifier，缺失时
+fail closed。服务租户/分区委托必须显式授权，不能信任 unsigned 身份头。
 
 ## 接入域仓库
 
 1. `go.mod` 里 require 域 repo（如 github.com/forgeplex/ledger）；
 2. `cmd/{{.Name}}/main.go` 里取消对应 `appkit.Modules` 装配注释；
-3. target 之外的契约补 `appkit.Remote(xxxv1.NewClient)`；
+3. target 之外的契约用 `appkit.Remote` 注册构造器，返回 `xxxv1.NewSecureClient`；
+   必须提供 HTTPS 地址、Audience 与 Credentials，见 AppKit `docs/SERVICE_AUTH.md`；
 4. 声明了事件消费者的域需要 `appkit.Bus(...)`（单库直投用 outbox.NewDirectBus()）。

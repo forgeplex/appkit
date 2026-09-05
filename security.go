@@ -56,8 +56,8 @@ const (
 // 注入它；网络输入本身永远不能直接构造可信 principal。
 //
 // TenantID/MerchantID 是服务凭证中已签名且已授权的委托范围，不是 unsigned
-// X-Tenant-Id/X-Merchant-Id 请求头。服务 JWT 的具体签发与验证在后续机制件中
-// 完成，本结构先固定路由授权所需的可信落点。
+// X-Tenant-Id/X-Merchant-Id 请求头。authn.ServiceVerifier 验证服务 JWT 后
+// 注入本结构；具体业务权限仍由路由与服务实现判定。
 type ServicePrincipal struct {
 	Subject    string
 	Issuer     string
@@ -70,6 +70,17 @@ type ServicePrincipal struct {
 }
 
 type servicePrincipalKey struct{}
+
+type untrustedIdentityHeadersKey struct{}
+
+// UntrustedIdentityHeadersFrom 返回严格 HTTP 边界剥离的原始身份头副本。
+// 这些值始终不可信，只供服务验签器拒绝 header 与签名声明冲突，绝不能据此
+// 授予身份或租户权限。只保存 partition/tenant/caller/merchant，既不包含
+// 凭证，也不穿过 contract 的 ctx 防火墙。返回值可修改，不会改变边界快照。
+func UntrustedIdentityHeadersFrom(ctx context.Context) http.Header {
+	h, _ := ctx.Value(untrustedIdentityHeadersKey{}).(http.Header)
+	return h.Clone()
+}
 
 // WithServicePrincipal 把已验证的服务身份放进 ctx。正常路径仅供服务凭证
 // 验证中间件使用；测试可用它构造授权场景。
@@ -166,22 +177,30 @@ func (r *Registry) validateRouteSecurity(mode SecurityMode, pprof bool) error {
 // RequestID 保留；它用于追踪，不授予数据或调用权限。
 func identityBoundary(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		untrusted := make(http.Header)
+		for name, values := range req.Header {
+			for _, identity := range []string{callctx.HeaderPartition, callctx.HeaderTenantID, callctx.HeaderCaller, "X-Merchant-Id"} {
+				if strings.EqualFold(name, identity) {
+					key := http.CanonicalHeaderKey(identity)
+					untrusted[key] = append(untrusted[key], values...)
+				}
+			}
+		}
 		meta := callctx.From(req.Context())
 		meta.Partition = ""
 		meta.TenantID = ""
 		meta.Caller = ""
-		ctx := callctx.With(req.Context(), meta)
+		ctx := context.WithValue(callctx.With(req.Context(), meta), untrustedIdentityHeadersKey{}, untrusted)
 		// 遮蔽可能由边界外代码带入的主体；后续验签器只能重新注入新值。
 		ctx = clearActor(ctx)
 		ctx = WithServicePrincipal(ctx, ServicePrincipal{})
 
 		clean := req.Clone(ctx)
-		clean.Header.Del(callctx.HeaderPartition)
-		clean.Header.Del(callctx.HeaderTenantID)
-		clean.Header.Del(callctx.HeaderCaller)
-		// Merchant header 会在 merchant principal 正式落地前就按同一信任规则
-		// 清除，避免调用方抢先把它当成可信输入。
-		clean.Header.Del("X-Merchant-Id")
+		for name := range clean.Header {
+			if _, ok := untrusted[http.CanonicalHeaderKey(name)]; ok {
+				delete(clean.Header, name)
+			}
+		}
 		next.ServeHTTP(w, clean)
 	})
 }
