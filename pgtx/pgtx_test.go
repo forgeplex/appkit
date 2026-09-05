@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/internal/dbtest"
 	"github.com/forgeplex/appkit/pgtx"
 	"github.com/forgeplex/appkit/tx"
@@ -511,6 +512,68 @@ func TestRoutedNestedDo(t *testing.T) {
 		if got := routedCount(t, pool, a, v); got != 1 {
 			t.Errorf("嵌套写入 %q 行数 = %d, want 1", v, got)
 		}
+	}
+}
+
+// TestRoutedNestedScopeMismatch prevents a nested savepoint from replacing the
+// outer search_path. The same resolved schema remains composable even when a
+// separately constructed Transactor owns the nested call.
+func TestRoutedNestedScopeMismatch(t *testing.T) {
+	pool := dbtest.Pool(t)
+	a, b := routedSchemas(t, pool)
+	route := func(ctx context.Context) (string, error) {
+		if callctx.From(ctx).Partition == "b" {
+			return b, nil
+		}
+		return a, nil
+	}
+	outer := pgtx.NewRouted(pool, route)
+	other := pgtx.NewRouted(pool, route)
+	base := callctx.With(context.Background(), callctx.Meta{Partition: "a"})
+
+	ranRejected := false
+	err := outer.Do(base, func(ctx context.Context) error {
+		inner := callctx.With(ctx, callctx.Meta{Partition: "b"})
+		innerErr := outer.Do(inner, func(context.Context) error {
+			ranRejected = true
+			return nil
+		})
+		if innerErr == nil || !strings.Contains(innerErr.Error(), "嵌套事务内切换作用域") {
+			return fmt.Errorf("nested route rebind should fail, got %v", innerErr)
+		}
+		var schema string
+		if err := pgtx.From(ctx, pool).QueryRow(ctx, "SELECT current_schema()").Scan(&schema); err != nil {
+			return err
+		}
+		if schema != a {
+			return fmt.Errorf("outer search_path changed to %q", schema)
+		}
+		return nil
+	})
+	if err != nil || ranRejected {
+		t.Fatalf("nested route rebind must not run callback or alter outer scope: err=%v ran=%v", err, ranRejected)
+	}
+
+	ran := false
+	err = outer.Do(base, func(ctx context.Context) error {
+		return other.Do(ctx, func(context.Context) error { ran = true; return nil })
+	})
+	if err != nil || !ran {
+		t.Fatalf("same routed scope across transactors should use a savepoint: err=%v ran=%v", err, ran)
+	}
+
+	plain := pgtx.New(pool)
+	err = plain.Do(context.Background(), func(ctx context.Context) error {
+		return outer.Do(callctx.With(ctx, callctx.Meta{Partition: "a"}), func(context.Context) error { return nil })
+	})
+	if err == nil || !strings.Contains(err.Error(), "嵌套事务内切换作用域") {
+		t.Fatalf("plain to routed nested upgrade should fail, got %v", err)
+	}
+	err = outer.Do(base, func(ctx context.Context) error {
+		return plain.Do(ctx, func(context.Context) error { return nil })
+	})
+	if err == nil || !strings.Contains(err.Error(), "嵌套事务内切换作用域") {
+		t.Fatalf("routed to plain nested downgrade should fail, got %v", err)
 	}
 }
 

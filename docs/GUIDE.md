@@ -230,6 +230,14 @@ appkit new domain docs -tenant -dir docs
    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA docs TO docs_app;
    ```
 
+**嵌套事务的范围固定**：最外层 `pgtx.Do` 确定 tenant 模式、tenant ID、
+read-all 与实际路由 schema，内层只能沿用同一范围和原 callback ctx。
+内层切换 tenant/schema、切换普通/隔离事务模式或替换事务句柄会在开启 savepoint
+前拒绝，外层可以处理该错误后继续。不同 Transactor 的同范围嵌套仍可用。
+不要手工 `tx.With(ctx, rawPgxTx)` 后调用 `pgtx.Do`：无法验证的外部事务会被拒绝，
+应改为让最外层 `pgtx.Do` 创建事务。需要切租户时，结束当前事务后再开新事务。
+此守卫防止框架嵌套误用；它不阻止受信代码直接执行 `SET LOCAL` SQL。
+
 跨租户的**读**有正门：管理面用例（运营看全部商户的订单、全局搜索、总览
 看板）先过跨租户权限码，再打标记后开事务——
 
@@ -1295,6 +1303,43 @@ keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可
 （lint/CI 配置、sqlc 产物、基础迁移）留在你仓库里但带生成头，改了会被
 `appkit check` 拦下——包括"把规则改松"这一手。你写的代码在 `internal/`，
 和上面两类不共处一处。
+
+## 独立 sqlc schema 快照
+
+迁移是数据库演进的事实源，sqlc 可以只读当前结构。新脚手架携带自包含的
+`internal/postgres/schematool`；既有域用 `appkit schema-tool -dir /path/to/domain`
+安装（只写框架工具源码，不改依赖、迁移、Makefile、sqlc 配置或数据库）。工具使用已存在的 AppKit/pgx
+API，可在仍依赖 v0.9.2 的域中运行，不需要 pg_dump。
+
+```sh
+# 在域仓库中；分区域加 -partitioned，固定 schema 域不加
+go run ./internal/postgres/schematool -domain invoice -partitioned
+# 首次生成后，先将 sqlc.yaml 唯一 PostgreSQL schema 输入改为 db/schema.sql
+go run ./internal/postgres/schematool -domain invoice -partitioned -check-source
+go run ./internal/postgres/schematool -domain invoice -partitioned -check
+```
+
+生成与 `-check` 需要 `TEST_DATABASE_URL` 指向测试服务器，并有 CREATEDB 权限。
+工具只在随机命名的一次性数据库里运行 pgmigrate，再读取 catalog，退出时清理；
+迁移 SQL 和测试服务器必须可信；这不是 SQL 沙箱，不应传入生产或共享业务库的
+连接凭证。它不会迁移连接串指向的现有库。输出 `db/schema.sql` 和 `db/schema.lock.json` 后，
+将 sqlc 的 `schema` 输入改为 `db/schema.sql`。脚手架的 `make schema-sqlc` 与
+`make schema-check` 封装上述步骤；`make schema` 保持原有文档/ER 图导出含义。
+新仓库首次采用是显式步骤，以保留 `appkit new` 不依赖数据库的能力。
+
+快照包含当前受支持对象的 DDL，排除迁移历史表，不含 owner/grants/序列运行值；
+是代码生成/阅读输入，不是部署脚本或完整备份。不支持的特性会明确报错。
+采用快照时仅支持一个 PostgreSQL SQL 项与一个 `db/schema.sql` 输入；未采用快照时
+不会把这些约束施加给已有多输入配置。
+显式生成仅在首次无快照/lock 时允许从单个 `db/migrations` 输入起步；生成后须先
+切换 sqlc 配置再运行后续命令。`-check`、`-check-source` 与采用后的普通测试共用
+sqlc 配置校验；配置改回迁移、多输入或非 PostgreSQL 会在连接数据库前失败。
+分区域使用 sqlc 默认的 `public` 作为编译期代表 schema，不改变 prefixless 运行时
+查询或路由。普通测试校验源/快照哈希，带 TEST_DATABASE_URL 的测试还会重放数据库
+逐字比对；仅修改哈希并不能通过数据库验收。删除一半产物不能关闭检查。
+
+已应用到需保留数据库的迁移继续只追加。开发期仅在明确授权且不需要旧库升级
+兼容时，才可把过渡迁移合并回初始建表；不要自动重建数据库或改 checksum 绕过漂移。
 
 ## Agent 的计划/应用与命名实例
 

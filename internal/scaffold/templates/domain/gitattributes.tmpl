@@ -1,6 +1,12 @@
 # 迁移文件参与 sha256 校验（pgmigrate 的不可变性守卫）：换行必须跨平台一致，
 # 否则在 Windows 上 checkout 会把 LF 变 CRLF，触发误报的 MIGRATION_DRIFT。
 *.sql text eol=lf
+# 快照来源锁按原始字节验证；生成工具与输入配置跨平台保持 LF。
+db/schema.lock.json text eol=lf
+internal/postgres/schematool/*.go text eol=lf
+.appkit.yml text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
 
 # 框架产物与工具生成物：GitHub PR 里默认折叠。
 # 折叠不是为了隐藏，而是让"有人手改了生成物"这件事在 diff 里更打眼。
@@ -12,4 +18,7 @@
 internal/postgres/sqlc/** linguist-generated=true
 db/SCHEMA.md             linguist-generated=true
 db/schema/**             linguist-generated=true
+db/schema.sql            linguist-generated=true
+db/schema.lock.json      linguist-generated=true
+internal/postgres/schematool/** linguist-generated=true
 *.gen.go                 linguist-generated=true

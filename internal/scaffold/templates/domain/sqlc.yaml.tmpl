@@ -8,6 +8,7 @@
 version: "2"
 sql:
   - engine: "postgresql"
+    # 首次 make schema-sqlc 后可切为 db/schema.sql；迁移仍是唯一事实源。
     schema: "db/migrations"
     queries: "db/queries"
     gen:

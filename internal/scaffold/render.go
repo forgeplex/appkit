@@ -28,6 +28,13 @@ func RenderDomain(o Options) (map[string][]byte, error) {
 	if o.Tenant {
 		files["db/migrations/0002_demo_notes.sql"] = []byte(tenantDemoSQL(o))
 	}
+	tool, err := SchemaToolFiles()
+	if err != nil {
+		return nil, err
+	}
+	for name, content := range tool {
+		files[name] = content
+	}
 	cfg, err := ruleset.ParseAppConfig(files[".appkit.yml"])
 	if err != nil {
 		return nil, fmt.Errorf("new domain %s: 物化规则集: %w", o.Name, err)

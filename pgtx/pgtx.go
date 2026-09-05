@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"time"
 
@@ -168,60 +169,80 @@ func NewRoutedTenant(pool *pgxpool.Pool, route func(ctx context.Context) (string
 	return &Transactor{pool: pool, route: &router{fn: route}, tenant: true}
 }
 
-// routeSchema 在事务开启后落位 search_path（嵌套幂等性见 beforeFn）。
-func (t *Transactor) routeSchema(ctx context.Context, ptx pgx.Tx) error {
+// transactionScope is the complete transaction-local state pgtx can change.
+// PostgreSQL SET LOCAL persists after a nested savepoint is released, therefore
+// every nested Do must derive exactly the same state as its outer transaction.
+// Empty tenant is significant: it differs from a tenant-scoped transaction.
+type transactionScope struct {
+	tenant   bool
+	tenantID string
+	readAll  bool
+	routed   bool
+	schema   string
+}
+
+type transactionMarker struct {
+	scope  transactionScope
+	handle pgx.Tx
+}
+
+// scopeKey carries the scope and exact pgx transaction established by pgtx.Do.
+// It is private deliberately: callers may derive contexts, but cannot
+// manufacture a trusted marker for an existing pgx transaction.
+type scopeKey struct{}
+
+// sameTx checks actual values with reflect.Value.Comparable, not merely
+// reflect.Type.Comparable: a comparable struct type may hold a slice inside an
+// interface field. Value.Comparable checks those contents too and guarantees
+// that a subsequent interface equality will not panic. Uncomparable handles
+// are conservatively not trusted as the marker's transaction.
+func sameTx(a, b pgx.Tx) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	aValue, bValue := reflect.ValueOf(a), reflect.ValueOf(b)
+	if aValue.Type() != bValue.Type() || !aValue.Comparable() || !bValue.Comparable() {
+		return false
+	}
+	return aValue.Interface() == bValue.Interface()
+}
+
+func (t *Transactor) deriveScope(ctx context.Context) (transactionScope, error) {
+	s := transactionScope{tenant: t.tenant, readAll: tx.ReadsAllTenants(ctx), routed: t.route != nil}
+	if t.tenant {
+		s.tenantID = callctx.From(ctx).TenantID
+	}
 	if t.route == nil {
-		return nil
+		return s, nil
 	}
 	schema, err := t.route.fn(ctx)
 	if err != nil {
-		return err
+		return transactionScope{}, err
 	}
 	if !schemaRe.MatchString(schema) {
-		return fmt.Errorf("pgtx: 路由返回的 schema 名 %q 不合法（须匹配 %s）", schema, schemaRe)
+		return transactionScope{}, fmt.Errorf("pgtx: 路由返回的 schema 名 %q 不合法（须匹配 %s）", schema, schemaRe)
 	}
-	if _, err := ptx.Exec(ctx, "SET LOCAL search_path TO "+pgx.Identifier{schema}.Sanitize()); err != nil {
-		return fmt.Errorf("pgtx: 设置 search_path: %w", err)
-	}
-	return nil
+	s.schema = schema
+	return s, nil
 }
 
-// beforeFn 落事务前置状态：分区的 search_path 与租户 GUC（各自按构造
-// 形态启用）。嵌套 Do（savepoint）会再次走到这里：route 纯函数、租户
-// 取自同一 ctx，重复执行解析出同样的值，幂等无害。
-func (t *Transactor) beforeFn(ctx context.Context, ptx pgx.Tx) error {
-	if err := t.routeSchema(ctx, ptx); err != nil {
-		return err
+// applyScope installs the already checked, transaction-local state. Values are
+// parameters; only the validated schema identifier is interpolated.
+func applyScope(ctx context.Context, ptx pgx.Tx, s transactionScope) error {
+	if s.routed {
+		if _, err := ptx.Exec(ctx, "SET LOCAL search_path TO "+pgx.Identifier{s.schema}.Sanitize()); err != nil {
+			return fmt.Errorf("pgtx: 设置 search_path: %w", err)
+		}
 	}
-	return t.setTenantGUC(ctx, ptx)
-}
-
-// scopeKey 记录本事务已落位的租户可见范围（true = 读全部），供嵌套 Do
-// 校验模式没有中途切换。
-type scopeKey struct{}
-
-// setTenantGUC 把 callctx 里的租户身份落成事务级 GUC（set_config 第三参
-// true：事务结束自动还原，连接归还池时不带走）。空租户不设——语义见
-// NewTenant。ctx 带读全部标记时另落 app.tenant_scope=all。
-//
-// 嵌套 Do 内的模式必须与外层一致：SET LOCAL 的作用域是整个事务，
-// savepoint 里切成读全部、释放后外层剩下的查询也全放开了——这是静默
-// 扩权，直接拒绝。
-func (t *Transactor) setTenantGUC(ctx context.Context, ptx pgx.Tx) error {
-	if !t.tenant {
+	if !s.tenant {
 		return nil
 	}
-	readAll := tx.ReadsAllTenants(ctx)
-	if applied, nested := ctx.Value(scopeKey{}).(bool); nested && applied != readAll {
-		return errors.New("pgtx: 嵌套事务内切换读全部租户模式——tx.WithReadAllTenants 必须在最外层 Do 之前打" +
-			"（SET LOCAL 延续到外层事务结束，savepoint 内切换等于静默扩权）")
-	}
-	if tenant := callctx.From(ctx).TenantID; tenant != "" {
-		if _, err := ptx.Exec(ctx, "SELECT set_config('"+tenantGUC+"', $1, true)", tenant); err != nil {
+	if s.tenantID != "" {
+		if _, err := ptx.Exec(ctx, "SELECT set_config('"+tenantGUC+"', $1, true)", s.tenantID); err != nil {
 			return fmt.Errorf("pgtx: 设置租户 GUC: %w", err)
 		}
 	}
-	if readAll {
+	if s.readAll {
 		if _, err := ptx.Exec(ctx, "SELECT set_config('"+tenantScopeGUC+"', 'all', true)"); err != nil {
 			return fmt.Errorf("pgtx: 设置读全部租户 GUC: %w", err)
 		}
@@ -243,17 +264,44 @@ type beginner interface {
 // 其上开 savepoint。fn 返回错误或 panic 都会回滚（panic 回滚后继续抛出），
 // 否则提交。fn 收到的 ctx 携带事务句柄，经 From 取到的 DBTX 即该事务。
 //
+// 嵌套只接受 pgtx.Do 建立的原事务 ctx，且租户模式、tenant ID、读全部模式
+// 与实际路由 schema 必须相同。手工注入 raw pgx.Tx 或替换 ctx 的事务句柄
+// 无法验证作用域，直接拒绝；应由最外层 pgtx.Do 建立事务并传递 callback ctx。
+// 不同 Transactor 可在同一有效作用域内嵌套，仍使用 savepoint。
+//
 // 收尾靠无条件 defer 而非 recover：recover 兜不住 runtime.Goexit（testing
 // 的 t.Fatal/FailNow 即是），Goexit 下事务既不提交也不回滚 = 连接泄漏到
 // 进程退出。defer 在返回、panic、Goexit 三种退出路径下都执行，连接必归还。
 func (t *Transactor) Do(ctx context.Context, fn func(ctx context.Context) error) (err error) {
 	var b beginner = t.pool
+	nested := false
+	var nestedHandle pgx.Tx
 	if h := tx.Value(ctx); h != nil {
 		cur, ok := h.(pgx.Tx)
 		if !ok {
 			return fmt.Errorf("pgtx: ctx 携带的事务句柄是 %T 而非 pgx.Tx：混用了不同的 Transactor 实现", h)
 		}
 		b = cur
+		nested = true
+		nestedHandle = cur
+	}
+
+	scope, err := t.deriveScope(ctx)
+	if err != nil {
+		return err
+	}
+	if nested {
+		outer, ok := ctx.Value(scopeKey{}).(transactionMarker)
+		if !ok {
+			return errors.New("pgtx: ctx 带有未由 pgtx.Do 建立的事务，无法验证嵌套事务作用域")
+		}
+		if !sameTx(outer.handle, nestedHandle) {
+			return errors.New("pgtx: ctx 的事务句柄与已建立的嵌套事务作用域不匹配")
+		}
+		if outer.scope != scope {
+			return errors.New("pgtx: 嵌套事务内切换作用域——tenant、route 与读全部模式必须在最外层 Do 之前确定" +
+				"（SET LOCAL 延续到外层事务结束，savepoint 内切换会改变外层事务）")
+		}
 	}
 	ptx, err := b.Begin(ctx)
 	if err != nil {
@@ -271,14 +319,10 @@ func (t *Transactor) Do(ctx context.Context, fn func(ctx context.Context) error)
 		}
 	}()
 
-	if err := t.beforeFn(ctx, ptx); err != nil {
+	if err := applyScope(ctx, ptx, scope); err != nil {
 		return err
 	}
-	fnCtx := tx.With(ctx, ptx)
-	if t.tenant {
-		// 记下本事务已落位的可见范围：嵌套 Do 据此拒绝中途切换读全部模式。
-		fnCtx = context.WithValue(fnCtx, scopeKey{}, tx.ReadsAllTenants(ctx))
-	}
+	fnCtx := context.WithValue(tx.With(ctx, ptx), scopeKey{}, transactionMarker{scope: scope, handle: ptx})
 	if err := fn(fnCtx); err != nil {
 		return err
 	}
