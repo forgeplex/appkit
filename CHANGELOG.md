@@ -2,6 +2,42 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.9.1（2026-09-05）
+
+服务身份、安全远程契约与业务接入收尾
+
+补齐 v0.9.0 明确保留的服务 JWT 机制和接入代码。本次只交付代码、测试与框架版本，不执行部署或现有业务数据库迁移。
+
+新增与修复：
+
+- authn.ServiceVerifier / ServiceSigner：Ed25519 短期服务 JWT，静态 issuer + kid + subject 信任表，精确单一 audience，必填 exp/iat，固定类型/用途，最长 5 分钟。
+- tenant / merchant / partition 委托须显式授权；未配置策略拒绝非空范围。Caller 从已验证服务 subject 重建，拒绝签名声明与身份头冲突，mixed 中两份凭证范围必须一致。
+- bootstrap 支持 security.service 声明式公钥和精确委托规则，以及 MainWithSecurity / RunWithSecurity 的 ServiceVerifier 和多用户签发方注入；缺失或无效配置仍在数据库/模块装配/监听前失败。
+- 迁移专用路径完全跳过 HTTP 安全配置加载与验证器构造，避免无关认证配置阻断迁移命令。
+- 生成 NewSecureClient 和 contract.NewSecureHTTPClient：强制 HTTPS、凭证 provider 与 audience，锁定 origin，禁止重定向、跳过 TLS 验证、cookie jar 和 HTTP trailer；每次尝试获取凭证，不转发用户或上一跳的令牌。
+- 用户签发方配置深拷贝，拒绝重复 Authorization 与 service/step-up 令牌冒充用户访问令牌。
+- apptest.ConformWithMeta 支持业务合法的租户/分区测试标识，并检查分区传播；保留原 Conform 签名与默认行为。
+- 域/组合脚手架 Makefile 使用按依赖版本固定的独立 CLI module，修复只读业务依赖图被工具依赖污染的问题；更新安全装配示例与文档。
+
+升级提示：
+
+- 现有用户访问令牌的 purpose 仅允许省略或 access；step-up 仍使用独立 X-Step-Up。服务凭证使用 X-Service-Authorization，不替代用户 Actor。
+- 旧 NewClient 保留兼容，但不提供服务认证；生产内部契约请重新生成并显式使用 NewSecureClient，接收端路由使用 MountInternalService。
+- 空租户/分区不是“全部”。业务入口仍须校验资源归属与请求范围；账本 ID、全局表或后台任务不能被机械改成 tenant。
+- v0.9.0 的显式安全模式、Partition/TenantID 分离和既有 RLS 升级要求继续适用；有数据的项目仍需自己的新增迁移和升级演练，不能改历史 SQL。
+
+边界：服务 JWT 是短期 bearer token，不是一次性凭证；本版不提供在线吊销、自动 JWKS、mTLS/SPIFFE 或生产密钥托管。签发策略和组合根仍是受信代码。原有业务仓库的代码修复不等于这些仓库已经发布或上线。
+
+验证：
+
+- make check、隔离 PostgreSQL 18.6 全框架 race、独立 lint module、真实规则检查器 E2E、五形态脚手架编译/check 全部通过；go mod tidy 无漂移，相对 v0.9.0 公开 API 零 incompatible。
+- 四项目最终源码副本完整 build/隔离 DB race：email 135、notification 78、RBAC 376、ledger 504 个 test/subtest 通过，均无失败；ledger 仅两个可选性能播种测试未启用。
+- 业务代码补齐签名服务入口、RBAC 分区与原权限语义、认证/授权先于幂等缓存、ledger 重放前资源归属复核、email HMAC 渠道与回执联合匹配；未修改历史 DDL，也未操作现有数据库。
+
+文档：
+- [服务认证与轮换](https://github.com/forgeplex/appkit/blob/v0.9.1/docs/SERVICE_AUTH.md)
+- [框架与业务代码验收](https://github.com/forgeplex/appkit/blob/v0.9.1/docs/FRAMEWORK_ACCEPTANCE.md)
+
 ## v0.9.0（2026-09-05）
 
 模块复用、Agent 工作流与显式安全边界
