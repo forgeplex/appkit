@@ -2,7 +2,47 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
-## v0.7.2（2026-09-03）
+## ��2026-09-05）
+
+模块复用、Agent 工作流与显式安全边界
+
+面向多个独立 Go 项目复用模块，以及 Agent 可审查、可恢复的代码生成流程。
+本版整合 v0.7.2 之后的框架功能与安全修复；v0.8.0 历史版本号不复用。
+
+新增与修复：
+
+- 按 Go 类型与名称精确绑定实例；保留无名绑定，不跨名称回退。实例名称不是租户或授权边界。
+- plan/apply/replay、输入输出快照、冲突检查和恢复日志；支持规则、契约、事件、错误码、wrapper、脚手架与 schema 文档。
+- 独立 Partition 与 TenantID、多签发方用户验签、分区＋行级隔离、显式只读跨租户及五种脚手架。
+- 分区域 schema 逻辑模板、目录成员 guard、契约生成漂移与保守模型兼容检查。
+- 不可变 workflow SHA、显式离线 -workflow-ref；自动来源解析支持取消，在工作区锁外执行，不把下游 HEAD 当作框架来源。
+- 修复 SkipMigrations 配置传递，接入受管 Broker 的启动、停机排空与失败关闭；CI 的 Action、工具与数据库镜像固定来源。
+
+升级必读：
+
+- 默认启动行为改变。App.Run 必须声明 Security；bootstrap 必须配置 security.mode。严格模式拒绝旧 Mount 的未分类根路由，须按实际语义分类，不能把业务端点统一改为 Public。
+- 严格 HTTP 边界不再信任外部 Actor/ServicePrincipal、身份上下文及 unsigned partition/tenant/caller 头，须由已验证凭证重建身份。
+- 无数据库不再隐式降级；零依赖试跑仅允许 dev 显式 -minimal。
+- 拆分 target 默认拒绝隐式 DirectBus；须通过 NewBus 配置外部 Broker，或用 AllowDirectBusForSplit 明确承担仅进程内投递的例外。无订阅者返回 ErrNoSubscriber，outbox 保留事件重试，不再把无人消费确认为投递成功。
+- 曾借 TenantID 路由 schema 的项目须迁至 Partition，并检查调用方、事件生产/消费与组合根映射。
+- 旧 RLS 必须新增迁移：先用 TenantScopeSQL 刷新上下文函数，再为各表更新 TenantPolicySQL 两条策略；分区域使用对应 Bare 版本，勿改历史迁移。用非 superuser/BYPASSRLS 角色验收。
+
+已知边界：
+
+- 标准 service JWT 验证器尚未交付；bootstrap 的 internal_service/mixed 仍拒绝启动，不宣称已完成生产级服务间认证。
+- 跨租户能力只显式开放读取，须事先授权、在外层事务前设置且不跨契约/事件传播；没有“写全部”模式。
+- schema 规划会在临时数据库执行可信 SQL，不是沙箱；逻辑模板不检查运行分区。apply 不执行业务迁移、部署或下游升级。
+- 文件提交可恢复，但不是对所有外部读者原子可见的事务；计划摘要只绑定选定输入输出，不是完整仓库证明或制品签名。
+- 公开 API 相对 v0.7.2 的 apidiff 零 incompatible，仅证明声明兼容，不代表旧应用无需调整即可启动。
+
+验收：本地 make check、PostgreSQL 18.6 全仓 race、lint module、真实规则 E2E、五形态编译/check、真实 CLI 离线与超时回归均通过。四业务源码副本均编译及真实数据库 race 通过；仅 ledger 两项性能播种 skip。业务仓库原有 go.sum/规则漂移单列，不冒充所有业务工程门禁或生产升级已完成。
+
+详细说明：
+- [升级清单](https://github.com/forgeplex/appkit/blob/v0.9.0/docs/RELEASE_CANDIDATE.md)
+- [Agent 工作流](https://github.com/forgeplex/appkit/blob/v0.9.0/docs/AGENT_WORKFLOW.md)
+- [验收范围与限制](https://github.com/forgeplex/appkit/blob/v0.9.0/docs/FRAMEWORK_ACCEPTANCE.md)
+
+## ��2026-09-03）
 
 page 包：列表端点的分页机制件
 
@@ -40,7 +80,7 @@ offset/page 码 API、双向翻页、游标签名、total/COUNT。
 仓库行为不变。已有列表端点（如 ledger 的旧游标串）不必迁移——旧
 格式继续工作，新端点用框架。
 
-## v0.7.1（2026-09-02）
+## ��2026-09-02）
 
 pgtx 修缮：事务收尾兜住 Goexit + DB 对齐 sqlc 批处理
 
@@ -78,7 +118,7 @@ DBTX 加上该方法，pgtx.From 的返回值进不了 sqlc.New，事务感知�
 Fixes #1
 Fixes #2
 
-## v0.7.0（2026-09-02）
+## ��2026-09-02）
 
 租户机制归框架：authn 焊 callctx + 单 schema 域 RLS 强制 + 第三种域形态 -tenant
 
@@ -132,7 +172,7 @@ Fixes #2
 新增框架面（租户子系统），值得每个多租户部署读一遍 GUIDE §3.2，故
 minor 而非 patch。
 
-## v0.6.0（2026-09-02）
+## ��2026-09-02）
 
 权限抽象进框架：声明 / 绑定 / 判定 / step-up
 
@@ -180,7 +220,7 @@ AuthnPublicKey 的系统行为不变。0.x 期间号是节拍：这版是新框�
 （权限子系统），域仓库的接入方式（声明 + 绑码 + 组合根挂验签）值得
 每个升级者读一遍 GUIDE 鉴权章节，故 minor 而非 patch。
 
-## v0.5.5（2026-09-02）
+## ��2026-09-02）
 
 分区域域 CI 解锁
 
@@ -202,7 +242,7 @@ AuthnPublicKey 的系统行为不变。0.x 期间号是节拍：这版是新框�
 
 影响面：分区域域 CI 从永红变可绿；单 schema 域行为不变。
 
-## v0.5.4（2026-09-02）
+## ��2026-09-02）
 
 真实客户端 IP 边缘解析 + MIT License
 
@@ -229,7 +269,7 @@ AuthnPublicKey 的系统行为不变。0.x 期间号是节拍：这版是新框�
 
 纯加法，apidiff 相对 v0.5.3 零 incompatible。
 
-## v0.5.3（2026-09-01）
+## ��2026-09-01）
 
 分区域域（partitioned domain）：一套代码、N 份数据分区，schema 由调用方确定
 
@@ -271,7 +311,7 @@ Transactor 保持可比较（路由函数收在指针后）。既有单 schema �
 
 详见 docs/DESIGN.md §8「分区域域」与 docs/GUIDE.md §3.1。
 
-## v0.5.2（2026-09-01）
+## ��2026-09-01）
 
 v0.5.2: 契约流水线落地——contract.yaml 一次生成五件套，零破坏性、零必做动作
 
@@ -304,7 +344,7 @@ examples/greeter 的 greetapi 已改为全生成，是这条链路的最小实�
 /debug/pprof）；make tag 现在同时打 lint/vX.Y.Z 路标——lint 是
 嵌套 module，下游以伪版本引用时需要同节拍的路标 tag。
 
-## v0.5.1（2026-08-31）
+## ��2026-08-31）
 
 v0.5.1: 三个安静的注入口——池选项透传、死信放回、测试样板收敛
 
@@ -322,7 +362,7 @@ v0.5.1: 三个安静的注入口——池选项透传、死信放回、测试样
 
 零默认行为变更，纯加法与内部收敛，故 patch（分寸见 AGENTS.md 发版节）。
 
-## v0.5.0（2026-08-31）
+## ��2026-08-31）
 
 v0.5.0: 金额边界焊死——decimal 持久化、decjson 机检、幂等指纹可注入
 
@@ -342,7 +382,7 @@ idem：WithCanonicalizer 让领域规范化口径接进中间件指纹，"80"/"8
 
 全部为加法：apidiff 相对 v0.4.0 零 incompatible。
 
-## v0.4.0（2026-08-31）
+## ��2026-08-31）
 
 v0.4.0: schema 设计从「在脑子里重放迁移历史」变成一份可 review 的生成物
 
@@ -389,11 +429,11 @@ appkit sync 不管它们（sync 只物化 .golangci.yml / .go-arch-lint.yml /
 照旧新开迁移文件，建表时顺手写 COMMENT ON TABLE——表的用途属于 schema 设计，
 写在迁移里才会跟着表一起演进。
 
-## v0.3.1（2026-08-31）
+## ��2026-08-31）
 
 fix: apptest 元数据传播检查不再多跑非幂等调用
 
-## v0.3.0（2026-08-31）
+## ��2026-08-31）
 
 v0.3.0: 出站 callctx 白名单从「纯约定」走到「装配一次 + 验得到」
 
@@ -408,7 +448,7 @@ v0.3.0: 出站 callctx 白名单从「纯约定」走到「装配一次 + 验得
 公开 API 仅新增，apidiff 零 incompatible。下游升级后无需改动既有代码；
 要用新能力则：出站 client 装 Transport，契约测试的 Binding 填 SeenMeta。
 
-## v0.2.2（2026-08-30）
+## ��2026-08-30）
 
 v0.2.2: 规则集端到端测试——物化规则首次被真正消费
 
@@ -421,11 +461,11 @@ v0.2.2: 规则集端到端测试——物化规则首次被真正消费
 
 下游无需动作：公开 API 与规则模板与 v0.2.1 完全一致。
 
-## v0.2.1（2026-08-30）
+## ��2026-08-30）
 
 fix(ruleset): 让物化的 lint 规则容得下有子包的域
 
-## v0.2.0（2026-08-30）
+## ��2026-08-30）
 
 v0.2.0 —— 五项框架托底能力 + 物化规则真正在 CI 执行
 
@@ -451,7 +491,7 @@ v0.2.0 —— 五项框架托底能力 + 物化规则真正在 CI 执行
 下游域仓库需各跑一次 `appkit sync`：.golangci.yml 与 .go-arch-lint.yml 内容有变，
 否则 CI 的漂移检查会红。
 
-## v0.1.1（2026-08-30）
+## ��2026-08-30）
 
 v0.1.1 —— AI agent 操作规程
 
@@ -460,7 +500,7 @@ v0.1.1 —— AI agent 操作规程
 
 公开 API 零变更（apidiff 相对 v0.1.0 零 incompatible）。
 
-## v0.1.0（2026-08-30）
+## ��2026-08-30）
 
 appkit v0.1.0：首个发布版本
 
