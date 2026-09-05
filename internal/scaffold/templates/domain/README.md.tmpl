@@ -60,6 +60,22 @@ CI 都会校验未漂移（改松规则不会让检查变绿）。CI 先验漂�
 {{- end}}
 建表时在迁移里写 `COMMENT ON TABLE`；文档从迁移中的说明生成，不另存一份事实源。
 
+### 可选：让 sqlc 读取当前结构快照
+
+`make schema-sqlc` 使用 `TEST_DATABASE_URL` 指定的一次性测试服务器，在新随机库
+回放迁移，生成 `db/schema.sql` 和 `db/schema.lock.json`；不迁移连接串指向的库。
+首次生成后，手动将 `sqlc.yaml` 的 `schema` 改为 `db/schema.sql` 并提交两个产物。
+以后改迁移先 `make schema-sqlc`，再 `make gen`；`make schema-check` 重放核验。
+`make schema` 仍只生成文档和 ER 图，不能替代快照生成。
+
+工具源码随脚手架提供，既有域可用支持该命令的 CLI 执行 `appkit schema-tool`
+安装/更新；安装不改依赖、迁移、sqlc 配置或 Makefile，旧域可直接运行
+`go run ./internal/postgres/schematool -domain {{.Name}}{{if .Partitioned}} -partitioned{{end}}`。
+未采用快照时普通测试不强制快照专用配置；采用后测试校验来源/产物摘要，提供
+测试 DSN 时还会真实重放。仅改哈希不能通过数据库验收。
+快照是 sqlc/阅读输入，不是部署备份；只支持一个 PostgreSQL SQL 项和一个快照
+输入，不含权限与数据，不支持的结构明确报错。迁移和测试服务器须可信。
+
 ## 结构
 
 ```

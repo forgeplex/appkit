@@ -2,6 +2,7 @@ package pgtx_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -451,6 +452,115 @@ func TestTenantReadAllNestedMismatch(t *testing.T) {
 	})
 	if err != nil || !ran {
 		t.Fatalf("外层读全部、嵌套沿用应放行: err=%v ran=%v", err, ran)
+	}
+}
+
+// TestTenantNestedScopeMismatch locks the whole transaction scope, not merely
+// read-all mode. SET LOCAL survives releasing a savepoint, so changing the
+// tenant in a nested Do would otherwise redirect the outer transaction.
+func TestTenantNestedScopeMismatch(t *testing.T) {
+	pool := dbtest.Pool(t)
+	dbtest.Schema(t, pool, "pgtx_nested_scope", tenantMigration)
+	outer := withTenant(context.Background(), "t1")
+	tenant := pgtx.NewTenant(pool)
+
+	for name, derive := range map[string]func(context.Context) context.Context{
+		"tenant": func(ctx context.Context) context.Context {
+			return callctx.With(ctx, callctx.Meta{TenantID: "t2"})
+		},
+		"read_all": tx.WithReadAllTenants,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ran := false
+			err := tenant.Do(outer, func(ctx context.Context) error {
+				innerErr := tenant.Do(derive(ctx), func(context.Context) error {
+					ran = true
+					return nil
+				})
+				if innerErr == nil || !strings.Contains(innerErr.Error(), "嵌套事务内切换作用域") {
+					return fmt.Errorf("nested scope rebind should fail, got %v", innerErr)
+				}
+				var got string
+				if err := pgtx.From(ctx, pool).QueryRow(ctx, "SELECT current_setting('app.tenant_id')").Scan(&got); err != nil {
+					return err
+				}
+				if got != "t1" {
+					return fmt.Errorf("outer tenant GUC changed to %q", got)
+				}
+				return nil
+			})
+			if err != nil || ran {
+				t.Fatalf("nested scope rebind must not run callback or alter outer scope: err=%v ran=%v", err, ran)
+			}
+		})
+	}
+
+	// Independent adapters may share a transaction only when their derived
+	// scope is identical. This preserves normal composition-root wiring.
+	other := pgtx.NewTenant(pool)
+	ran := false
+	err := tenant.Do(outer, func(ctx context.Context) error {
+		return other.Do(ctx, func(context.Context) error { ran = true; return nil })
+	})
+	if err != nil || !ran {
+		t.Fatalf("same tenant scope across transactors should use a savepoint: err=%v ran=%v", err, ran)
+	}
+
+	// A plain outer transaction has no tenant GUC. Adding tenant isolation in a
+	// nested savepoint is also a scope change, not an implicit upgrade.
+	plain := pgtx.New(pool)
+	err = plain.Do(context.Background(), func(ctx context.Context) error {
+		return tenant.Do(withTenant(ctx, "t1"), func(context.Context) error { return nil })
+	})
+	if err == nil || !strings.Contains(err.Error(), "嵌套事务内切换作用域") {
+		t.Fatalf("plain to tenant nested upgrade should fail, got %v", err)
+	}
+	err = tenant.Do(outer, func(ctx context.Context) error {
+		return plain.Do(ctx, func(context.Context) error { return nil })
+	})
+	if err == nil || !strings.Contains(err.Error(), "嵌套事务内切换作用域") {
+		t.Fatalf("tenant to plain nested downgrade should fail, got %v", err)
+	}
+
+	// A raw pgx transaction marker without pgtx's scope marker is not trusted:
+	// otherwise a caller could erase the marker and rebind transaction-local GUCs.
+	err = tenant.Do(outer, func(ctx context.Context) error {
+		return tenant.Do(tx.With(context.Background(), pgtx.From(ctx, pool)), func(context.Context) error { return nil })
+	})
+	if err == nil || !strings.Contains(err.Error(), "无法验证嵌套事务作用域") {
+		t.Fatalf("unscoped existing transaction should fail, got %v", err)
+	}
+
+	// Retaining a valid marker while replacing tx.Value with another raw pgx.Tx
+	// must not authorize a savepoint on that different transaction.
+	err = tenant.Do(outer, func(ctx context.Context) error {
+		borrowed, err := pool.Begin(context.Background())
+		if err != nil {
+			return err
+		}
+		defer func() { _ = borrowed.Rollback(context.WithoutCancel(context.Background())) }()
+		ran := false
+		innerErr := tenant.Do(tx.With(ctx, borrowed), func(context.Context) error {
+			ran = true
+			return nil
+		})
+		if innerErr == nil || !strings.Contains(innerErr.Error(), "事务句柄") {
+			return fmt.Errorf("borrowed transaction should fail, got %v", innerErr)
+		}
+		if ran {
+			return errors.New("borrowed transaction callback ran")
+		}
+		var got string
+		if err := pgtx.From(ctx, pool).QueryRow(ctx, "SELECT current_setting('app.tenant_id')").Scan(&got); err != nil {
+			return err
+		}
+		if got != "t1" {
+			return fmt.Errorf("outer tenant GUC changed to %q", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("outer transaction should continue after borrowed transaction rejection: %v", err)
 	}
 }
 

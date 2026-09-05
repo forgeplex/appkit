@@ -111,8 +111,20 @@ func assertFileSet(t *testing.T, dir string, want []string) {
 // assertRendered 断言全部生成文件不残留模板占位符。
 func assertRendered(t *testing.T, dir string) {
 	t.Helper()
+	toolFiles, err := SchemaToolFiles()
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, rel := range listFiles(t, dir) {
 		data := readFile(t, dir, rel)
+		if source, ok := toolFiles[rel]; ok {
+			// Copied Go source is not a text/template; nested literals contain
+			// doubled braces. Exact byte parity is stronger than a brace scan.
+			if data != string(source) {
+				t.Errorf("%s 与框架工具源码不一致", rel)
+			}
+			continue
+		}
 		if strings.Contains(data, "{{") || strings.Contains(data, "}}") {
 			t.Errorf("%s 残留模板占位符", rel)
 		}

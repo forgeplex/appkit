@@ -61,6 +61,7 @@ unsigned `X-Partition` 只负责传输、不授信。组合根注入「分区键
 | `internal/module/module.go` | 唯一 wiring 落点（Provide/Mount/Migrations/Health） | 每加路由/用例改一行 |
 | `db/migrations/` | 迁移；`0001_appkit_base.sql` 是框架基础表 | 新增文件，**不改旧文件** |
 | `db/SCHEMA.md`、`db/schema/` | {{if .Partitioned}}逻辑模板总览{{else}}表结构总览{{end}} + ER 图 + 每表详情，从迁移派生 | **禁止手改**（make schema 重新生成） |
+| `db/schema.sql`、`db/schema.lock.json` | 可选 sqlc 当前结构快照与来源摘要 | **禁止手改**（make schema-sqlc 生成） |
 | `db/queries/` | SQL 唯一存在地（sqlc 源） | 是 |
 | `{{.Name}}.go`、`cmd/` | 导出面与部署入口 | 几乎不 |
 | `.golangci.yml`、`.go-arch-lint.yml`、`.github/` | appkit sync 物化的规则 | **禁止手改**（appkit sync 刷新） |
@@ -91,6 +92,9 @@ unsigned `X-Partition` 只负责传输、不授信。组合根注入「分区键
    `db/SCHEMA.md` 里被标 ⚠，CI 的 `appkit schema -check` 会逐表打 ::warning
    注解（不阻断合并，但 review 与 PR 里都看得见）。
    写完跑 `make schema` 重新生成 schema 文档，产出一并提交。
+   如果 sqlc 已切到 `db/schema.sql`，还要用一次性测试 PostgreSQL 的
+   `TEST_DATABASE_URL` 跑 `make schema-sqlc`，再 `make gen`；`make schema`
+   只更新文档，不更新 sqlc 快照。未采用快照的域仍直接读取 migrations。
 {{- if .Partitioned}}
    产物标为 logical-template，不证明任何运行时分区的当前结构或租户数据隔离行为。
 {{- end}}

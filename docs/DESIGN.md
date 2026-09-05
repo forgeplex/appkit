@@ -610,8 +610,10 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 租户域跨租户泄漏 | RLS（ENABLE+FORCE+隔离策略+读全部策略，`pgtx.TenantPolicySQL`）+ 事务级 GUC（`pgtx.NewTenant` / `NewRoutedTenant` 的 Do）；Setup 期 `pgtx.VerifyTenantRLS` 校验完整性（缺任一件/角色 superuser 或 BYPASSRLS 即拒启，点名表并附修复 SQL） | ★ 运行时级：漏写 WHERE 只会查不到行/写入被拒，且缺件启动即暴露 |
 | 跨租户读只能是显式、只读、不传播 | `tx.WithReadAllTenants` 是进程内 ctx 标记（不进 callctx：防火墙剥掉、事件不带）；落成第二个 GUC `app.tenant_scope`，与租户值那条通道（令牌 tid）分离；策略只对 SELECT 放开，写入的 WITH CHECK 不变；标记须在最外层 Do 之前打，嵌套内切换报错 | ★ 存储级：写全部模式不存在；「谁能打标记」归 `reg.Require` 跨租户码 + 用例纪律（约定级） |
 | 分区与租户身份只能来自已验证凭证 | 严格 HTTP 边界先清除 ctx partition/tenant 与 unsigned 头；MultiIssuer 从签发方配置重建 Partition，ServiceVerifier 从授权后的签名委托重建范围 | ▲ 中间件级：标准 bootstrap 可执行；自写受信 Middleware 仍可错误地授予权限 |
+| 嵌套事务不改变外层隔离范围 | `pgtx.Do` 绑定 tenant 模式、tenant ID、read-all、实际 schema 与具体事务句柄，内层重绑或无法验证的 raw pgx.Tx 在 savepoint 前拒绝 | ★ 运行时守卫：同范围嵌套保留，错误可由外层处理；不是阻止受信代码直接执行 SET LOCAL 的 SQL 沙箱 |
 | schema 文档支持分区域域 | `partitioned: true` 自动生成 logical-template：无前缀迁移在代表 schema 回放一次，全部文档显式标记；分区＋tenant 的 RLS 同步呈现 | ▲ 工具/CI 级；只证明逻辑模板，未枚举或检查运行中分区；未启用文档的仓库仍 notice 放行 |
 | 没人跑迁移不可能 | 登记了迁移却既无 `Migrator` 又无 `SkipMigrations()` → 启动报错；`-migrate` 无 `database.url` 亦报错 | ★ 装配级 fail-fast |
+| 独立 sqlc 快照不与迁移脱节 | 脚手架分发独立 schema 工具，在随机临时库回放迁移并读取 catalog，生成 `db/schema.sql` 与来源锁；采用后普通测试检查摘要，带测试 DSN 时重放逐字比对 | ▲ 生成/CI 级：默认仍读取 migrations；仅离线哈希不证明数据库一致。快照仅支持一个 PostgreSQL SQL 项，不支持的结构失败；不是 SQL 沙箱或部署备份 |
 | schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`；在固定数据库环境、可复现迁移下生成确定性文档，不承诺跨 PostgreSQL/扩展/模板库或随机 SQL 的绝对纯函数。CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（原生分区表、生成列、继承…）点名报错；RLS 如实渲染（策略被删/FORCE 被摘即漂移） | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行；从不启用的仓库永远不被检查，跑过一次 `make schema` 就永久转严。新增检查随 appkit release + sync 显式进入下游，不会由 main 突然扩散。 |
 | 表有说明（`COMMENT ON TABLE`） | 缺的表在 `db/SCHEMA.md` 表清单里标 ⚠ 缺说明并给出该补的那一句；`appkit schema -check` 在 CI 里逐表打 `::warning` 注解 | ▲ 软约束：不阻断 CI（刻意的，存量仓库不会突然红），且 `db/SCHEMA.md` 带 `linguist-generated` 在 PR diff 里默认折叠——⚠ 没人主动打开就看不见，::warning 注解是让它浮出水面的那一半 |
 | 长驻任务死了必被发现 | `Registry.Worker` 托管：异常退出上报主循环并触发关停（不再是"探针绿着、事件停摆"） | ★ API 设计级 |
