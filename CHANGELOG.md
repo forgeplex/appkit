@@ -2,6 +2,37 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.9.4（2026-09-16）
+
+v0.9.4 — harden transaction, idempotency, and relay boundaries
+
+This patch closes correctness gaps at the transaction, Inbox, HTTP idempotency,
+cleanup, and audit relay boundaries while preserving the v0.9.3 public API
+compatibility contract.
+
+- Route Inbox handling through pgtx.Transactor.Do so Inbox and service writes
+  share one transaction, with same-scope nested calls using savepoints. Add
+  explicit tenant, routed, and routed+tenant coverage; routed Inbox requires an
+  empty schema and uses the transaction search_path.
+- Make oversized or failed HTTP idempotency responses terminal `executed`
+  results. They return a stable 409 with
+  `IDEMPOTENCY_RESULT_UNAVAILABLE`, never replay a truncated body, and never
+  re-execute the handler.
+- Fence audit relay claim completion, retry, dead-letter, and release updates
+  with a per-claim token so a previous lease owner cannot mutate a takeover.
+- Give database rollback and other cleanup operations cancellation isolation
+  with a bounded five-second deadline.
+- Add forward-only outbox and idempotency upgrade SQL, update scaffold output,
+  and document migration ordering and cooperative contract.Call timeouts.
+- Make CI prefetch the complete Go module graph before offline scaffold checks,
+  avoiding dependence on an incidental runner cache.
+
+Validation passed in CI on the merged implementation: Go 1.26 formatting,
+vet, build, race tests with disposable PostgreSQL, lint, materialized rules,
+and the v0.9.3 API compatibility gate. Existing domains must apply the new
+forward migrations before using the new relay/idempotency paths; no production
+or development database migration is included in this tag.
+
 ## v0.9.3（2026-09-06）
 
 v0.9.3 — optional sqlc schema snapshots and nested transaction isolation
