@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgeplex/appkit/callctx"
+	"github.com/forgeplex/appkit/internal/cleanup"
 	"github.com/forgeplex/appkit/internal/metrics"
 	"github.com/forgeplex/appkit/tx"
 )
@@ -169,6 +170,14 @@ func NewRoutedTenant(pool *pgxpool.Pool, route func(ctx context.Context) (string
 	return &Transactor{pool: pool, route: &router{fn: route}, tenant: true}
 }
 
+// IsRouted 报告 Do 是否会按当前 ctx 的分区身份设置事务级 search_path。
+// 基础设施包装器（例如 outbox.InboxWithTransactor）据此选择无前缀表名，
+// 让同一个 handler 能随事件路由到当前分区；普通/tenant Transactor 则仍
+// 使用调用方提供的 schema 限定表名。
+func (t *Transactor) IsRouted() bool {
+	return t != nil && t.route != nil
+}
+
 // transactionScope is the complete transaction-local state pgtx can change.
 // PostgreSQL SET LOCAL persists after a nested savepoint is released, therefore
 // every nested Do must derive exactly the same state as its outer transaction.
@@ -313,7 +322,9 @@ func (t *Transactor) Do(ctx context.Context, fn func(ctx context.Context) error)
 		if !committed {
 			// 已提交/已收尾的事务再 Rollback 得 ErrTxClosed，忽略；其余回滚
 			// 失败并进返回错误（panic/Goexit 路径 err 无人消费，并进去无害）。
-			if rbErr := ptx.Rollback(rollbackCtx(ctx)); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
+			rbCtx, cancel := rollbackCtx(ctx)
+			defer cancel()
+			if rbErr := ptx.Rollback(rbCtx); rbErr != nil && !errors.Is(rbErr, pgx.ErrTxClosed) {
 				err = errors.Join(err, fmt.Errorf("pgtx: 回滚: %w", rbErr))
 			}
 		}
@@ -333,10 +344,11 @@ func (t *Transactor) Do(ctx context.Context, fn func(ctx context.Context) error)
 	return nil
 }
 
-// rollbackCtx 剥离取消信号：fn 常因 ctx 取消而失败，若回滚也用已取消的 ctx，
-// ROLLBACK 发不出去，连接会被整个废弃。回滚必须尽力完成以归还健康连接。
-func rollbackCtx(ctx context.Context) context.Context {
-	return context.WithoutCancel(ctx)
+// rollbackCtx 剥离取消信号并设置独立上限：fn 常因 ctx 取消而失败，若回滚也用
+// 已取消的 ctx，ROLLBACK 发不出去，连接会被整个废弃；但无限期 WithoutCancel
+// 又可能把收尾永久挂住。回滚必须在有限预算内尽力完成以归还健康连接。
+func rollbackCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return cleanup.Context(ctx)
 }
 
 // DB 与 sqlc 生成代码的 DBTX 接口签名一致：pgx.Tx 与 *pgxpool.Pool 都满足它，

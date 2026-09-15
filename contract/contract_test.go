@@ -181,6 +181,29 @@ func TestCallTimeout(t *testing.T) {
 	}
 }
 
+// TestCallTimeoutIsCooperative 锁住本地契约调用的边界：Call 只能把 deadline
+// 传播给实现，不能安全地强行停止一个忽略 ctx 的同步函数。实现迟到返回 nil
+// 时，Call 也必须保留它的成功结果；调用方应把这类操作视为结果未知并依靠
+// 幂等键/业务查询收敛，而不是用 goroutine+select 制造一个表面超时。
+func TestCallTimeoutIsCooperative(t *testing.T) {
+	start := time.Now()
+	got, err := contract.Call(context.Background(), "ledger", "SlowIgnoringContext", 10*time.Millisecond,
+		func(context.Context) (string, error) {
+			time.Sleep(100 * time.Millisecond)
+			return "late-success", nil
+		})
+
+	if err != nil {
+		t.Fatalf("忽略 ctx 的实现迟到成功不应被伪造为超时错误: %v", err)
+	}
+	if got != "late-success" {
+		t.Fatalf("迟到结果 = %q, want late-success", got)
+	}
+	if elapsed := time.Since(start); elapsed < 90*time.Millisecond {
+		t.Fatalf("Call 不应强行提前返回并遗留仍在运行的 fn: elapsed=%v", elapsed)
+	}
+}
+
 func TestCallErrorNormalize(t *testing.T) {
 	sentinel := errors.New("driver: broken pipe")
 

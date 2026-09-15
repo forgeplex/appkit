@@ -108,7 +108,7 @@ appkit new domain clients  -dir clients
 | `internal/http/` | transport：DTO ↔ 业务类型映射 | 实现 handler，禁业务规则/SQL（机检） |
 | `internal/inbox/` | 外域事件消费者 | 按 topic 写 handler |
 | `internal/module/module.go` | 唯一 wiring 落点：Provide/Mount/Migrations/Health | 每加一个用例/路由在这里挂 |
-| `db/migrations/0001_appkit_base.sql` | outbox/inbox/幂等/审计四张基础表（生成期由框架库函数拼装） | 别动；自己的表从 `0002_` 开始 |
+| `db/migrations/0001_appkit_base.sql` | outbox/inbox/幂等/审计四张基础表（生成期由框架库函数拼装） | 别动；自己的表从 `0002_` 开始；框架升级另起版本迁移 |
 | `db/queries/` + `sqlc.yaml` | SQL 唯一存在地；sqlc 生成到 `internal/postgres/sqlc` | 写 `.sql`，`make gen` |
 | `db/SCHEMA.md` + `db/schema/` | 表结构总览 + ER 图 + 每表详情，从迁移派生（要连 DB，所以 `new` 时不生成） | 改过迁移就 `make schema`；**禁止手改**（见 4.1） |
 | `identity.go` | 唯一导出面：`Module()`（只有组合仓库和本仓 cmd/ 会 import） | 一般不动 |
@@ -116,6 +116,11 @@ appkit new domain clients  -dir clients
 | `config/dev.yaml` | 运行配置；任意键可被 `IDENTITYD_*` 环境变量覆盖 | 开发骨架显式写 `security.mode: disabled`；完整模式时再填 `database.url` |
 | `.appkit.yml` | 框架配置：`check`/`sync`/`dev` 读取 | 接入合约仓库后填 `contracts:` |
 | `.gitattributes` | 钉 `*.sql eol=lf`（迁移校验和跨平台一致）+ 折叠生成物 | 别动（`appkit sync` 维护） |
+
+`0001_appkit_base.sql` 已应用后不可编辑。若升级 AppKit 需要框架表结构变化，
+在域仓库新增版本迁移，分别嵌入 `outbox.MigrationSQLUpgrade(schema)` /
+`outbox.MigrationSQLBareUpgrade()` 和 `idem.MigrationSQLUpgrade(schema)` /
+`idem.MigrationSQLBareUpgrade()` 的输出；新生成的域则直接得到最新版基础 DDL。
 
 **三类代码是分开的，这是刻意的**：框架在 module cache 里（0444 只读，改不到）；
 框架生成的公共代码（lint/CI 配置、sqlc 产物、基础迁移）带生成头且由 `appkit check`
@@ -408,6 +413,12 @@ idemMW := idem.Middleware(idem.NewStore(m.opts.Pool, Schema), m.opts.Log,
 别来回换。作用域模式下键与作用域含控制字节会被 400 拒绝（RFC 7230 头值
 本就不允许），这是分隔符不可伪造的前提。
 
+响应缓存有 1 MiB 上限。业务 handler 已经执行而响应超限、短写或底层写出失败时，
+幂等记录会进入 `executed` 终态：同一个 key 后续只返回 409
+`IDEMPOTENCY_RESULT_UNAVAILABLE`，不会释放 claim 重新执行业务，也不会回放截断响应。
+业务提交与结果落库之间仍存在进程崩溃窗口；写操作必须用业务唯一键、结果查询或对账
+收敛，不能把幂等中间件理解成 exactly-once。
+
 敏感变更再加 `audit.Recorder`（与业务写同事务）；金额存储/运算用
 `decimal.Decimal`（sqlc 脚手架已全局 override NUMERIC），需要"币种+金额"
 绑定时用领域层的 `money.Money`（不落库，币种另列存），JSON 边界一律字符串。
@@ -580,6 +591,10 @@ appkit gen contract -in identityv1/contract.yaml -dir identityv1
 （DESIGN §5.3）。`idempotent: true` 的方法，生成 client 会对可用性故障做
 有界重试；`doc` 必填——契约是给别的团队读的。
 
+`contract.Call` 的 timeout 是协作式的：deadline 会传给实现，已经启动的同步
+实现若忽略 ctx 仍可能迟到返回，框架不会强杀 goroutine。涉及写入时，超时后的
+结果应按成功或未知结果处理，并用幂等键、查询或对账确认。
+
 然后：
 
 - **提供方 identity**：`.appkit.yml` 填 `contracts: github.com/forgeplex/sso-contracts/go`，
@@ -595,9 +610,12 @@ appkit gen contract -in identityv1/contract.yaml -dir identityv1
 - **消费方 authn**：`Setup` 里 `appkit.MustResolve[identityv1.Service](reg)`，
   拿到的永远是已包裹的实现。**事务内发起契约调用会直接报错**
   （`TX_BOUNDARY`）——跨域一致性走事件，不走共享事务。
-- **消费事件**：authn 的 module 里
-  `reg.Consumer(identityv1.TopicUserCreated, outbox.Inbox(pool, "authn", "authn", handler))`
-  ——inbox 按 (consumer, event_id) 去重，handler 天然幂等。
+- **消费事件**：authn 的 module 里把与 Service 相同作用域的 `txr` 传入：
+  `reg.Consumer(identityv1.TopicUserCreated, outbox.InboxWithTransactor(pool, txr, "authn", "authn", handler))`
+  ——inbox 按 (consumer, event_id) 去重，handler 的嵌套 `txr.Do` 使用 savepoint，
+  占位与业务写同事务；普通域也可用兼容入口 `outbox.Inbox`。
+  分区域域使用 `pgtx.NewRouted` / `NewRoutedTenant` 时传空 schema（`""`），让
+  事务级 `search_path` 同时决定 inbox 与业务表所在分区；传固定 schema 会直接 panic。
 
 ### 给契约加一条一致性测试（`apptest`）
 
@@ -1256,7 +1274,7 @@ keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可
 | 域 A 调域 B | 合约接口 + `Resolve`，事务外调用 | 直接 require B 仓库（check/编译失败）；事务内调用（运行时守卫报 TX_BOUNDARY） |
 | 跨域取数据做报表 | 订阅事件构建本域读模型 | 跨 schema JOIN（check 拒绝 SQL） |
 | 发领域事件 | 用例事务内 `pub.Publish` | 事务外发（守卫拒绝）；直连 broker（业务包 import 不到） |
-| 处理外域事件 | `reg.Consumer` + `outbox.Inbox` 包裹 | 裸 handler（重复投递=重复执行） |
+| 处理外域事件 | `reg.Consumer` + `outbox.InboxWithTransactor(pool, txr, schema, ...)` 包裹（普通域 schema 必填；routed 域传空 schema；普通域也可用 `Inbox` 兼容入口） | 裸 handler（重复投递=重复执行）；把 raw `pgx.Tx` 手工塞 ctx（绕过 pgtx 作用域校验） |
 | 写 SQL | `db/queries/*.sql` + sqlc | handler/service 里拼 SQL（depguard 拦 pgx import） |
 | 表示金额 | `decimal.Decimal`（存储/运算，sqlc 全局 override NUMERIC）+ `money.Money`（需币种绑定时，领域层）+ JSON 边界字符串（入站用 `money.ParseCanonical`） | float64、裸 decimal 上 JSON 面（都在 appkit-lint 里，make lint 与 CI 都跑） |
 | 返回错误 | 合约错误码（`apperr.Is(err, identityv1.CodeXxx)` 单体/微服务行为一致） | 字符串比对、裸 errors.New 跨层 |

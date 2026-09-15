@@ -14,17 +14,18 @@ import (
 
 // 框架保留错误码。业务错误码由合约仓库（psp-contracts）定义。
 const (
-	CodeInternal         = "INTERNAL"             // 未分类内部错误，对外不泄漏细节
-	CodeInvalidArgument  = "INVALID_ARGUMENT"     // 请求不合法
-	CodeNotFound         = "NOT_FOUND"            //
-	CodeConflict         = "CONFLICT"             // 并发/状态冲突
-	CodeUnauthenticated  = "UNAUTHENTICATED"      //
-	CodePermissionDenied = "PERMISSION_DENIED"    //
-	CodeUnavailable      = "UNAVAILABLE"          // 依赖不可用/超时，可重试
-	CodeTxBoundary       = "TX_BOUNDARY"          // 事务内发起跨模块调用（运行时守卫）
-	CodeIdempotency      = "IDEMPOTENCY_CONFLICT" // 同幂等键不同 payload
-	CodeMigrationDrift   = "MIGRATION_DRIFT"      // 已应用的迁移内容被改动（启动期守卫）
-	CodeStepUpRequired   = "STEP_UP_REQUIRED"     // 已认证但权限码带 Challenge：须先完成 step-up 挑战（403 + 重新挑战）
+	CodeInternal                     = "INTERNAL"                       // 未分类内部错误，对外不泄漏细节
+	CodeInvalidArgument              = "INVALID_ARGUMENT"               // 请求不合法
+	CodeNotFound                     = "NOT_FOUND"                      //
+	CodeConflict                     = "CONFLICT"                       // 并发/状态冲突
+	CodeUnauthenticated              = "UNAUTHENTICATED"                //
+	CodePermissionDenied             = "PERMISSION_DENIED"              //
+	CodeUnavailable                  = "UNAVAILABLE"                    // 依赖不可用/超时，可重试
+	CodeTxBoundary                   = "TX_BOUNDARY"                    // 事务内发起跨模块调用（运行时守卫）
+	CodeIdempotency                  = "IDEMPOTENCY_CONFLICT"           // 同幂等键不同 payload
+	CodeIdempotencyResultUnavailable = "IDEMPOTENCY_RESULT_UNAVAILABLE" // 已执行但响应不可回放
+	CodeMigrationDrift               = "MIGRATION_DRIFT"                // 已应用的迁移内容被改动（启动期守卫）
+	CodeStepUpRequired               = "STEP_UP_REQUIRED"               // 已认证但权限码带 Challenge：须先完成 step-up 挑战（403 + 重新挑战）
 )
 
 // Error 是唯一跨层传播的错误类型。值不可变：With* 方法返回副本，

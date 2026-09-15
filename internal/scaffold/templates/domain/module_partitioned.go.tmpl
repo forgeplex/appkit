@@ -133,8 +133,9 @@ func (m *mod) Register(reg *appkit.Registry) error {
 		// 分区域域的 dedup 表（inbox）随分区一套：消费者按「这个 topic 的事件
 		// 落在哪个分区」登记，handler 内按事件 meta 的分区键路由（callctx
 		// 已沿事件传播）：
+		// routed transactor 的 schema 必须为空，由 search_path 选择当前分区：
 		// reg.Consumer("other.something.v1",
-		//     outbox.Inbox(m.opts.Pool, m.opts.Schemas["tenant"], inbox.Consumer, inbox.NewHandler(svc)))
+		//     outbox.InboxWithTransactor(m.opts.Pool, txr, "", inbox.Consumer, inbox.NewHandler(svc)))
 		return nil
 	})
 	reg.MountPublic({{.Name}}http.PingPattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

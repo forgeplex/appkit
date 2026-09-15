@@ -2,9 +2,12 @@
 //
 // 核心是防双重执行竞态：执行 handler 之前先以独立短事务
 // INSERT ... ON CONFLICT DO NOTHING 抢占（claim）幂等键——抢到唯一执行权才执行，
-// 完成后把响应存回记录，后续同键请求回放存储的响应。执行中断（panic/断连/进程死亡）
-// 留下的 in_progress 记录超过 TTL 后允许被接管重试；接管会更换记录的 owner_token
-// 作 fencing——原持有者迟到的 Complete/Release 会被拒绝，不会覆盖接管者。
+// 完成后把响应存回记录，后续同键请求回放存储的响应。响应超出缓存能力或底层写出
+// 失败时进入 executed 终态，后续同键请求不会再次执行业务。执行中断（panic/断连/
+// 进程死亡）留下的 in_progress 记录超过 TTL 后允许被接管重试；接管会更换记录的
+// owner_token 作 fencing——原持有者迟到的 Complete/MarkExecuted/Release 会被拒绝，
+// 不会覆盖接管者。业务提交后进程可能在终态落库前崩溃，业务唯一键/结果查询仍是
+// 防止重复副作用的最后一道收敛机制。
 // 业务表的 UNIQUE 约束是最后一道兜底（见 docs/DESIGN.md §6）。
 //
 // 默认指纹绑定原始字节；领域有规范化口径时经 WithCanonicalizer 注入，多租户/
@@ -27,6 +30,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/internal/cleanup"
 )
 
 const (
@@ -34,6 +38,10 @@ const (
 	HeaderKey = "Idempotency-Key"
 	// HeaderReplayed 标记响应来自存储回放，而非本次真实执行。
 	HeaderReplayed = "Idempotency-Replayed"
+	// HeaderStatus 标记幂等记录的终态，尤其用于响应无法安全回放的 executed。
+	HeaderStatus = "Idempotency-Status"
+	// StatusExecuted 表示业务已执行但响应不可安全回放；同键请求不得再次执行。
+	StatusExecuted = "executed"
 
 	// DefaultTTL 是 in_progress 记录的接管时限：超时仍未完成的 claim
 	// 视为持有者已死，后续同键同 payload 的请求可以接管重试。
@@ -48,14 +56,16 @@ const (
 	DefaultMaxRequestBytes int64 = 1 << 20
 
 	// maxCaptureBytes 是响应缓存上限。超限的响应无法完整回放，
-	// 完成时改为释放 claim 让重试重新执行，绝不回放截断的响应。
+	// 完成时转为 executed 终态，绝不回放截断响应或再次执行业务。
 	maxCaptureBytes = 1 << 20
 )
 
-// 记录状态。claim 抢到即 in_progress，响应存回后转为 completed（终态）。
+// 记录状态。claim 抢到即 in_progress；响应可回放时转为 completed，响应不可
+// 回放但业务已经执行时转为 executed。两者都是终态，后者禁止同键重新执行。
 const (
 	StateInProgress = "in_progress"
 	StateCompleted  = "completed"
+	StateExecuted   = "executed"
 )
 
 // MigrationSQL 返回幂等表的建表语句，供域 repo 嵌入自己 schema 的首个迁移
@@ -72,12 +82,32 @@ func MigrationSQLBare() string {
 	return migrationSQLFor("idempotency_keys")
 }
 
+// MigrationSQLUpgrade 返回已应用旧版基础迁移升级幂等终态所需的 DDL。
+// 历史迁移不可改；已有域必须把本函数输出写入新的版本迁移，再与代码一起发布。
+// 语句可重复执行，schema 仅作为标识符转义，不承担运行时输入。
+func MigrationSQLUpgrade(schema string) string {
+	tbl := pgx.Identifier{schema, "idempotency_keys"}.Sanitize()
+	return upgradeSQLFor(tbl)
+}
+
+// MigrationSQLBareUpgrade 是 MigrationSQLUpgrade 的分区域版本，目标表由
+// pgmigrate 当前 search_path 决定。
+func MigrationSQLBareUpgrade() string {
+	return upgradeSQLFor("idempotency_keys")
+}
+
+func upgradeSQLFor(tbl string) string {
+	return `ALTER TABLE ` + tbl + ` DROP CONSTRAINT IF EXISTS idempotency_keys_state_check;
+ALTER TABLE ` + tbl + ` ADD CONSTRAINT idempotency_keys_state_check CHECK (state IN ('in_progress', 'completed', 'executed'));
+COMMENT ON TABLE ` + tbl + ` IS '幂等键：claim 先行占位防双重执行，完成后缓存响应供重放；不可回放的已执行请求进入 executed 终态。';`
+}
+
 func migrationSQLFor(tbl string) string {
 	return `CREATE TABLE IF NOT EXISTS ` + tbl + ` (
     key          text PRIMARY KEY,
     payload_hash bytea NOT NULL,
     owner_token  uuid NOT NULL,
-    state        text NOT NULL CHECK (state IN ('in_progress', 'completed')),
+    state        text NOT NULL CONSTRAINT idempotency_keys_state_check CHECK (state IN ('in_progress', 'completed', 'executed')),
     status       int,
     headers      jsonb,
     body         bytea,
@@ -85,7 +115,7 @@ func migrationSQLFor(tbl string) string {
     completed_at timestamptz
 );
 
-COMMENT ON TABLE ` + tbl + ` IS '幂等键：claim 先行占位防双重执行，完成后缓存响应供重放。';
+COMMENT ON TABLE ` + tbl + ` IS '幂等键：claim 先行占位防双重执行，完成后缓存响应供重放；不可回放的已执行请求进入 executed 终态。';
 COMMENT ON COLUMN ` + tbl + `.payload_hash IS '同 key 异 payload 判 422 的依据。';
 COMMENT ON COLUMN ` + tbl + `.owner_token IS 'claim 的持有者，超时接管时据此判断归属。';`
 }
@@ -213,6 +243,23 @@ func (s *Store) Complete(ctx context.Context, key, token string, status int, hea
 	return nil
 }
 
+// MarkExecuted 把业务已执行但响应不可安全回放的 claim 转为 executed 终态。
+// 这条路径绝不能 Release：业务提交可能已经发生，释放会让重试再次产生副作用。
+// owner_token 仍是 fencing 条件，迟到的旧 owner 不能覆盖接管者的记录。
+func (s *Store) MarkExecuted(ctx context.Context, key, token string, status int) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE `+s.tbl+` SET state = 'executed', status = $3, headers = NULL, body = NULL, completed_at = now()
+		 WHERE key = $1 AND state = 'in_progress' AND owner_token = $2`,
+		key, token, status)
+	if err != nil {
+		return fmt.Errorf("idem: 标记已执行但不可回放: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("idem: 键 %q 的 claim 已易主或已完成，fencing 拒绝标记 executed", key)
+	}
+	return nil
+}
+
 // Release 删除仍由 token 持有且在 in_progress 的 claim，让后续重试重新执行。
 // owner_token 是 fencing 条件：已被接管或已完成时删除 0 行，返回错误由调用方
 // 记日志，绝不误删接管者的 claim。
@@ -245,6 +292,8 @@ var (
 		"同一 Idempotency-Key 携带了不同的请求内容")
 	errInFlight = apperr.New(apperr.CodeConflict, http.StatusConflict,
 		"同一 Idempotency-Key 的请求正在处理中")
+	errExecuted = apperr.New(apperr.CodeIdempotencyResultUnavailable, http.StatusConflict,
+		"同一 Idempotency-Key 对应的业务已执行，但响应无法安全回放；请使用新的幂等键查询业务结果")
 	errBodyTooLarge = apperr.New(apperr.CodeInvalidArgument, http.StatusRequestEntityTooLarge,
 		"请求体超过幂等中间件允许的上限")
 	errKeyPartInvalid = apperr.New(apperr.CodeInvalidArgument, http.StatusBadRequest,
@@ -436,20 +485,27 @@ func Middleware(store *Store, log *slog.Logger, opts ...Option) func(http.Handle
 			// Complete，记录保持 in_progress，超过 TTL 后由后续重试接管。
 			next.ServeHTTP(cw, r)
 
-			// 响应已发出，落库失败只能记日志。WithoutCancel：handler 正常
-			// 完成后客户端断连不应把已产生的业务结果丢成 in_progress。
-			cctx := context.WithoutCancel(r.Context())
-			if cw.overflow {
-				log.Warn("idem: 响应超过缓存上限，释放 claim（重试将重新执行）", "key", key)
-				if err := store.Release(cctx, key, token); err != nil {
-					log.Error("idem: 释放 claim 失败（可能已被接管）", "key", key, "err", err)
-				}
-				return
-			}
 			status := cw.status
 			if status == 0 {
 				// handler 一字未写：net/http 在返回后隐式发 200。
 				status = http.StatusOK
+			}
+			// 响应已发出，落库失败只能记日志。客户端断连不应把已产生的业务
+			// 结果丢成可被 TTL 接管的 in_progress；cleanup context 忽略父取消但
+			// 仍有固定上限，避免无限期占住连接。
+			cctx, cancelCleanup := cleanup.Context(r.Context())
+			defer cancelCleanup()
+			if cw.overflow || cw.writeFailed {
+				reason := "响应超过缓存上限"
+				if cw.writeFailed {
+					reason = "响应写出失败或短写"
+				}
+				log.Warn("idem: 响应不可安全回放，标记 executed 终态，不释放 claim",
+					"key", key, "reason", reason)
+				if err := store.MarkExecuted(cctx, key, token, status); err != nil {
+					log.Error("idem: 标记 executed 失败（可能已被接管）", "key", key, "err", err)
+				}
+				return
 			}
 			headers := map[string][]string{}
 			for k, vs := range cw.Header() {
@@ -466,8 +522,9 @@ func Middleware(store *Store, log *slog.Logger, opts ...Option) func(http.Handle
 	}
 }
 
-// replyExisting 处理没抢到 claim 的三种结局。payload 指纹先于状态判定：
-// 同键异 payload 是客户端错误，无论现存记录处于什么状态。
+// replyExisting 处理没抢到 claim 的结局。payload 指纹先于状态判定：同键异
+// payload 是客户端错误，无论现存记录处于什么状态；executed 是已执行但不可回放
+// 的稳定终态，不能当成普通 in-flight 让客户端盲目重试。
 func replyExisting(w http.ResponseWriter, rec *Record, hash []byte) {
 	switch {
 	case !bytes.Equal(rec.PayloadHash, hash):
@@ -483,20 +540,24 @@ func replyExisting(w http.ResponseWriter, rec *Record, hash []byte) {
 		}
 		w.WriteHeader(status)
 		_, _ = w.Write(rec.Body)
+	case rec.State == StateExecuted:
+		w.Header().Set(HeaderStatus, StatusExecuted)
+		apperr.WriteProblem(w, errExecuted)
 	default:
 		w.Header().Set("Retry-After", "1")
 		apperr.WriteProblem(w, errInFlight)
 	}
 }
 
-// captureWriter 边透传边缓存响应。超过 limit 后放弃缓存（客户端不受影响），
-// 由调用方释放 claim——宁可让重试重新执行，也不存下无法完整回放的响应。
+// captureWriter 边透传边缓存响应。超过 limit 或底层写出失败后放弃缓存，
+// 但调用方必须把 claim 转为 executed，不能释放后让业务被同键重试再次执行。
 type captureWriter struct {
 	http.ResponseWriter
-	status   int
-	buf      bytes.Buffer
-	limit    int
-	overflow bool
+	status      int
+	buf         bytes.Buffer
+	limit       int
+	overflow    bool
+	writeFailed bool
 }
 
 func (w *captureWriter) WriteHeader(code int) {
@@ -518,7 +579,11 @@ func (w *captureWriter) Write(b []byte) (int, error) {
 			w.buf.Write(b)
 		}
 	}
-	return w.ResponseWriter.Write(b)
+	n, err := w.ResponseWriter.Write(b)
+	if err != nil || n != len(b) {
+		w.writeFailed = true
+	}
+	return n, err
 }
 
 // Unwrap 供 http.ResponseController 透传 Flush/Hijack 等能力。

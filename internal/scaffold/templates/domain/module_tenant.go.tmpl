@@ -63,10 +63,11 @@ func (m *mod) Register(reg *appkit.Registry) error {
 	// GUC（app.tenant_id），连接归池即净。业务表的 RLS 策略读它过滤行——
 	// 一切业务查询照旧经 tx.Do（骨架的既有形态就是），不在这一层做任何
 	// 特判。
+	txr := pgtx.NewTenant(m.opts.Pool)
 	appkit.Provide(reg, func(*appkit.Registry) (*{{.Name}}.Service, error) {
 		return {{.Name}}.NewService(
 			postgres.NewStore(m.opts.Pool),
-			pgtx.NewTenant(m.opts.Pool),
+			txr,
 			outbox.NewPublisher(m.opts.Pool, Schema),
 		), nil
 	})
@@ -97,7 +98,7 @@ func (m *mod) Register(reg *appkit.Registry) error {
 		// 事件 meta 沿调用链带着租户身份（callctx 已传播），handler 内
 		// 照常 tx.Do 即落对租户：
 		// reg.Consumer("other.something.v1",
-		//     outbox.Inbox(m.opts.Pool, Schema, inbox.Consumer, inbox.NewHandler(svc)))
+		//     outbox.InboxWithTransactor(m.opts.Pool, txr, Schema, inbox.Consumer, inbox.NewHandler(svc)))
 		return nil
 	})
 	reg.MountPublic({{.Name}}http.PingPattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

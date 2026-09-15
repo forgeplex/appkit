@@ -7,10 +7,10 @@
 //
 // 读路径（Relay）按 claim/lease 两段式投递：
 //   - claim：短事务内以 FOR UPDATE SKIP LOCKED 选中到期未发布事件并写
-//     claimed_until 租约，立即提交——投递期间不占用连接池连接；
+//     claimed_until 租约与 claim_token fencing 令牌，立即提交——投递期间不占用连接池连接；
 //   - 投递：逐条调 Bus.Publish（进程内 DirectBus，或未来的 NATS/Kafka 适配），
 //     handler panic 会被恢复并按失败处理；
-//   - 收尾：成功者标记 published_at；失败者记 attempts 与指数退避
+//   - 收尾：成功/失败/释放都必须匹配 claim_token；成功者标记 published_at；失败者记 attempts 与指数退避
 //     next_attempt_at（封顶 5 分钟），超过重试上限置 failed_at 进入死信，
 //     移出投递热路径等待人工介入。
 //
@@ -61,6 +61,7 @@ const migrationTemplate = `CREATE TABLE IF NOT EXISTS %[1]soutbox (
     attempts        int         NOT NULL DEFAULT 0,
     next_attempt_at timestamptz NOT NULL DEFAULT now(),
     claimed_until   timestamptz,
+    claim_token     uuid,
     failed_at       timestamptz,
     last_error      text,
     created_at      timestamptz NOT NULL DEFAULT now(),
@@ -81,6 +82,7 @@ CREATE TABLE IF NOT EXISTS %[1]sinbox (
 COMMENT ON TABLE %[1]soutbox IS '事务性事件外发：业务写与事件落表同事务提交，relay 轮询后投递。';
 COMMENT ON COLUMN %[1]soutbox.meta IS 'callctx 白名单快照——事件是异步的，投递时原请求的 ctx 早已消失。';
 COMMENT ON COLUMN %[1]soutbox.claimed_until IS 'relay 的领取租约到期时刻，过期后其它副本可重新领取。';
+COMMENT ON COLUMN %[1]soutbox.claim_token IS 'relay claim 的 fencing 令牌；收尾更新必须匹配当前 owner。';
 COMMENT ON TABLE %[1]sinbox IS '事件消费去重：主键 (consumer, event_id)，同一事件每个消费者各消费一次。';
 `
 
@@ -94,12 +96,32 @@ func MigrationSQL(schema string) string {
 	return fmt.Sprintf(migrationTemplate, ident(schema)+".")
 }
 
+// MigrationSQLUpgrade 返回已应用旧版基础迁移升级 outbox fencing 所需的 DDL。
+// 历史迁移不可改；已有域必须把本函数输出写入新的版本迁移，再与代码一起发布。
+// 语句可重复执行，schema 不合法时 panic。
+func MigrationSQLUpgrade(schema string) string {
+	mustSchema(schema)
+	return fmt.Sprintf(
+		`ALTER TABLE %soutbox ADD COLUMN IF NOT EXISTS claim_token uuid;
+COMMENT ON COLUMN %soutbox.claim_token IS 'relay claim 的 fencing 令牌；收尾更新必须匹配当前 owner。';
+`, ident(schema)+".", ident(schema)+".")
+}
+
 // MigrationSQLBare 返回无 schema 前缀的 outbox/inbox DDL，供分区域域
 // （appkit new domain -partitioned）的迁移使用：目标 schema 由 pgmigrate
 // 在应用时经 SET LOCAL search_path 落位（见 pgmigrate包文档）。带前缀版
 // 是单 schema 域的事实源；两版的列定义必须保持一致。
 func MigrationSQLBare() string {
 	return fmt.Sprintf(migrationTemplate, "")
+}
+
+// MigrationSQLBareUpgrade 是 MigrationSQLUpgrade 的分区域版本：目标表由
+// pgmigrate 当前 search_path 决定。已有分区域域也必须新增迁移文件，而不能改已应用的
+// 基础迁移。
+func MigrationSQLBareUpgrade() string {
+	return `ALTER TABLE outbox ADD COLUMN IF NOT EXISTS claim_token uuid;
+COMMENT ON COLUMN outbox.claim_token IS 'relay claim 的 fencing 令牌；收尾更新必须匹配当前 owner。';
+`
 }
 
 // errNoTx：Publish 的运行时守卫。与 contract 的「事务内禁跨模块调用」互为镜像：

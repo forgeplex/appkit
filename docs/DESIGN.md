@@ -352,11 +352,14 @@ contract.yaml 生成同一接口的进程内 wrapper 与 HTTP client，方法体
    单体里跨模块共享事务默默能跑，拆成微服务当场爆炸"。
 2. **运行时守卫**：若调用发生时 `pgtx.HasTx(ctx)` 为真 → 直接返回错误（事务内禁跨模块调用；
    静态分析对这条规则只能"提高绕过成本"，运行时守卫才是真正可执行的）。
-3. **超时 + 错误规范化**：错误一律折叠为 apperr，错误身份是错误码——
+3. **协作式超时 + 错误规范化**：错误一律折叠为 apperr，错误身份是错误码——
    `apperr.Is(err, ledgerv1.CodeInsufficientFunds)` 在单体（原始错误）和
    微服务（RFC 9457 反序列化重建）两种模式下行为完全一致。发起时 ctx 已取消/
    超时的调用在进 fn 前就失败（`CodeUnavailable`）：跨网络时这种调用本来就发不
    出去，而进程内实现完全可能不看 ctx 照常成功——不挡住，两种形态就此分叉。
+   timeout 只通过 deadline 传播给 fn，`Call` 不会用 goroutine+select 强杀同步实现；
+   忽略 ctx 的实现可能迟到返回，调用方必须把结果视为成功或未知并依赖幂等键、
+   业务查询/对账收敛，不能把本地等待超时误当成没有副作用。
 4. **观测**：跨模块调用产生与 RPC 同名的 span/metric，两种模式下监控视图一致。
 
 这四条是**框架的承诺**，而承诺需要被验证：`apptest.Conform` 让同一批用例分别
@@ -562,7 +565,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 
 | # | 层 | 做什么 | 禁止什么（执行手段） |
 |---|---|---|---|
-| 1 | HTTP 根链 | 最外层 identity boundary 清洗 unsigned 身份 → httpserver Base（request id / recover / OTel / access log）→ authn 验用户令牌重建 Actor/tenant → `Mount*` 路由守卫 → **idem claim**（独立短事务 `INSERT…ON CONFLICT` 占位：已完成→回放缓存响应；进行中→409；同 key 异 payload→422） | 绕过根路由分类（启动守卫）；业务逻辑写进标准中间件 |
+| 1 | HTTP 根链 | 最外层 identity boundary 清洗 unsigned 身份 → httpserver Base（request id / recover / OTel / access log）→ authn 验用户令牌重建 Actor/tenant → `Mount*` 路由守卫 → **idem claim**（独立短事务 `INSERT…ON CONFLICT` 占位：completed→回放缓存响应；executed→409 且禁止重执行；进行中→409；同 key 异 payload→422） | 绕过根路由分类（启动守卫）；业务逻辑写进标准中间件 |
 | 2 | internal/http | 实现 contracts 生成的 server 接口；解码、结构校验、DTO↔ledger 类型映射 | SQL、pgx、import internal/postgres、业务规则（depguard + arch-lint） |
 | 3 | internal/ledger（service.go 编排） | `tx.Do(ctx, fn)` 开事务；调不变量；经 Store 接口读写；经消费方接口发事件（wiring 注入 outbox.Publisher，同事务落表）；recovery point；审计 | import gin/pgx（depguard）；事务内跨模块调用（**运行时守卫**） |
 | 4 | internal/ledger（类型与不变量） | 纯函数/实体方法：借贷平衡、币种一致、Money 精度 | 一切 I/O、float64（arch-lint + analyzer） |
@@ -622,6 +625,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 指标基数不失控 | 标签值只能是代码常量或 `internal/metrics` 收敛过的枚举；SQL 动词过白名单，未识别塌缩为 `other` | ▲ API 设计级：业务传不进框架指标，但自建 meter 仍可自伤 |
 | 已死的 ctx 不落到实现上 | `contract.Call` 在进 fn 前查 `ctx.Err()`——跨网络时这种调用本来就发不出去 | ★ 运行时级：两种形态由构造一致 |
 | 两种部署形态语义一致 | `apptest.Conform` 让同一批用例跑过每个绑定，比对错误码/返回值/边界语义 | ▲ 测试级：写了才有；但不写就只剩口头承诺 |
+| 契约超时不制造伪取消 | `contract.Call` 只传播 deadline，已启动的同步 fn 必须自行协作取消；忽略 ctx 的迟到返回按结果/未知结果处理，不用 goroutine+select 强杀 | ★ 语义明确级：不能强制停止任意 Go 函数；业务须用幂等与查询/对账收敛 |
 | 脚手架的 sqlc NUMERIC override 真能过 pgx | override 只指向 decimal.Decimal（pgx 经 Valuer/Scanner 原生编解码）；`internal/scaffold` 的 `TestDomainNumericOverrideRoundTrips` 把渲染后声明的类型真库读写一遍（27 位小数 + NULL）。编译测试对"扫描不了 OID 1700"结构性失明——money.Money 那次教训就是编译全绿、运行即炸 | ▲ 测试级：需 `TEST_DATABASE_URL`（`make test-db`），无 DB 时 skip |
 | 出站 HTTP 也带上 `callctx` 白名单 | `callctx.Transport` 装进 `http.Client` 一次即可（不必逐调用点写 `Inject`）；`apptest.Conform` 填了 `Binding.SeenMeta` 就当场验请求头 | ▲ API 设计级 + 测试级：漏点从「每个调用点」收敛到「一处装配」，且验得到。但两者都得自己接——不填 `SeenMeta` 就仍是口头承诺 |
 | 端点权限绑定 ⊆ 已声明码 | Registry 收集绑定（Register/Setup 期都可能产生，模块内部 mux 在 Setup 装配），全部 Setup 之后、监听之前统一校验，拼错的码点名（模块、码）报错 | ★ 装配期硬失败 |
@@ -675,15 +679,23 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   两条路径用的是同一份模块声明，不存在"迁移清单和服务清单不是同一份"的漂移。
   已应用的迁移内容不可变（sha256 守卫），改结构一律新增文件。
 - **outbox/inbox/幂等/审计表每 schema 一套**，由脚手架的首个 migration 生成。
+  已应用迁移不可改；框架后续结构变更由 `outbox.MigrationSQLUpgrade` /
+  `MigrationSQLBareUpgrade`、`idem.MigrationSQLUpgrade` /
+  `MigrationSQLBareUpgrade` 输出到新的版本迁移。
 - **relay 投递语义**：claim/lease 两段式（短事务租约后释放连接再投递，杜绝
-  hold-and-wait 连接池死锁）；至少一次投递 + inbox 按 (consumer, event_id) 去重；
+  hold-and-wait 连接池死锁）；每次 claim 带 `claim_token` fencing，成功/失败/释放
+  收尾都必须匹配当前 token，旧 owner 接管后不能污染新 owner；至少一次投递 + inbox 按 (consumer, event_id) 去重；
   失败指数退避、超过重试上限进死信（failed_at），毒消息不阻塞后续事件；
   批内保序尽力而为，跨批/退避后不保证全局序。
   死信有恢复通道：`outbox.DeadLetters`（`appkit outbox` 子命令即其运维面）
   列出失败原因、修好后按事件 ID 放回——attempts 归零、立即到期、按完整
   重试预算重走；放回只动死信态的行，未死或已发布的事件不受影响。
-- **幂等 claim 带 fencing token**：TTL 接管后旧持有者的 Complete/Release 必然失败，
-  不存在双写窗口；TTL 必须大于 handler 最长执行时间。
+- **幂等 claim 带 fencing token**：TTL 接管后旧持有者的 Complete/Release/MarkExecuted
+  必然失败，不存在旧 owner 覆盖新 owner 的窗口；TTL 必须大于 handler 最长执行时间。
+  响应超过缓存上限或底层写出失败时转为 `executed` 终态（`IDEMPOTENCY_RESULT_UNAVAILABLE`），
+  不释放 claim、不再次执行业务；同 key 后续请求只返回稳定的 409。业务提交后进程
+  可能在 Complete/MarkExecuted 前崩溃，TTL 接管仍可能再次执行——框架不宣称 exactly-once，
+  资金/写操作必须用业务唯一键、结果查询或对账收敛。
 - **幂等指纹与键作用域可注入**（`idem.WithCanonicalizer` / `idem.WithKeyScope`，
   纯新增选项，默认行为不变）：默认指纹绑定原始字节，金额 "80" 与 "80.00"
   的重试会被判异 payload 而 422——入站 DTO 走 `money.ParseCanonical` 的域把
@@ -696,7 +708,10 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   拆分部署切 NATS/Kafka——同一 Bus 接口，部署形态切换不改业务代码。DirectBus
   对无订阅 topic 返回 `ErrNoSubscriber`，relay 不会把空投递标记成功；bootstrap
   默认拒绝 `target != all` 继续隐式使用 DirectBus，特殊场景必须明确 opt-in。
-  模块经 `reg.Consumer(topic, handler)` 声明消费（handler 用 outbox.Inbox 包去重），
+  模块经 `reg.Consumer(topic, handler)` 声明消费（handler 用
+  `outbox.InboxWithTransactor(pool, txr, schema, consumer, handler)` 去重；普通域的
+  兼容入口 `outbox.Inbox` 使用 plain `pgtx.New`；routed 域传空 schema，让同一
+  事务级 `search_path` 同时定位 inbox 与业务表），
   App 以 `appkit.Bus(...)` 装配；声明了消费者却未配 Bus 属启动错误（fail-fast）。
   持久化 Broker 可额外实现 `appkit.ManagedSubscriber`：`Connect` 在监听前完成，
   `Run` 作为受管 Worker 传播消费循环错误，`Ready` 接入 readiness；关停按

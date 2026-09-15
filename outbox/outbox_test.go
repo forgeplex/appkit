@@ -13,6 +13,7 @@ import (
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/outbox"
+	"github.com/forgeplex/appkit/pgtx"
 	"github.com/forgeplex/appkit/tx"
 )
 
@@ -72,7 +73,7 @@ func TestMigrationSQL(t *testing.T) {
 				`"ledger".outbox`, `"ledger".inbox`,
 				"published_at", "event_id",
 				// claim/lease 与退避、死信所需的列。
-				"attempts", "next_attempt_at", "claimed_until", "failed_at", "last_error",
+				"attempts", "next_attempt_at", "claimed_until", "claim_token", "failed_at", "last_error",
 				// 部分索引须排除死信，否则死信永远留在热路径索引里。
 				"WHERE published_at IS NULL AND failed_at IS NULL",
 				// inbox 去重键是 (consumer, event_id)。
@@ -97,6 +98,20 @@ func TestMigrationSQL(t *testing.T) {
 				if !strings.Contains(sql, w) {
 					t.Errorf("MigrationSQL(%q) 缺少 %q:\n%s", tc.schema, w, sql)
 				}
+			}
+		})
+	}
+}
+
+func TestMigrationSQLUpgrade(t *testing.T) {
+	t.Parallel()
+	for name, sql := range map[string]string{
+		"schema": outbox.MigrationSQLUpgrade("ledger"),
+		"bare":   outbox.MigrationSQLBareUpgrade(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(sql, "ADD COLUMN IF NOT EXISTS claim_token uuid") {
+				t.Fatalf("升级 DDL 未添加 relay fencing token:\n%s", sql)
 			}
 		})
 	}
@@ -169,6 +184,33 @@ func TestInboxRejectsEmptyConsumer(t *testing.T) {
 	t.Parallel()
 	if !panics(func() { outbox.Inbox(nil, "s", "", nil) }) {
 		t.Fatal("Inbox 空 consumer 应 panic")
+	}
+}
+
+func TestInboxTransactorSchemaMode(t *testing.T) {
+	t.Parallel()
+	routed := pgtx.NewRouted(nil, func(context.Context) (string, error) { return "partition_a", nil })
+	if !routed.IsRouted() {
+		t.Fatal("NewRouted transactor 应报告 routed 模式")
+	}
+	if panics(func() {
+		outbox.InboxWithTransactor(nil, routed, "partition_a", "c", nil)
+	}) == false {
+		t.Fatal("routed Inbox 传固定 schema 应 panic，避免去重与业务落在不同分区")
+	}
+	if panics(func() {
+		outbox.InboxWithTransactor(nil, routed, "", "c", nil)
+	}) {
+		t.Fatal("routed Inbox 传空 schema 应使用 search_path，不应 panic")
+	}
+	plain := pgtx.New(nil)
+	if plain.IsRouted() {
+		t.Fatal("New transactor 不应报告 routed 模式")
+	}
+	if panics(func() {
+		outbox.InboxWithTransactor(nil, plain, "", "c", nil)
+	}) == false {
+		t.Fatal("plain Inbox 缺少 schema 应 panic")
 	}
 }
 
