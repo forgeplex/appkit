@@ -672,13 +672,13 @@ func schemaToolFixture(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	for path, body := range map[string]string{
-		".appkit.yml":                             "version: 1\nkind: domain\ndomain: demo\nmodule: github.com/forgeplex/demo\npartitioned: true\n",
-		"go.mod":                                  "module github.com/forgeplex/demo\n\ngo 1.26.0\n",
-		"go.sum":                                  "",
-		"sqlc.yaml":                               "version: '2'\nsql:\n  - engine: postgresql\n    schema: db/schema.sql\n    queries: db/queries\n",
-		"db/migrations/0001_widgets.sql":          "CREATE TABLE widgets (id integer PRIMARY KEY, name text NOT NULL);\n",
-		"db/migrations/0002_index.sql":            "CREATE INDEX widgets_name_idx ON widgets (name);\n",
-		"internal/postgres/schematool/main.go":    "package main\n// schema command fixture\n",
+		".appkit.yml":                          "version: 1\nkind: domain\ndomain: demo\nmodule: github.com/forgeplex/demo\npartitioned: true\n",
+		"go.mod":                               "module github.com/forgeplex/demo\n\ngo 1.26.0\n",
+		"go.sum":                               "",
+		"sqlc.yaml":                            "version: '2'\nsql:\n  - engine: postgresql\n    schema: db/schema.sql\n    queries: db/queries\n",
+		"db/migrations/0001_widgets.sql":       "CREATE TABLE widgets (id integer PRIMARY KEY, name text NOT NULL);\n",
+		"db/migrations/0002_index.sql":         "CREATE INDEX widgets_name_idx ON widgets (name);\n",
+		"internal/postgres/schematool/main.go": "package main\n// schema command fixture\n",
 		"internal/postgres/schematool/catalog.go": "package main\n// catalog fixture\n",
 	} {
 		writeSchemaTestFile(t, dir, path, body)

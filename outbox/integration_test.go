@@ -18,6 +18,7 @@ import (
 
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/internal/dbtest"
 	"github.com/forgeplex/appkit/outbox"
 	"github.com/forgeplex/appkit/pgtx"
@@ -312,6 +313,7 @@ func TestRelayDurableAckFailureIsNotPublished(t *testing.T) {
 func TestInboxIntegration(t *testing.T) {
 	pool := dbtest.Pool(t)
 	errBoom := errors.New("boom")
+	errNested := errors.New("nested rollback")
 
 	tests := []struct {
 		name      string
@@ -330,19 +332,35 @@ func TestInboxIntegration(t *testing.T) {
 				t.Fatalf("建业务表: %v", err)
 			}
 
+			serviceTx := pgtx.New(pool)
 			var calls atomic.Int64
 			next := func(hctx context.Context, evt appkit.Event) error {
 				if !tx.HasTx(hctx) {
 					return errors.New("next 内应处于事务中")
 				}
-				if _, err := pgtx.From(hctx, pool).Exec(hctx,
-					`INSERT INTO `+schema+`.side (v) VALUES ($1)`, evt.ID); err != nil {
-					return err
-				}
-				if calls.Add(1) == 1 && tc.failFirst {
-					return errBoom
-				}
-				return nil
+				// 模拟真实业务层：handler 调 Service，Service 自己划定
+				// nested Do/savepoint，repository 再从 ctx 取 DBTX。
+				return serviceTx.Do(hctx, func(sctx context.Context) error {
+					innerErr := serviceTx.Do(sctx, func(nctx context.Context) error {
+						_, err := pgtx.From(nctx, pool).Exec(nctx,
+							`INSERT INTO `+schema+`.side (v) VALUES ($1)`, evt.ID+"/nested")
+						if err != nil {
+							return err
+						}
+						return errNested
+					})
+					if !errors.Is(innerErr, errNested) {
+						return fmt.Errorf("nested Do = %v, want %v", innerErr, errNested)
+					}
+					if _, err := pgtx.From(sctx, pool).Exec(sctx,
+						`INSERT INTO `+schema+`.side (v) VALUES ($1)`, evt.ID); err != nil {
+						return err
+					}
+					if calls.Add(1) == 1 && tc.failFirst {
+						return errBoom
+					}
+					return nil
+				})
 			}
 			h := outbox.Inbox(pool, schema, "ledger", next)
 			evt := appkit.Event{ID: uuid.NewString(), Topic: "ledger.entry_posted"}
@@ -377,8 +395,153 @@ func TestInboxIntegration(t *testing.T) {
 			if n := countRows(t, pool, `SELECT count(*) FROM `+schema+`.side`); n != 1 {
 				t.Errorf("业务行数 = %d, want 1", n)
 			}
+			if n := countRows(t, pool, `SELECT count(*) FROM `+schema+`.side WHERE v LIKE $1`, evt.ID+"/nested"); n != 0 {
+				t.Errorf("nested savepoint 回滚后的业务行数 = %d, want 0", n)
+			}
 		})
 	}
+}
+
+// TestInboxWithTransactorScopes 锁住 Inbox → Service → nested Do 的作用域组合：
+// Inbox 不得把 raw pgx.Tx 伪装进 ctx；同一套 plain/tenant/routed/routed+tenant
+// Transactor 都必须能在真实业务层继续开 savepoint，并让占位与业务写同事务提交。
+func TestInboxWithTransactorScopes(t *testing.T) {
+	pool := dbtest.Pool(t)
+
+	t.Run("tenant", func(t *testing.T) {
+		schema := dbtest.Schema(t, pool, "outbox_inbox_tenant", outbox.MigrationSQL)
+		ctx := callctx.With(context.Background(), callctx.Meta{TenantID: "tenant-a"})
+		if _, err := pool.Exec(context.Background(), `CREATE TABLE `+schema+`.inbox_side (
+			id text PRIMARY KEY, tenant_id text NOT NULL
+		)`); err != nil {
+			t.Fatalf("建 tenant 业务表: %v", err)
+		}
+		if _, err := pool.Exec(context.Background(), pgtx.TenantScopeSQL(schema)+pgtx.TenantPolicySQL(schema, "inbox_side")); err != nil {
+			t.Fatalf("建 tenant RLS: %v", err)
+		}
+
+		txr := pgtx.NewTenant(pool)
+		var calls atomic.Int64
+		h := outbox.InboxWithTransactor(pool, txr, schema, "tenant-consumer", func(ctx context.Context, evt appkit.Event) error {
+			calls.Add(1)
+			return txr.Do(ctx, func(ctx context.Context) error {
+				_, err := pgtx.From(ctx, pool).Exec(ctx,
+					`INSERT INTO `+schema+`.inbox_side (id, tenant_id) VALUES ($1, current_setting('app.tenant_id'))`, evt.ID)
+				return err
+			})
+		})
+		evt := appkit.Event{ID: uuid.NewString(), Topic: "tenant.created"}
+		if err := h(ctx, evt); err != nil {
+			t.Fatalf("tenant Inbox: %v", err)
+		}
+		if err := h(ctx, evt); err != nil {
+			t.Fatalf("tenant duplicate Inbox: %v", err)
+		}
+		if got := countRows(t, pool, `SELECT count(*) FROM `+schema+`.inbox_side WHERE tenant_id = 'tenant-a'`); got != 1 {
+			t.Fatalf("tenant 业务行数 = %d, want 1", got)
+		}
+		if got := calls.Load(); got != 1 {
+			t.Fatalf("tenant handler 调用次数 = %d, want 1", got)
+		}
+	})
+
+	t.Run("routed", func(t *testing.T) {
+		a := dbtest.Schema(t, pool, "outbox_inbox_route_a", outbox.MigrationSQL)
+		b := dbtest.Schema(t, pool, "outbox_inbox_route_b", outbox.MigrationSQL)
+		for _, schema := range []string{a, b} {
+			if _, err := pool.Exec(context.Background(), `CREATE TABLE `+schema+`.inbox_side (id text PRIMARY KEY)`); err != nil {
+				t.Fatalf("建 routed 业务表 %s: %v", schema, err)
+			}
+		}
+		route := func(ctx context.Context) (string, error) {
+			switch callctx.From(ctx).Partition {
+			case "a":
+				return a, nil
+			case "b":
+				return b, nil
+			default:
+				return "", fmt.Errorf("unknown partition %q", callctx.From(ctx).Partition)
+			}
+		}
+		txr := pgtx.NewRouted(pool, route)
+		next := func(ctx context.Context, evt appkit.Event) error {
+			return txr.Do(ctx, func(ctx context.Context) error {
+				_, err := pgtx.From(ctx, pool).Exec(ctx, `INSERT INTO inbox_side (id) VALUES ($1)`, evt.ID)
+				return err
+			})
+		}
+		h := outbox.InboxWithTransactor(pool, txr, "", "routed-consumer", next)
+		for _, tc := range []struct {
+			partition, schema string
+		}{
+			{partition: "a", schema: a},
+			{partition: "b", schema: b},
+		} {
+			evt := appkit.Event{ID: uuid.NewString(), Topic: "routed.created"}
+			ctx := callctx.With(context.Background(), callctx.Meta{Partition: tc.partition})
+			if err := h(ctx, evt); err != nil {
+				t.Fatalf("routed %s Inbox: %v", tc.partition, err)
+			}
+			if err := h(ctx, evt); err != nil {
+				t.Fatalf("routed %s duplicate Inbox: %v", tc.partition, err)
+			}
+			if got := countRows(t, pool, `SELECT count(*) FROM `+tc.schema+`.inbox_side`); got != 1 {
+				t.Fatalf("routed %s 业务行数 = %d, want 1", tc.partition, got)
+			}
+		}
+	})
+
+	t.Run("routed+tenant", func(t *testing.T) {
+		a := dbtest.Schema(t, pool, "outbox_inbox_rt_a", outbox.MigrationSQL)
+		b := dbtest.Schema(t, pool, "outbox_inbox_rt_b", outbox.MigrationSQL)
+		for _, schema := range []string{a, b} {
+			if _, err := pool.Exec(context.Background(), `CREATE TABLE `+schema+`.inbox_side (
+				id text PRIMARY KEY, tenant_id text NOT NULL
+			)`); err != nil {
+				t.Fatalf("建 routed+tenant 业务表 %s: %v", schema, err)
+			}
+			if _, err := pool.Exec(context.Background(), pgtx.TenantScopeSQL(schema)+pgtx.TenantPolicySQL(schema, "inbox_side")); err != nil {
+				t.Fatalf("建 routed+tenant RLS %s: %v", schema, err)
+			}
+		}
+		route := func(ctx context.Context) (string, error) {
+			switch callctx.From(ctx).Partition {
+			case "a":
+				return a, nil
+			case "b":
+				return b, nil
+			default:
+				return "", fmt.Errorf("unknown partition %q", callctx.From(ctx).Partition)
+			}
+		}
+		txr := pgtx.NewRoutedTenant(pool, route)
+		next := func(ctx context.Context, evt appkit.Event) error {
+			return txr.Do(ctx, func(ctx context.Context) error {
+				_, err := pgtx.From(ctx, pool).Exec(ctx,
+					`INSERT INTO inbox_side (id, tenant_id) VALUES ($1, current_setting('app.tenant_id'))`, evt.ID)
+				return err
+			})
+		}
+		h := outbox.InboxWithTransactor(pool, txr, "", "routed-tenant-consumer", next)
+		for _, tc := range []struct {
+			partition, tenant, schema string
+		}{
+			{partition: "a", tenant: "tenant-a", schema: a},
+			{partition: "b", tenant: "tenant-b", schema: b},
+		} {
+			ctx := callctx.With(context.Background(), callctx.Meta{Partition: tc.partition, TenantID: tc.tenant})
+			evt := appkit.Event{ID: uuid.NewString(), Topic: "routed.tenant.created"}
+			if err := h(ctx, evt); err != nil {
+				t.Fatalf("routed+tenant %s Inbox: %v", tc.partition, err)
+			}
+			if err := h(ctx, evt); err != nil {
+				t.Fatalf("routed+tenant %s duplicate Inbox: %v", tc.partition, err)
+			}
+			if got := countRows(t, pool, `SELECT count(*) FROM `+tc.schema+`.inbox_side WHERE tenant_id = $1`, tc.tenant); got != 1 {
+				t.Fatalf("routed+tenant %s 业务行数 = %d, want 1", tc.partition, got)
+			}
+		}
+	})
 }
 
 // 端到端：事务发布 → relay → DirectBus → Inbox 去重消费。
@@ -620,19 +783,38 @@ func TestRelayLeaseTakeover(t *testing.T) {
 	const topic = "ledger.entry_posted"
 
 	block := make(chan struct{})
+	released := make(chan struct{})
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(block) }) }
 
 	stuckBus := outbox.NewDirectBus()
 	stuckBus.Subscribe(topic, func(context.Context, appkit.Event) error {
 		<-block
+		close(released)
 		// 解除阻塞只发生在测试收尾：返回错误即可，避免与 relay2 的成功标记混淆。
 		return errors.New("stuck handler released")
 	})
 	relay1 := outbox.NewRelay(pool, schema, stuckBus,
 		outbox.WithInterval(10*time.Millisecond), outbox.WithLease(300*time.Millisecond))
-	startRelay(t, relay1)
-	// 注册在 startRelay 之后：Cleanup 按 LIFO 先解除阻塞，relay1 才能退出。
+	relay1Ctx, cancelRelay1 := context.WithCancel(context.Background())
+	relay1Finished := make(chan struct{})
+	var relay1Err error
+	go func() {
+		relay1Err = relay1.Run(relay1Ctx)
+		close(relay1Finished)
+	}()
+	t.Cleanup(func() {
+		cancelRelay1()
+		select {
+		case <-relay1Finished:
+			if relay1Err != nil {
+				t.Errorf("relay1 Run 退出应返回 nil，得到 %v", relay1Err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("relay1 在 ctx 取消后未退出")
+		}
+	})
+	// 注册在 relay1 cleanup 之后：Cleanup 按 LIFO 先解除阻塞，relay1 才能退出。
 	t.Cleanup(unblock)
 
 	evt := appkit.Event{ID: uuid.NewString(), Topic: topic}
@@ -670,6 +852,36 @@ func TestRelayLeaseTakeover(t *testing.T) {
 	}
 	if publishedAt.Before(claimedUntil) {
 		t.Errorf("接管早于租约到期：published_at = %v, claimed_until = %v", publishedAt, claimedUntil)
+	}
+
+	// 让旧 owner 在新 owner 成功之后返回失败，验证迟到的失败收尾不能污染
+	// 已发布事件（旧实现会把 attempts 再加一）。
+	unblock()
+	<-released
+	cancelRelay1()
+	select {
+	case <-relay1Finished:
+		if relay1Err != nil {
+			t.Fatalf("relay1 退出 = %v, want nil", relay1Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay1 在旧 owner 返回后未完成收尾")
+	}
+	var (
+		failedAt   *time.Time
+		attempts   int
+		claimToken *string
+	)
+	if err := pool.QueryRow(context.Background(),
+		`SELECT failed_at, attempts, claim_token FROM `+schema+`.outbox WHERE id = $1`, evt.ID).
+		Scan(&failedAt, &attempts, &claimToken); err != nil {
+		t.Fatalf("读取接管后的旧 owner 状态: %v", err)
+	}
+	if failedAt != nil || attempts != 0 {
+		t.Fatalf("旧 owner 的迟到失败污染了已发布事件: failed_at=%v attempts=%d", failedAt, attempts)
+	}
+	if claimToken != nil {
+		t.Fatalf("已发布事件不应保留 claim token: %q", *claimToken)
 	}
 }
 

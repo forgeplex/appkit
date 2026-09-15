@@ -9,10 +9,12 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/callctx"
+	"github.com/forgeplex/appkit/internal/cleanup"
 	"github.com/forgeplex/appkit/internal/metrics"
 )
 
@@ -130,24 +132,27 @@ func NewRelay(pool *pgxpool.Pool, schema string, bus Bus, opts ...RelayOption) *
 			 ORDER BY created_at, id LIMIT $1 FOR UPDATE SKIP LOCKED`,
 			ident(schema)),
 		claimMarkSQL: fmt.Sprintf(
-			`UPDATE %s.outbox SET claimed_until = now() + $2 * interval '1 millisecond' WHERE id = ANY($1)`,
+			`UPDATE %s.outbox SET claimed_until = now() + $2 * interval '1 millisecond', claim_token = $3
+				 WHERE id = ANY($1) AND published_at IS NULL AND failed_at IS NULL`,
 			ident(schema)),
 		publishedSQL: fmt.Sprintf(
-			`UPDATE %s.outbox SET published_at = now(), claimed_until = NULL WHERE id = ANY($1)`,
+			`UPDATE %s.outbox SET published_at = now(), claimed_until = NULL, claim_token = NULL
+				 WHERE id = ANY($1) AND published_at IS NULL AND failed_at IS NULL AND claim_token = $2`,
 			ident(schema)),
 		retrySQL: fmt.Sprintf(
 			`UPDATE %s.outbox SET attempts = attempts + 1,
-			        next_attempt_at = now() + $2 * interval '1 millisecond',
-			        last_error = $3, claimed_until = NULL
-			 WHERE id = $1`,
+				        next_attempt_at = now() + $2 * interval '1 millisecond',
+				        last_error = $3, claimed_until = NULL, claim_token = NULL
+				 WHERE id = $1 AND published_at IS NULL AND failed_at IS NULL AND claim_token = $4`,
 			ident(schema)),
 		deadSQL: fmt.Sprintf(
 			`UPDATE %s.outbox SET attempts = attempts + 1, failed_at = now(),
-			        last_error = $2, claimed_until = NULL
-			 WHERE id = $1`,
+				        last_error = $2, claimed_until = NULL, claim_token = NULL
+				 WHERE id = $1 AND published_at IS NULL AND failed_at IS NULL AND claim_token = $3`,
 			ident(schema)),
 		releaseSQL: fmt.Sprintf(
-			`UPDATE %s.outbox SET claimed_until = NULL WHERE id = ANY($1)`,
+			`UPDATE %s.outbox SET claimed_until = NULL, claim_token = NULL
+				 WHERE id = ANY($1) AND published_at IS NULL AND failed_at IS NULL AND claim_token = $2`,
 			ident(schema)),
 		// WHERE 子句必须与 outbox_unpublished_idx 的部分索引条件逐字一致，
 		// 否则退化成全表扫描。
@@ -218,27 +223,32 @@ func (r *Relay) backlog(ctx context.Context) (metrics.Backlog, error) {
 	}, nil
 }
 
-// claimedEvent 是 claim 阶段选中的一行。attempts 供失败退避决策；meta 延迟
-// 到投递前才反序列化——坏 meta 按该条投递失败退避处理，不再阻塞整批。
+// claimedEvent 是 claim 阶段选中的一行。attempts 供失败退避决策，claimToken
+// 是所有收尾 SQL 的 fencing 条件；meta 延迟到投递前才反序列化——坏 meta 按该条
+// 投递失败退避处理，不再阻塞整批。
 type claimedEvent struct {
-	id       string
-	topic    string
-	payload  []byte
-	meta     []byte
-	attempts int
+	id         string
+	topic      string
+	payload    []byte
+	meta       []byte
+	attempts   int
+	claimToken string
 }
+
+var errRelayLeaseLost = errors.New("outbox: relay claim fencing rejected")
 
 // relayOnce 以 claim/lease 两段式处理一批。
 //
-// ① claim（短事务）：FOR UPDATE SKIP LOCKED 选中到期待投递事件、写
-// claimed_until 租约后立即提交——投递期间连接已归还，同池消费者（如 Inbox）
+// ① claim（短事务）：FOR UPDATE SKIP LOCKED 选中到期待投递事件、写 claimed_until
+// 租约和 claim_token 后立即提交——投递期间连接已归还，同池消费者（如 Inbox）
 // 再 Begin 不会与 relay 形成 hold-and-wait 死锁。
 // ② 投递（不持连接）：逐条 bus.Publish，panic 恢复为错误；单条失败即停止
 // 本批后续投递（批内尽力保序），未投递者立即释放租约由下轮重拣。
 // ③ 收尾（短语句）：成功者置 published_at；失败者记 attempts 与指数退避
 // next_attempt_at、写 last_error，达重试上限则置 failed_at 进入死信。
 //
-// 崩溃于 ②③ 之间时租约到期后重投——至少一次语义不变，重复由 inbox 去重吸收。
+// 崩溃于 ②③ 之间时租约到期后重投——至少一次语义不变，重复由 inbox 去重吸收；
+// 租约接管后旧 owner 的迟到收尾因 token 不匹配而无效。
 // 返回本轮 claim 的事件数（供 Run 判断是否仍有积压）。
 func (r *Relay) relayOnce(ctx context.Context) (n int, err error) {
 	claimed, err := r.claim(ctx)
@@ -264,12 +274,18 @@ func (r *Relay) relayOnce(ctx context.Context) (n int, err error) {
 		delivered = append(delivered, claimed[i].id)
 	}
 
-	// 收尾必须尽力完成：ctx 已取消也要把已投递的结果落库，否则重复投递被放大。
-	finCtx := context.WithoutCancel(ctx)
+	// 收尾必须尽力完成：ctx 已取消也要把已投递的结果落库，否则重复投递被放大；
+	// 但取消安全的 cleanup ctx 仍有固定上限，不能无限期占住连接。
+	finCtx, cancelFin := cleanup.Context(ctx)
+	defer cancelFin()
 	var finErrs []error
 	if len(delivered) > 0 {
-		if _, err := r.pool.Exec(finCtx, r.publishedSQL, delivered); err != nil {
+		tag, err := r.pool.Exec(finCtx, r.publishedSQL, delivered, claimed[0].claimToken)
+		if err != nil {
 			finErrs = append(finErrs, fmt.Errorf("outbox: 标记 published_at: %w", err))
+		} else if tag.RowsAffected() != int64(len(delivered)) {
+			finErrs = append(finErrs, fmt.Errorf("%w: 已成功投递的 %d 条事件中仅收尾 %d 条",
+				errRelayLeaseLost, len(delivered), tag.RowsAffected()))
 		}
 	}
 	if failedIdx >= 0 {
@@ -278,7 +294,7 @@ func (r *Relay) relayOnce(ctx context.Context) (n int, err error) {
 		}
 	}
 	if len(rest) > 0 {
-		if _, err := r.pool.Exec(finCtx, r.releaseSQL, rest); err != nil {
+		if _, err := r.pool.Exec(finCtx, r.releaseSQL, rest, claimed[0].claimToken); err != nil {
 			finErrs = append(finErrs, fmt.Errorf("outbox: 释放未投递事件的租约: %w", err))
 		}
 	}
@@ -291,8 +307,13 @@ func (r *Relay) claim(ctx context.Context) ([]claimedEvent, error) {
 	if err != nil {
 		return nil, fmt.Errorf("outbox: 开启 claim 事务: %w", err)
 	}
-	// 提交成功后的 Rollback 是空操作；用免取消 ctx 保证失败路径能归还健康连接。
-	defer func() { _ = ptx.Rollback(context.WithoutCancel(ctx)) }()
+	// 提交成功后的 Rollback 是空操作；用取消安全且有上限的 ctx 保证失败路径
+	// 能尽力归还健康连接而不会无限期挂住。
+	defer func() {
+		rbCtx, cancelRollback := cleanup.Context(ctx)
+		defer cancelRollback()
+		_ = ptx.Rollback(rbCtx)
+	}()
 
 	rows, err := ptx.Query(ctx, r.claimSelectSQL, r.batch)
 	if err != nil {
@@ -318,11 +339,19 @@ func (r *Relay) claim(ctx context.Context) ([]claimedEvent, error) {
 	if len(claimed) == 0 {
 		return nil, nil
 	}
-	if _, err := ptx.Exec(ctx, r.claimMarkSQL, ids, r.lease.Milliseconds()); err != nil {
+	claimToken := uuid.NewString()
+	tag, err := ptx.Exec(ctx, r.claimMarkSQL, ids, r.lease.Milliseconds(), claimToken)
+	if err != nil {
 		return nil, fmt.Errorf("outbox: 写入 claim 租约: %w", err)
+	}
+	if tag.RowsAffected() != int64(len(claimed)) {
+		return nil, fmt.Errorf("outbox: 写入 claim 租约仅更新 %d/%d 条", tag.RowsAffected(), len(claimed))
 	}
 	if err := ptx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("outbox: 提交 claim 事务: %w", err)
+	}
+	for i := range claimed {
+		claimed[i].claimToken = claimToken
 	}
 	return claimed, nil
 }
@@ -359,8 +388,12 @@ func (r *Relay) deliver(ctx context.Context, ce claimedEvent) (err error) {
 func (r *Relay) recordFailure(ctx context.Context, ce claimedEvent, cause error) error {
 	attempts := ce.attempts + 1
 	if attempts >= r.maxAttempts {
-		if _, err := r.pool.Exec(ctx, r.deadSQL, ce.id, cause.Error()); err != nil {
+		tag, err := r.pool.Exec(ctx, r.deadSQL, ce.id, cause.Error(), ce.claimToken)
+		if err != nil {
 			return fmt.Errorf("outbox: 标记死信: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: event %s", errRelayLeaseLost, ce.id)
 		}
 		metrics.OutboxDead(ctx, ce.topic)
 		r.log.Error("outbox: 事件投递重试达上限，转入死信（failed_at），需人工处理",
@@ -369,8 +402,12 @@ func (r *Relay) recordFailure(ctx context.Context, ce claimedEvent, cause error)
 		return nil
 	}
 	delay := backoff(r.interval, ce.attempts)
-	if _, err := r.pool.Exec(ctx, r.retrySQL, ce.id, delay.Milliseconds(), cause.Error()); err != nil {
+	tag, err := r.pool.Exec(ctx, r.retrySQL, ce.id, delay.Milliseconds(), cause.Error(), ce.claimToken)
+	if err != nil {
 		return fmt.Errorf("outbox: 记录失败退避: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: event %s", errRelayLeaseLost, ce.id)
 	}
 	return nil
 }

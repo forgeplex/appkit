@@ -153,6 +153,7 @@ func TestDomainScaffold(t *testing.T) {
 			"Modules: func(d bootstrap.Deps)", "ledger.Module(")
 		mustContain(t, "module.go", readFile(t, dir, "internal/module/module.go"),
 			`Schema = "ledger"`, "reg.Migrations(Schema", "reg.Health(", "appkit.Provide(",
+			"txr := pgtx.New(m.opts.Pool)", "InboxWithTransactor(m.opts.Pool, txr, Schema,",
 			// 权限码声明从第一天就在骨架里：目录由各域自声明、框架汇总，
 			// 组合根不再手抄全目录。
 			"reg.Permissions(ledger.PermissionCatalog()...)", "reg.MountPublic(", "reg.MountPermission(")
@@ -310,6 +311,7 @@ func TestDomainPartitionedScaffold(t *testing.T) {
 			`apperr.InvalidArgument(`,
 			"outbox.Publish(ctx, pgtx.From(ctx, p.pool), schema, evt)",
 			`reg.Worker("outbox-relay/"+partition`,
+			"InboxWithTransactor(m.opts.Pool, txr, \"\",",
 			// 权限码是应用级目录，分区形态同样声明。
 			"reg.Permissions(rbac.PermissionCatalog()...)", "reg.MountPublic(", "reg.MountPermission(",
 		)
@@ -387,6 +389,7 @@ func TestDomainTenantScaffold(t *testing.T) {
 		mod := readFile(t, dir, "internal/module/module.go")
 		mustContain(t, "module.go", mod,
 			"pgtx.NewTenant(m.opts.Pool)",
+			"InboxWithTransactor(m.opts.Pool, txr, Schema,",
 			// Setup 期守卫必须在：迁移先于 Setup 应用，这里看到的是终态。
 			"pgtx.VerifyTenantRLS(ctx, m.opts.Pool, Schema)",
 			// 权限码声明与其他形态一致（目录是应用级的）。
@@ -486,6 +489,7 @@ func TestDomainPartitionedTenantScaffold(t *testing.T) {
 			// 逐分区校验：每个 schema 各自要过。
 			"pgtx.VerifyTenantRLS(ctx, m.opts.Pool, schema)",
 			`reg.Worker("outbox-relay/"+partition`,
+			"InboxWithTransactor(m.opts.Pool, txr, \"\",",
 			"reg.Permissions(order.PermissionCatalog()...)", "tx.WithReadAllTenants",
 		)
 		mustContain(t, "permission.go", readFile(t, dir, "internal/order/permission.go"),

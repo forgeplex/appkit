@@ -47,7 +47,7 @@ func NewDeadLetters(pool *pgxpool.Pool, schema string) *DeadLetters {
 			ident(schema)),
 		retrySQL: fmt.Sprintf(
 			`UPDATE %s.outbox
-			    SET failed_at = NULL, attempts = 0, next_attempt_at = now(), claimed_until = NULL
+			SET failed_at = NULL, attempts = 0, next_attempt_at = now(), claimed_until = NULL, claim_token = NULL
 			  WHERE id = ANY($1) AND failed_at IS NOT NULL AND published_at IS NULL`,
 			ident(schema)),
 	}

@@ -87,7 +87,8 @@ func baseMigrationSQL(o Options) string {
 	}
 	var b strings.Builder
 	b.WriteString("-- 0001_appkit_base.sql —— appkit 基础设施表（outbox/inbox/幂等/审计），每 schema 一套（DESIGN §8）。\n")
-	b.WriteString("-- 本文件由 appkit new 调用库函数生成（库函数是 DDL 唯一事实源）；升级 appkit 后可重新生成刷新。\n\n")
+	b.WriteString("-- 本文件由 appkit new 调用库函数生成（库函数是 DDL 唯一事实源）。\n")
+	b.WriteString("-- 已应用迁移不可改；已有域的框架升级请另建版本迁移，嵌入 outbox.MigrationSQLUpgrade / idem.MigrationSQLUpgrade 的输出。\n\n")
 	// pgmigrate 运行期本来会建 schema；这里再写一份是给 sqlc 的静态分析看的
 	// （sqlc 只读迁移文件，看不到运行期行为），幂等重复无害。
 	fmt.Fprintf(&b, "CREATE SCHEMA IF NOT EXISTS %q;\n\n", o.Name)
@@ -152,7 +153,8 @@ func baseMigrationSQLPartitioned(o Options) string {
 	b.WriteString("-- 0001_appkit_base.sql —— appkit 基础设施表（outbox/inbox/幂等/审计），每分区一套（DESIGN §8）。\n")
 	b.WriteString("-- 分区域域：本文件全无前缀，落位由 pgmigrate 按分区经 search_path 决定；\n")
 	b.WriteString("-- 新分区 = 组合根的分区映射加一条 + 重启，迁移自动建 schema——本文件勿手写任何 schema 名或建 schema 语句。\n")
-	b.WriteString("-- 本文件由 appkit new 调用库函数生成（库函数是 DDL 唯一事实源）；升级 appkit 后可重新生成刷新。\n\n")
+	b.WriteString("-- 本文件由 appkit new 调用库函数生成（库函数是 DDL 唯一事实源）。\n")
+	b.WriteString("-- 已应用迁移不可改；已有域的框架升级请另建版本迁移，嵌入 outbox.MigrationSQLBareUpgrade / idem.MigrationSQLBareUpgrade 的输出。\n\n")
 	b.WriteString(outbox.MigrationSQLBare())
 	b.WriteString("\n")
 	b.WriteString(idem.MigrationSQLBare())

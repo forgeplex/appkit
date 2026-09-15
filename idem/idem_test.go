@@ -43,7 +43,7 @@ func TestMigrationSQL(t *testing.T) {
 				"key          text PRIMARY KEY",
 				"payload_hash bytea NOT NULL",
 				"owner_token  uuid NOT NULL",
-				"state        text NOT NULL CHECK (state IN ('in_progress', 'completed'))",
+				"state        text NOT NULL CONSTRAINT idempotency_keys_state_check CHECK (state IN ('in_progress', 'completed', 'executed'))",
 				"headers      jsonb",
 				// 框架自己也守「建表就写说明」这条：机检见
 				// internal/schemadoc 的 TestFrameworkTablesAllDocumented。
@@ -67,6 +67,22 @@ func TestMigrationSQL(t *testing.T) {
 				if !strings.Contains(sql, frag) {
 					t.Errorf("缺少片段 %q:\n%s", frag, sql)
 				}
+			}
+		})
+	}
+}
+
+func TestMigrationSQLUpgrade(t *testing.T) {
+	t.Parallel()
+	for name, sql := range map[string]string{
+		"schema": MigrationSQLUpgrade("ledger"),
+		"bare":   MigrationSQLBareUpgrade(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(sql, "DROP CONSTRAINT IF EXISTS idempotency_keys_state_check") ||
+				!strings.Contains(sql, "ADD CONSTRAINT idempotency_keys_state_check") ||
+				!strings.Contains(sql, "'executed'") {
+				t.Fatalf("升级 DDL 未放开 executed 终态:\n%s", sql)
 			}
 		})
 	}
@@ -553,8 +569,9 @@ func TestStaleInProgressTakeover(t *testing.T) {
 	}
 }
 
-// TestOversizeResponseReleasesClaim 验证超限响应不入库：claim 被释放，重试重新执行。
-func TestOversizeResponseReleasesClaim(t *testing.T) {
+// TestOversizeResponseIsTerminal 验证超限响应不入库但 claim 不释放：业务可能已经
+// 执行，后续同键请求必须得到稳定的结果不可回放错误而不能再次执行。
+func TestOversizeResponseIsTerminal(t *testing.T) {
 	_, store := testStore(t)
 	big := bytes.Repeat([]byte("x"), maxCaptureBytes+1)
 	var runs atomic.Int32
@@ -569,16 +586,63 @@ func TestOversizeResponseReleasesClaim(t *testing.T) {
 		t.Fatalf("首次响应 = %d %d 字节, want 200 %d 字节（客户端不受缓存上限影响）",
 			first.Code, first.Body.Len(), len(big))
 	}
-	if _, found := rowState(t, store, "big-key"); found {
-		t.Fatal("超限响应后 claim 应被释放（记录不存在）")
+	if state, found := rowState(t, store, "big-key"); !found || state != StateExecuted {
+		t.Fatalf("超限响应后 state = %q（found=%v）, want executed", state, found)
 	}
 
 	second := doReq(t, h, http.MethodPost, "/big", "big-key", "b")
-	if second.Code != http.StatusOK {
-		t.Fatalf("重试 status = %d, want 200", second.Code)
+	if second.Code != http.StatusConflict {
+		t.Fatalf("同键请求 status = %d, want 409", second.Code)
 	}
-	if got := runs.Load(); got != 2 {
-		t.Fatalf("释放后重试应重新执行，执行次数 = %d, want 2", got)
+	if p := decodeProblem(t, second.Body); p.Code != apperr.CodeIdempotencyResultUnavailable {
+		t.Fatalf("同键请求 problem code = %q, want %q", p.Code, apperr.CodeIdempotencyResultUnavailable)
+	}
+	if got := second.Header().Get(HeaderStatus); got != StatusExecuted {
+		t.Fatalf("同键请求 %s = %q, want %q", HeaderStatus, got, StatusExecuted)
+	}
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("不可回放终态不得重新执行，执行次数 = %d, want 1", got)
+	}
+}
+
+type failingResponseWriter struct {
+	header http.Header
+	status int
+}
+
+func (w *failingResponseWriter) Header() http.Header { return w.header }
+
+func (w *failingResponseWriter) WriteHeader(code int) { w.status = code }
+
+func (w *failingResponseWriter) Write([]byte) (int, error) {
+	return 0, errors.New("connection reset")
+}
+
+func TestResponseWriteFailureIsTerminal(t *testing.T) {
+	_, store := testStore(t)
+	var runs atomic.Int32
+	h := Middleware(store, slog.New(slog.DiscardHandler))(
+		http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			runs.Add(1)
+			_, _ = w.Write([]byte("business-executed"))
+		}))
+
+	req := httptest.NewRequest(http.MethodPost, "/write-failure", strings.NewReader("b"))
+	req.Header.Set(HeaderKey, "write-failure-key")
+	failedWriter := &failingResponseWriter{header: make(http.Header)}
+	h.ServeHTTP(failedWriter, req)
+
+	if state, found := rowState(t, store, "write-failure-key"); !found || state != StateExecuted {
+		t.Fatalf("写出失败后 state = %q（found=%v）, want executed", state, found)
+	}
+	second := doReq(t, h, http.MethodPost, "/write-failure", "write-failure-key", "b")
+	if second.Code != http.StatusConflict ||
+		decodeProblem(t, second.Body).Code != apperr.CodeIdempotencyResultUnavailable {
+		t.Fatalf("写出失败后的同键响应 = %d %q, want 409/%s", second.Code,
+			second.Body.String(), apperr.CodeIdempotencyResultUnavailable)
+	}
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("写出失败后的同键请求不得重新执行，执行次数 = %d, want 1", got)
 	}
 }
 
@@ -671,6 +735,41 @@ func TestTakeoverFencesLateComplete(t *testing.T) {
 	if replay.Header().Get(HeaderReplayed) != "true" || replay.Body.String() != "takeover" {
 		t.Fatalf("回放 = replayed=%q body=%q, want true takeover",
 			replay.Header().Get(HeaderReplayed), replay.Body.String())
+	}
+}
+
+// TestTakeoverFencesLateMarkExecuted 锁住不可回放终态也受 owner_token 保护：
+// 旧 owner 的 MarkExecuted 不能把 takeover owner 已完成的响应改成 executed。
+func TestTakeoverFencesLateMarkExecuted(t *testing.T) {
+	_, store := testStore(t)
+	store = store.WithTTL(50 * time.Millisecond)
+	hash := payloadHash(http.MethodPost, "/pay", []byte("body"))
+
+	claimed, oldToken, _, err := store.Claim(context.Background(), "mark-fence-key", hash)
+	if err != nil || !claimed {
+		t.Fatalf("旧 owner claim: claimed=%v err=%v", claimed, err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	claimed, newToken, _, err := store.Claim(context.Background(), "mark-fence-key", hash)
+	if err != nil || !claimed {
+		t.Fatalf("接管 claim: claimed=%v err=%v", claimed, err)
+	}
+	if err := store.Complete(context.Background(), "mark-fence-key", newToken, http.StatusOK,
+		map[string][]string{}, []byte("takeover")); err != nil {
+		t.Fatalf("接管 owner complete: %v", err)
+	}
+	if err := store.MarkExecuted(context.Background(), "mark-fence-key", oldToken, http.StatusOK); err == nil {
+		t.Fatal("旧 owner MarkExecuted 应被 fencing 拒绝")
+	}
+
+	var state string
+	var body []byte
+	if err := store.pool.QueryRow(context.Background(),
+		"SELECT state, body FROM "+store.tbl+" WHERE key = $1", "mark-fence-key").Scan(&state, &body); err != nil {
+		t.Fatalf("读取 takeover 记录: %v", err)
+	}
+	if state != StateCompleted || string(body) != "takeover" {
+		t.Fatalf("旧 owner 污染 takeover 记录: state=%q body=%q", state, body)
 	}
 }
 

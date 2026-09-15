@@ -52,10 +52,11 @@ func (m *mod) Name() string { return "{{.Name}}" }
 
 // Register 只做声明：Provide 服务、登记迁移 / 路由 / 健康检查（DESIGN §5.1）。
 func (m *mod) Register(reg *appkit.Registry) error {
+	txr := pgtx.New(m.opts.Pool)
 	appkit.Provide(reg, func(*appkit.Registry) (*{{.Name}}.Service, error) {
 		return {{.Name}}.NewService(
 			postgres.NewStore(m.opts.Pool),
-			pgtx.New(m.opts.Pool),
+			txr,
 			outbox.NewPublisher(m.opts.Pool, Schema),
 		), nil
 	})
@@ -77,7 +78,7 @@ func (m *mod) Register(reg *appkit.Registry) error {
 		m.handler = {{.Name}}http.NewPingHandler(m.opts.Log, svc)
 		// 消费外域事件样例（声明后组合根必须以 appkit.Bus 注入总线）：
 		// reg.Consumer("other.something.v1",
-		//     outbox.Inbox(m.opts.Pool, Schema, inbox.Consumer, inbox.NewHandler(svc)))
+		//     outbox.InboxWithTransactor(m.opts.Pool, txr, Schema, inbox.Consumer, inbox.NewHandler(svc)))
 		return nil
 	})
 	reg.MountPublic({{.Name}}http.PingPattern, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

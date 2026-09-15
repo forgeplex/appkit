@@ -29,6 +29,7 @@ import (
 
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/internal/cleanup"
 )
 
 // schema 名会被拼进 DDL（标识符无法参数化），必须白名单校验防注入。
@@ -85,8 +86,13 @@ func inLockedTx(ctx context.Context, pool *pgxpool.Pool, schema string, fn func(
 		return fmt.Errorf("开启事务: %w", err)
 	}
 	// 提交成功后 Rollback 返回 ErrTxClosed，忽略即可。
-	// 剥离取消信号：ROLLBACK 必须尽力发出，否则连接被整个废弃（同 pgtx）。
-	defer func() { _ = ptx.Rollback(context.WithoutCancel(ctx)) }()
+	// 剥离取消信号并给收尾独立上限：ROLLBACK 必须尽力发出，否则连接被
+	// 整个废弃；无限期 WithoutCancel 又可能把迁移收尾永久挂住（同 pgtx）。
+	defer func() {
+		rbCtx, cancelRollback := cleanup.Context(ctx)
+		defer cancelRollback()
+		_ = ptx.Rollback(rbCtx)
+	}()
 
 	if _, err := ptx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", schema); err != nil {
 		return fmt.Errorf("获取 advisory lock: %w", err)

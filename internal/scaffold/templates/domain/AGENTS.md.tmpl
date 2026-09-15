@@ -59,7 +59,7 @@ unsigned `X-Partition` 只负责传输、不授信。组合根注入「分区键
 | `internal/http/` | handler：只做 DTO ↔ 领域类型映射；每个资源一个文件 | 是 |
 | `internal/inbox/` | 外域事件消费者 | 偶尔 |
 | `internal/module/module.go` | 唯一 wiring 落点（Provide/Mount/Migrations/Health） | 每加路由/用例改一行 |
-| `db/migrations/` | 迁移；`0001_appkit_base.sql` 是框架基础表 | 新增文件，**不改旧文件** |
+| `db/migrations/` | 迁移；`0001_appkit_base.sql` 是框架基础表 | 新增文件，**不改旧文件**；框架升级 DDL 另起版本 |
 | `db/SCHEMA.md`、`db/schema/` | {{if .Partitioned}}逻辑模板总览{{else}}表结构总览{{end}} + ER 图 + 每表详情，从迁移派生 | **禁止手改**（make schema 重新生成） |
 | `db/schema.sql`、`db/schema.lock.json` | 可选 sqlc 当前结构快照与来源摘要 | **禁止手改**（make schema-sqlc 生成） |
 | `db/queries/` | SQL 唯一存在地（sqlc 源） | 是 |
@@ -183,8 +183,9 @@ unsigned `X-Partition` 只负责传输、不授信。组合根注入「分区键
   禁止字符串比对；
 - **事件**：只能在 `tx.Do` 内经注入的 Publisher 发（落 outbox，提交后
   relay 自动外发）；事务外发布会被运行时守卫拒绝；
-- **消费事件**：`reg.Consumer(topic, outbox.Inbox(pool, schema, consumer, h))`，
-  handler 必须幂等；
+- **消费事件**：`reg.Consumer(topic, outbox.InboxWithTransactor(pool, txr, schema, consumer, h))`，
+  把与 Service 相同作用域的 `txr` 传入；普通/tenant 域的 `schema` 必填，
+  routed 域传空字符串让事务级 `search_path` 同时定位 inbox 与业务表；handler 必须幂等；
 - **跨域调用**：只依赖合约 module 的接口 + `appkit.Resolve`；
   **禁止 require 其他业务域仓库**（appkit check 会拦）；事务内跨域调用
   会得到 TX_BOUNDARY 错误——一致性走事件，不走共享事务；

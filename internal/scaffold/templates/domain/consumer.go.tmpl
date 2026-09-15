@@ -1,4 +1,4 @@
-// Package inbox 消费外域事件：装配层用 outbox.Inbox 按 (consumer, event_id)
+// Package inbox 消费外域事件：装配层用 outbox.InboxWithTransactor 按 (consumer, event_id)
 // 去重后调业务包用例。不得 import internal/postgres（DESIGN §4 约束 3）。
 package inbox
 
@@ -14,7 +14,8 @@ import (
 const Consumer = "{{.Name}}"
 
 // NewHandler 返回外域事件处理器。装配时（internal/module）用
-// outbox.Inbox(pool, "{{.Name}}", Consumer, NewHandler(svc)) 包一层去重，
+// 普通域用 outbox.InboxWithTransactor(pool, txr, "{{.Name}}", Consumer, NewHandler(svc))；
+// routed 域传空 schema（""）让事务级 search_path 选择当前分区；再包一层去重，
 // 再经 reg.Consumer(topic, ...) 声明消费。
 //
 // 投递语义是至少一次：实现必须幂等——inbox 去重只保证「至少一次投递、
