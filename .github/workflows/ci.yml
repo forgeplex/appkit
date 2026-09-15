@@ -36,6 +36,12 @@ jobs:
         with:
           go-version: "1.26"
 
+      # 内部 acceptance/scaffold 测试会在子进程中关闭网络，构建完整的
+      # appkit 工作区。显式预热整个 module graph，不能依赖 runner 缓存恰好
+      # 已包含仅在生成域构建中才会加载的间接依赖。
+      - name: 预热完整 Go module cache
+        run: go mod download all
+
       - name: gofmt 检查
         run: |
           out=$(gofmt -l .)
