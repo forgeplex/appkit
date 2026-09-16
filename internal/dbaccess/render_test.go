@@ -45,6 +45,7 @@ func TestRenderSQLIsDeterministicAndSafe(t *testing.T) {
 		`ALTER TABLE "merchant"."admin_account" FORCE ROW LEVEL SECURITY;`,
 		`RAISE EXCEPTION 'required RLS policy % is missing on %', 'admin_account_tenant_isolation', 'merchant.admin_account';`,
 		`REVOKE DELETE, INSERT, TRIGGER, TRUNCATE, UPDATE ON TABLE "ledger"."ledger_entry" FROM "app_admin_api";`,
+		`REVOKE INSERT (%I), UPDATE (%I) ON TABLE %I.%I FROM %I`,
 		`REVOKE TRIGGER, TRUNCATE ON TABLE "merchant"."admin_account" FROM "app_admin_api";`,
 	} {
 		if !strings.Contains(text, want) {

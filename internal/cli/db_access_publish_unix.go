@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -18,7 +19,7 @@ func publishAccessSQL(requestedParent, targetName string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	dirfd, err := unix.Open(parent, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	dirfd, err := openAccessDirectory(parent)
 	if err != nil {
 		return fmt.Errorf("打开生成 SQL 目录 %s: %w", parent, err)
 	}
@@ -60,6 +61,29 @@ func publishAccessSQL(requestedParent, targetName string, data []byte) error {
 	tempExists = false
 	_ = unix.Fsync(dirfd)
 	return nil
+}
+
+// openAccessDirectory walks the canonical absolute path from a root directory
+// descriptor. Every component is opened relative to the previously verified
+// descriptor with O_NOFOLLOW, so concurrent path replacement cannot redirect
+// the final descriptor after validation.
+func openAccessDirectory(path string) (int, error) {
+	current, err := unix.Open(string(os.PathSeparator), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return -1, err
+	}
+	for _, component := range strings.Split(strings.TrimPrefix(path, string(os.PathSeparator)), string(os.PathSeparator)) {
+		if component == "" {
+			continue
+		}
+		next, err := unix.Openat(current, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		_ = unix.Close(current)
+		if err != nil {
+			return -1, err
+		}
+		current = next
+	}
+	return current, nil
 }
 
 func ensureAccessTargetAbsent(dirfd int, displayPath, targetName string) error {

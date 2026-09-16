@@ -35,4 +35,13 @@ $appkit$;
 ALTER TABLE "merchant"."admin_account" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "merchant"."admin_account" FORCE ROW LEVEL SECURITY;
 REVOKE DELETE, INSERT, TRIGGER, TRUNCATE, UPDATE ON TABLE "ledger"."ledger_entry" FROM "app_admin_api";
+DO $appkit$
+DECLARE
+    appkit_column text;
+BEGIN
+    FOR appkit_column IN SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'ledger' AND c.relname = 'ledger_entry' AND a.attnum > 0 AND NOT a.attisdropped LOOP
+        EXECUTE format('REVOKE INSERT (%I), UPDATE (%I) ON TABLE %I.%I FROM %I', appkit_column, appkit_column, 'ledger', 'ledger_entry', 'app_admin_api');
+    END LOOP;
+END
+$appkit$;
 REVOKE TRIGGER, TRUNCATE ON TABLE "merchant"."admin_account" FROM "app_admin_api";

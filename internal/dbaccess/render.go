@@ -3,6 +3,7 @@ package dbaccess
 import (
 	"crypto/sha256"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -114,7 +115,18 @@ func renderForbiddenPrivileges(b *strings.Builder, m Manifest, role string) {
 		if len(privileges) > 0 {
 			fmt.Fprintf(b, "REVOKE %s ON TABLE %s FROM %s;\n", strings.Join(privileges, ", "), quoteQualified(object), role)
 		}
+		if slices.Contains(m.Forbidden.Mutations, object) {
+			renderColumnMutationRevokes(b, object, role)
+		}
 	}
+}
+
+func renderColumnMutationRevokes(b *strings.Builder, object, role string) {
+	schema, table, _ := splitQualifiedName(object)
+	b.WriteString("DO $appkit$\nDECLARE\n    appkit_column text;\nBEGIN\n")
+	fmt.Fprintf(b, "    FOR appkit_column IN SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped LOOP\n", quoteLiteral(schema), quoteLiteral(table))
+	fmt.Fprintf(b, "        EXECUTE format('REVOKE INSERT (%%I), UPDATE (%%I) ON TABLE %%I.%%I FROM %%I', appkit_column, appkit_column, %s, %s, %s);\n", quoteLiteral(schema), quoteLiteral(table), quoteLiteral(strings.Trim(role, `"`)))
+	b.WriteString("    END LOOP;\nEND\n$appkit$;\n")
 }
 
 func renderGrantMap(b *strings.Builder, kind string, grants map[string][]string, role string) {
