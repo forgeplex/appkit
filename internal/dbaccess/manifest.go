@@ -182,6 +182,7 @@ func (m Manifest) Validate() error {
 	problems = append(problems, validateGrantMap("grants.schemas", m.Grants.Schemas, schemaPrivileges, false)...)
 	problems = append(problems, validateGrantMap("grants.tables", m.Grants.Tables, tablePrivileges, true)...)
 	problems = append(problems, validateGrantMap("grants.sequences", m.Grants.Sequences, sequencePrivileges, true)...)
+	columnIdentities := map[string]bool{}
 	for i, grant := range m.Grants.Columns {
 		prefix := fmt.Sprintf("grants.columns[%d]", i)
 		for field, value := range map[string]string{"schema": grant.Schema, "table": grant.Table, "column": grant.Column} {
@@ -189,8 +190,14 @@ func (m Manifest) Validate() error {
 				problems = append(problems, err.Error())
 			}
 		}
+		identity := grant.Schema + "." + grant.Table + "." + grant.Column
+		if columnIdentities[identity] {
+			problems = append(problems, fmt.Sprintf("%s 与其他 column grant 重复声明对象 %s", prefix, identity))
+		}
+		columnIdentities[identity] = true
 		problems = append(problems, validatePrivileges(prefix+".privileges", grant.Privileges, columnPrivileges)...)
 	}
+	functionIdentities := map[string]bool{}
 	for i, grant := range m.Grants.Functions {
 		prefix := fmt.Sprintf("grants.functions[%d]", i)
 		if err := validateIdentifier(prefix+".schema", grant.Schema); err != nil {
@@ -204,6 +211,11 @@ func (m Manifest) Validate() error {
 				problems = append(problems, err.Error())
 			}
 		}
+		identity := functionIdentity(grant)
+		if functionIdentities[identity] {
+			problems = append(problems, fmt.Sprintf("%s 与其他 function grant 重复声明签名 %s", prefix, identity))
+		}
+		functionIdentities[identity] = true
 		problems = append(problems, validatePrivileges(prefix+".privileges", grant.Privileges, functionPrivileges)...)
 	}
 	for table, required := range m.RLS {

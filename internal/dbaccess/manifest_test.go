@@ -86,10 +86,12 @@ func TestParseRejectsUnsafeDeclarations(t *testing.T) {
 			"merchant.admin_account: [SELECT, INSERT, UPDATE]", "merchant.admin_account: [SELECT]", 1),
 			"      privileges: [SELECT]", "      privileges: [UPDATE]", 1),
 			"mutations: [ledger.ledger_entry]", "mutations: [merchant.admin_account]", 1),
-		"unqualified custom type": strings.Replace(validManifest, "arguments: [text, pg_catalog.uuid]", "arguments: [custom_type]", 1),
-		"unqualified rls":         strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  admin_account:", 1),
-		"overqualified rls":       strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  tenant.merchant.admin_account:", 1),
-		"weak rls":                strings.Replace(validManifest, "    forced: true", "    forced: false", 1),
+		"unqualified custom type":  strings.Replace(validManifest, "arguments: [text, pg_catalog.uuid]", "arguments: [custom_type]", 1),
+		"duplicate column grant":   strings.Replace(validManifest, "  functions:\n", "    - schema: merchant\n      table: admin_account\n      column: encrypted_key\n      privileges: [UPDATE]\n  functions:\n", 1),
+		"duplicate function grant": strings.Replace(validManifest, "rls:\n", "    - schema: merchant\n      name: search_admin_account_keys\n      arguments: [text, pg_catalog.uuid]\n      privileges: [EXECUTE]\nrls:\n", 1),
+		"unqualified rls":          strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  admin_account:", 1),
+		"overqualified rls":        strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  tenant.merchant.admin_account:", 1),
+		"weak rls":                 strings.Replace(validManifest, "    forced: true", "    forced: false", 1),
 	}
 	for name, source := range tests {
 		t.Run(name, func(t *testing.T) {

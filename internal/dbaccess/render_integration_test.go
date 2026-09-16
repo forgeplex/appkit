@@ -183,8 +183,12 @@ func TestRenderSQLConcurrentRoleCreation(t *testing.T) {
 	suffix := fmt.Sprintf("%d_%d", time.Now().UnixNano(), integrationSequence.Add(1))
 	login := "access_race_login_" + suffix
 	permission := "access_race_perm_" + suffix
+	migrationSchemas := []string{"access_race_a_" + suffix, "access_race_b_" + suffix}
 	ident := func(name string) string { return pgx.Identifier{name}.Sanitize() }
 	t.Cleanup(func() {
+		for _, schema := range migrationSchemas {
+			_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+ident(schema)+" CASCADE")
+		}
 		_, _ = pool.Exec(ctx, "DROP ROLE IF EXISTS "+ident(login))
 		_, _ = pool.Exec(ctx, "DROP ROLE IF EXISTS "+ident(permission))
 	})
@@ -207,11 +211,17 @@ func TestRenderSQLConcurrentRoleCreation(t *testing.T) {
 	errs := make(chan error, 2)
 	var ready sync.WaitGroup
 	ready.Add(2)
-	for range 2 {
+	run := pgmigrate.Runner(pool)
+	for _, migrationSchema := range migrationSchemas {
+		migrationSchema := migrationSchema
 		go func() {
 			ready.Done()
 			<-start
-			_, err := pool.Exec(ctx, string(sql))
+			err := run(ctx, []appkit.MigrationSet{{
+				Schema: migrationSchema,
+				FS:     fstest.MapFS{"001_access.sql": {Data: sql}},
+				Module: "dbaccess-role-race",
+			}})
 			errs <- err
 		}()
 	}

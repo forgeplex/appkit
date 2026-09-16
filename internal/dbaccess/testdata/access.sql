@@ -3,6 +3,7 @@
 -- manifest-sha256: fa45bc384716d6ec9522bf3fc90e05b2883157e2c93cba286bb9b01e98179f3a
 -- Append this output as a new migration; never replace an applied migration.
 
+SELECT pg_advisory_xact_lock(hashtextextended('appkit:db-access:role:app_admin_api', 0));
 DO $appkit$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_admin_api') THEN

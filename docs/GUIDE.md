@@ -1399,9 +1399,10 @@ migration 定义，包含 policy 的 migration 必须排在 access migration 之
 所有被引用的 schema/table/sequence/function/type/policy 都是前置依赖，必须由编号更小
 的 migration 创建；顺序错误会使 access migration 整体失败并回滚。函数参数中的
 PostgreSQL 内置类型可使用短名，自定义类型必须写为 `schema.type`，避免依赖
-`search_path`。permission role 是集群级对象；并发 migration 的重复创建竞态会按
-PostgreSQL 实际返回收敛 `duplicate_object` / `unique_violation`，随后统一执行受管
-属性与权限声明。
+`search_path`。相同 column/function 身份不得重复声明，避免规范化结果依赖 YAML
+顺序。permission role 是集群级对象；生成物按 role 名获取跨 schema transaction
+advisory lock，再执行创建和全部属性/ACL 变更；重复创建竞态仍按 PostgreSQL 实际
+返回收敛 `duplicate_object` / `unique_violation`。
 `validate/render/check` 是静态与
 生成证据；`check -sql` 只比较指定生成物的字节漂移，不读取 pgmigrate 已应用清单，
 也不是数据库验收：尚未检查实际 catalog、继承链、`PUBLIC` 有效权限或
