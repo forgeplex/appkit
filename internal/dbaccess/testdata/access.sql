@@ -6,7 +6,11 @@
 DO $appkit$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_admin_api') THEN
-        CREATE ROLE "app_admin_api" NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE INHERIT;
+        BEGIN
+            CREATE ROLE "app_admin_api" NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE INHERIT;
+        EXCEPTION
+            WHEN duplicate_object OR unique_violation THEN NULL; -- concurrent migration created the same cluster-wide role
+        END;
     END IF;
 END
 $appkit$;

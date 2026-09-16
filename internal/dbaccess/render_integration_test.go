@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/fstest"
@@ -32,12 +33,14 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 	suffix := fmt.Sprintf("%d_%d", time.Now().UnixNano(), integrationSequence.Add(1))
 	schema := "access_test_" + suffix
 	migrationSchema := "access_migration_" + suffix
+	dependencyMigrationSchema := "access_dependency_" + suffix
 	login := "access_login_" + suffix
 	permission := "access_perm_" + suffix
 	ident := func(parts ...string) string { return pgx.Identifier(parts).Sanitize() }
 	t.Cleanup(func() {
 		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+ident(schema)+" CASCADE")
 		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+ident(migrationSchema)+" CASCADE")
+		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+ident(dependencyMigrationSchema)+" CASCADE")
 		_, _ = pool.Exec(ctx, "DROP ROLE IF EXISTS "+ident(login))
 		_, _ = pool.Exec(ctx, "DROP ROLE IF EXISTS "+ident(permission))
 	})
@@ -111,6 +114,26 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 		t.Fatalf("failed policy assertion did not roll back RLS DDL: enabled=%t forced=%t", missingRLSEnabled, missingRLSForced)
 	}
 
+	missingDependency := m
+	missingDependency.Grants.Tables = map[string][]string{schema + ".not_created": {"SELECT"}}
+	missingDependency.RLS = nil
+	missingDependency.Forbidden = Forbidden{}
+	dependencySQL, err := RenderSQL(missingDependency)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencyFS := fstest.MapFS{"001_access_before_objects.sql": {Data: dependencySQL}}
+	if err := run(ctx, []appkit.MigrationSet{{Schema: dependencyMigrationSchema, FS: dependencyFS, Module: "dbaccess-dependency-test"}}); err == nil {
+		t.Fatal("access migration unexpectedly ran before its referenced objects existed")
+	}
+	var dependencyApplied int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+ident(dependencyMigrationSchema, "schema_migrations")+" WHERE version='001_access_before_objects.sql'").Scan(&dependencyApplied); err != nil {
+		t.Fatal(err)
+	}
+	if dependencyApplied != 0 {
+		t.Fatal("failed dependency migration was recorded as applied")
+	}
+
 	var canSelect, canUpdate, canTrigger bool
 	if err := pool.QueryRow(ctx, "SELECT has_table_privilege($1, $2, 'SELECT'), has_table_privilege($1, $2, 'UPDATE'), has_table_privilege($1, $2, 'TRIGGER')", login, schema+".items").Scan(&canSelect, &canUpdate, &canTrigger); err != nil {
 		t.Fatal(err)
@@ -142,5 +165,61 @@ WHERE n.nspname=$1 AND c.relname='items'`, schema).Scan(&rlsEnabled, &rlsForced,
 	}
 	if roleLogin || superuser || bypassRLS || createDB || createRole {
 		t.Fatalf("unsafe permission role attributes: login=%t super=%t bypass=%t createdb=%t createrole=%t", roleLogin, superuser, bypassRLS, createDB, createRole)
+	}
+}
+
+func TestRenderSQLConcurrentRoleCreation(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("TEST_DATABASE_URL 未设置，跳过 PostgreSQL 集成测试")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	suffix := fmt.Sprintf("%d_%d", time.Now().UnixNano(), integrationSequence.Add(1))
+	login := "access_race_login_" + suffix
+	permission := "access_race_perm_" + suffix
+	ident := func(name string) string { return pgx.Identifier{name}.Sanitize() }
+	t.Cleanup(func() {
+		_, _ = pool.Exec(ctx, "DROP ROLE IF EXISTS "+ident(login))
+		_, _ = pool.Exec(ctx, "DROP ROLE IF EXISTS "+ident(permission))
+	})
+	if _, err := pool.Exec(ctx, "CREATE ROLE "+ident(login)+" LOGIN INHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"); err != nil {
+		t.Fatal(err)
+	}
+	m := Manifest{
+		Version: 1,
+		Service: "access_race",
+		Roles: Roles{
+			Login:      Role{Name: login, Attributes: RoleAttributes{Login: true, Inherit: true}},
+			Permission: Role{Name: permission, Managed: true, Attributes: RoleAttributes{Inherit: true}},
+		},
+	}
+	sql, err := RenderSQL(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	for range 2 {
+		go func() {
+			ready.Done()
+			<-start
+			_, err := pool.Exec(ctx, string(sql))
+			errs <- err
+		}()
+	}
+	ready.Wait()
+	close(start)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent role creation failed: %v", err)
+		}
 	}
 }

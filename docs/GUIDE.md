@@ -1369,8 +1369,10 @@ forbidden:
 ```
 
 工作流是先校验，再生成一个**新的**追加 migration；输出路径的父目录必须预先
-存在，命令不会创建目录或改变目录权限；新文件以 `0644` 为权限上限并继续受进程
-umask 约束，输出文件已存在时拒绝覆盖。已应用
+存在且输出目录本身不得是符号链接；祖先路径会先规范化为真实路径，命令不会创建
+目录或改变目录权限。生成器先在同目录完整写入并同步临时文件，再原子发布最终路径，
+因此并发读取不会看到半成品；输出
+文件已存在时拒绝覆盖。新文件权限不宽于 `0644`。已应用
 migration 仍服从 pgmigrate 的 checksum 不可变规则。生成 SQL 不自带事务控制，
 由 pgmigrate 的单文件事务统一提交或回滚：
 
@@ -1387,12 +1389,19 @@ appkit db-access check -manifest db/access.yaml \
 建立 required membership、撤销明确 forbidden membership/表写权限并授予声明的
 schema/table/column/sequence/function 权限。`forbidden.mutations` 是独立的负向
 reconciliation scope：对象无需同时出现在 `grants.tables`，用于撤销遗留写 ACL；
+同表的 table 或 column `INSERT/UPDATE` 等写授权会在校验阶段被拒绝；
 `forbidden.privileges` 会从全部受管表及 mutation 表的 permission role 直接 ACL 撤销。
 继承与 `PUBLIC` 的有效权限仍由后续
 catalog verifier 检查。RLS 条目会生成 `ENABLE/FORCE ROW LEVEL SECURITY`，并在同一
 事务先断言 `requiredPolicies` 已存在，再启用并强制 RLS；policy predicate 仍由版本
 migration 定义，包含 policy 的 migration 必须排在 access migration 之前。生成文件
 带 `DO NOT EDIT` 标记，不支持拆分或手工改写后绕开该原子顺序。当前
+所有被引用的 schema/table/sequence/function/type/policy 都是前置依赖，必须由编号更小
+的 migration 创建；顺序错误会使 access migration 整体失败并回滚。函数参数中的
+PostgreSQL 内置类型可使用短名，自定义类型必须写为 `schema.type`，避免依赖
+`search_path`。permission role 是集群级对象；并发 migration 的重复创建竞态会按
+PostgreSQL 实际返回收敛 `duplicate_object` / `unique_violation`，随后统一执行受管
+属性与权限声明。
 `validate/render/check` 是静态与
 生成证据；`check -sql` 只比较指定生成物的字节漂移，不读取 pgmigrate 已应用清单，
 也不是数据库验收：尚未检查实际 catalog、继承链、`PUBLIC` 有效权限或

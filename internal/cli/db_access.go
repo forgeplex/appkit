@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/forgeplex/appkit/internal/dbaccess"
 )
@@ -91,14 +92,12 @@ func loadAndRenderAccess(path string) ([]byte, error) {
 }
 
 func writeNewAccessSQL(path string, data []byte) error {
-	parent := filepath.Dir(path)
-	info, err := os.Stat(parent)
+	requestedParent := filepath.Dir(path)
+	parent, err := validateAccessOutputDirectory(requestedParent)
 	if err != nil {
-		return fmt.Errorf("检查生成 SQL 目录 %s: %w（目录必须预先存在，命令不会代建或改变权限）", parent, err)
+		return err
 	}
-	if !info.IsDir() {
-		return fmt.Errorf("生成 SQL 的父路径 %s 不是目录", parent)
-	}
+	path = filepath.Join(parent, filepath.Base(path))
 	if target, err := os.Lstat(path); err == nil {
 		if target.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("拒绝通过符号链接写入生成 SQL %s", path)
@@ -107,26 +106,93 @@ func writeNewAccessSQL(path string, data []byte) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("检查生成 SQL 目标 %s: %w", path, err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := os.CreateTemp(parent, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("拒绝覆盖已有文件 %s；权限变化必须生成新的追加 migration", path)
-		}
-		return fmt.Errorf("创建生成 SQL %s: %w", path, err)
+		return fmt.Errorf("创建生成 SQL 临时文件: %w", err)
 	}
-	complete := false
+	tempPath := f.Name()
+	tempExists := true
 	defer func() {
-		if !complete {
-			_ = os.Remove(path)
+		_ = f.Close()
+		if tempExists {
+			_ = os.Remove(tempPath)
 		}
 	}()
 	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
 		return fmt.Errorf("写入生成 SQL %s: %w", path, err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("同步生成 SQL %s: %w", path, err)
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("关闭生成 SQL %s: %w", path, err)
 	}
-	complete = true
+	currentParent, err := validateAccessOutputDirectory(requestedParent)
+	if err != nil {
+		return err
+	}
+	if currentParent != parent {
+		return fmt.Errorf("生成 SQL 目录在写入期间发生变化: %s", requestedParent)
+	}
+	if err := os.Link(tempPath, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("拒绝覆盖已有文件 %s；权限变化必须生成新的追加 migration", path)
+		}
+		return fmt.Errorf("原子发布生成 SQL %s: %w", path, err)
+	}
+	if err := os.Remove(tempPath); err != nil {
+		return fmt.Errorf("清理生成 SQL 临时文件: %w", err)
+	}
+	tempExists = false
+	directory, err := os.Open(parent)
+	if err != nil {
+		return fmt.Errorf("打开生成 SQL 目录 %s: %w", parent, err)
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if err := errors.Join(syncErr, closeErr); err != nil {
+		return fmt.Errorf("同步生成 SQL 目录 %s: %w", parent, err)
+	}
 	return nil
+}
+
+func validateAccessOutputDirectory(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("解析生成 SQL 目录 %s: %w", path, err)
+	}
+	requested, err := os.Lstat(abs)
+	if err != nil {
+		return "", fmt.Errorf("检查生成 SQL 目录 %s: %w（目录必须预先存在，命令不会代建或改变权限）", abs, err)
+	}
+	if requested.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("拒绝通过符号链接目录写入生成 SQL: %s", abs)
+	}
+	abs, err = filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", fmt.Errorf("解析生成 SQL 目录真实路径 %s: %w", path, err)
+	}
+	volume := filepath.VolumeName(abs)
+	current := volume + string(os.PathSeparator)
+	for _, part := range strings.Split(strings.TrimPrefix(abs, current), string(os.PathSeparator)) {
+		if part == "" {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return "", fmt.Errorf("检查生成 SQL 目录 %s: %w（目录必须预先存在，命令不会代建或改变权限）", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("拒绝通过符号链接目录写入生成 SQL: %s", current)
+		}
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("检查生成 SQL 目录 %s: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("生成 SQL 的父路径 %s 不是目录", abs)
+	}
+	return abs, nil
 }

@@ -82,9 +82,14 @@ func TestParseRejectsUnsafeDeclarations(t *testing.T) {
 		"unknown privilege":    strings.Replace(validManifest, "[SELECT, INSERT, UPDATE]", "[SELECT, OWN]", 1),
 		"grant forbidden":      strings.Replace(validManifest, "privileges: [TRUNCATE, TRIGGER]", "privileges: [SELECT]", 1),
 		"mutation conflict":    strings.Replace(validManifest, "mutations: [ledger.ledger_entry]", "mutations: [merchant.admin_account]", 1),
-		"unqualified rls":      strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  admin_account:", 1),
-		"overqualified rls":    strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  tenant.merchant.admin_account:", 1),
-		"weak rls":             strings.Replace(validManifest, "    forced: true", "    forced: false", 1),
+		"column mutation conflict": strings.Replace(strings.Replace(strings.Replace(validManifest,
+			"merchant.admin_account: [SELECT, INSERT, UPDATE]", "merchant.admin_account: [SELECT]", 1),
+			"      privileges: [SELECT]", "      privileges: [UPDATE]", 1),
+			"mutations: [ledger.ledger_entry]", "mutations: [merchant.admin_account]", 1),
+		"unqualified custom type": strings.Replace(validManifest, "arguments: [text, pg_catalog.uuid]", "arguments: [custom_type]", 1),
+		"unqualified rls":         strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  admin_account:", 1),
+		"overqualified rls":       strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  tenant.merchant.admin_account:", 1),
+		"weak rls":                strings.Replace(validManifest, "    forced: true", "    forced: false", 1),
 	}
 	for name, source := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -101,5 +106,12 @@ func TestParseAllowsReadOnlyGrantOnForbiddenMutationTable(t *testing.T) {
 		"    merchant.admin_account: [SELECT, INSERT, UPDATE]\n    ledger.ledger_entry: [SELECT]", 1)
 	if _, err := Parse(strings.NewReader(source)); err != nil {
 		t.Fatalf("read-only access should coexist with forbidden mutations: %v", err)
+	}
+}
+
+func TestParseAllowsQualifiedCustomFunctionType(t *testing.T) {
+	source := strings.Replace(validManifest, "pg_catalog.uuid", "merchant.custom_type", 1)
+	if _, err := Parse(strings.NewReader(source)); err != nil {
+		t.Fatalf("qualified custom function type should be accepted: %v", err)
 	}
 }

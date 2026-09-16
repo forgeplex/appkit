@@ -232,6 +232,10 @@ func (m Manifest) Validate() error {
 			if slices.Contains(m.Forbidden.Privileges, privilege) {
 				problems = append(problems, fmt.Sprintf("grants.columns[%d] 的 %s 同时被 forbidden.privileges 禁止", i, privilege))
 			}
+			object := grant.Schema + "." + grant.Table
+			if slices.Contains(m.Forbidden.Mutations, object) && slices.Contains(columnMutationPrivileges, privilege) {
+				problems = append(problems, fmt.Sprintf("grants.columns[%d] 的 %s 同时被 forbidden.mutations 禁止", i, privilege))
+			}
 		}
 	}
 	for i, name := range m.Forbidden.Mutations {
@@ -246,13 +250,15 @@ func (m Manifest) Validate() error {
 }
 
 var (
-	schemaPrivileges   = []string{"CREATE", "USAGE"}
-	tablePrivileges    = []string{"DELETE", "INSERT", "REFERENCES", "SELECT", "TRIGGER", "TRUNCATE", "UPDATE"}
-	sequencePrivileges = []string{"SELECT", "UPDATE", "USAGE"}
-	columnPrivileges   = []string{"INSERT", "REFERENCES", "SELECT", "UPDATE"}
-	functionPrivileges = []string{"EXECUTE"}
-	mutationPrivileges = []string{"DELETE", "INSERT", "TRUNCATE", "UPDATE"}
-	roleAttributeNames = []string{"BYPASSRLS", "CREATEDB", "CREATEROLE", "LOGIN", "SUPERUSER"}
+	schemaPrivileges         = []string{"CREATE", "USAGE"}
+	tablePrivileges          = []string{"DELETE", "INSERT", "REFERENCES", "SELECT", "TRIGGER", "TRUNCATE", "UPDATE"}
+	sequencePrivileges       = []string{"SELECT", "UPDATE", "USAGE"}
+	columnPrivileges         = []string{"INSERT", "REFERENCES", "SELECT", "UPDATE"}
+	columnMutationPrivileges = []string{"INSERT", "UPDATE"}
+	functionPrivileges       = []string{"EXECUTE"}
+	mutationPrivileges       = []string{"DELETE", "INSERT", "TRUNCATE", "UPDATE"}
+	roleAttributeNames       = []string{"BYPASSRLS", "CREATEDB", "CREATEROLE", "LOGIN", "SUPERUSER"}
+	builtinTypeNames         = []string{"bigint", "bit", "bool", "boolean", "box", "bpchar", "bytea", "char", "cidr", "circle", "date", "decimal", "float4", "float8", "inet", "int2", "int4", "int8", "integer", "interval", "json", "jsonb", "line", "lseg", "macaddr", "macaddr8", "money", "name", "numeric", "oid", "path", "point", "polygon", "real", "record", "regclass", "regconfig", "regdictionary", "regnamespace", "regoper", "regoperator", "regproc", "regprocedure", "regrole", "regtype", "smallint", "text", "time", "timestamp", "timestamptz", "timetz", "tsquery", "tsvector", "txid_snapshot", "uuid", "varbit", "varchar", "void", "xml"}
 )
 
 func validateRoleLists(m Memberships, roles Roles) []string {
@@ -364,7 +370,7 @@ func splitQualifiedName(value string) (schema, object string, ok bool) {
 func validateTypeName(path, value string) error {
 	base := strings.TrimSuffix(value, "[]")
 	parts := strings.Split(base, ".")
-	if len(parts) > 2 || (value != base && strings.HasSuffix(base, "[]")) {
+	if len(parts) > 2 || (value != base && strings.HasSuffix(base, "[]")) || (len(parts) == 1 && !slices.Contains(builtinTypeNames, base)) {
 		return fmt.Errorf("%s=%q 不是受支持的 PostgreSQL 类型名", path, value)
 	}
 	for _, part := range parts {

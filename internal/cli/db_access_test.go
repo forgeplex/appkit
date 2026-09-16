@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/forgeplex/appkit/internal/dbaccess"
@@ -120,6 +121,63 @@ func TestDBAccessRenderRequiresExistingParentAndPreservesMode(t *testing.T) {
 	}
 	if string(data) != "preserve" {
 		t.Fatalf("symlink target changed: %q", data)
+	}
+
+	realParent := filepath.Join(dir, "real-parent")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkedParent := filepath.Join(dir, "linked-parent")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Skipf("symbolic links unavailable: %v", err)
+	}
+	if err := dbAccess([]string{"render", "-manifest", manifest, "-out", filepath.Join(linkedParent, "0005_access.sql")}, &out, &diagnostics); err == nil || !strings.Contains(err.Error(), "符号链接目录") {
+		t.Fatalf("did not reject symlink parent explicitly: %v", err)
+	}
+}
+
+func TestWriteNewAccessSQLPublishesAtomicallyWithoutOverwrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "0001_access.sql")
+	bodies := [][]byte{bytes.Repeat([]byte("a"), 1<<20), bytes.Repeat([]byte("b"), 1<<20)}
+	errs := make(chan error, len(bodies))
+	var ready sync.WaitGroup
+	ready.Add(len(bodies))
+	start := make(chan struct{})
+	for _, body := range bodies {
+		body := body
+		go func() {
+			ready.Done()
+			<-start
+			errs <- writeNewAccessSQL(path, body)
+		}()
+	}
+	ready.Wait()
+	close(start)
+	var successes int
+	for range bodies {
+		if err := <-errs; err == nil {
+			successes++
+		} else if !strings.Contains(err.Error(), "拒绝覆盖") {
+			t.Fatalf("unexpected concurrent publish error: %v", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful publishers=%d, want 1", successes)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, bodies[0]) && !bytes.Equal(got, bodies[1]) {
+		t.Fatalf("published partial content: %d bytes", len(got))
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(path) {
+		t.Fatalf("temporary files remained after publish: %v", entries)
 	}
 }
 
