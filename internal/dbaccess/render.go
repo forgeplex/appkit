@@ -69,11 +69,11 @@ func renderRLSRequirements(b *strings.Builder, requirements map[string]RLSRequir
 	sort.Strings(tables)
 	for _, table := range tables {
 		requirement := requirements[table]
-		parts := strings.Split(table, ".")
+		schema, relation, _ := strings.Cut(table, ".") // Validate guarantees exactly one separator.
 		fmt.Fprintf(b, "ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n", quoteQualified(table))
 		fmt.Fprintf(b, "ALTER TABLE %s FORCE ROW LEVEL SECURITY;\n", quoteQualified(table))
 		for _, policy := range sortedUnique(requirement.RequiredPolicies) {
-			fmt.Fprintf(b, "DO $appkit$\nBEGIN\n    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = %s AND tablename = %s AND policyname = %s) THEN\n", quoteLiteral(parts[0]), quoteLiteral(parts[1]), quoteLiteral(policy))
+			fmt.Fprintf(b, "DO $appkit$\nBEGIN\n    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = %s AND tablename = %s AND policyname = %s) THEN\n", quoteLiteral(schema), quoteLiteral(relation), quoteLiteral(policy))
 			fmt.Fprintf(b, "        RAISE EXCEPTION 'required RLS policy %% is missing on %%', %s, %s;\n", quoteLiteral(policy), quoteLiteral(table))
 			b.WriteString("    END IF;\nEND\n$appkit$;\n")
 		}
@@ -132,8 +132,8 @@ func renderGrantMap(b *strings.Builder, kind string, grants map[string][]string,
 func quoteIdentifier(value string) string { return `"` + value + `"` }
 
 func quoteQualified(value string) string {
-	parts := strings.Split(value, ".")
-	return quoteIdentifier(parts[0]) + "." + quoteIdentifier(parts[1])
+	schema, object, _ := strings.Cut(value, ".") // Validate guarantees exactly one separator.
+	return quoteIdentifier(schema) + "." + quoteIdentifier(object)
 }
 
 func quoteLiteral(value string) string { return "'" + strings.ReplaceAll(value, "'", "''") + "'" }

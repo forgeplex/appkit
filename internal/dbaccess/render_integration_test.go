@@ -47,7 +47,7 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 	if _, err := pool.Exec(ctx, "CREATE ROLE "+ident(permission)+" NOLOGIN INHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+ident(schema)+"; CREATE TABLE "+ident(schema, "items")+" (id bigint PRIMARY KEY, tenant_id text NOT NULL, value text); CREATE TABLE "+ident(schema, "missing_items")+" (id bigint PRIMARY KEY, tenant_id text NOT NULL); CREATE POLICY access_test_policy ON "+ident(schema, "items")+" USING (true) WITH CHECK (true); CREATE SEQUENCE "+ident(schema, "item_seq")+"; CREATE FUNCTION "+ident(schema, "echo")+"(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1'; GRANT TRIGGER ON "+ident(schema, "items")+" TO "+ident(permission)); err != nil {
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+ident(schema)+"; CREATE TABLE "+ident(schema, "items")+" (id bigint PRIMARY KEY, tenant_id text NOT NULL, value text); CREATE TABLE "+ident(schema, "blocked_items")+" (id bigint PRIMARY KEY); CREATE TABLE "+ident(schema, "missing_items")+" (id bigint PRIMARY KEY, tenant_id text NOT NULL); CREATE POLICY access_test_policy ON "+ident(schema, "items")+" USING (true) WITH CHECK (true); CREATE SEQUENCE "+ident(schema, "item_seq")+"; CREATE FUNCTION "+ident(schema, "echo")+"(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1'; GRANT TRIGGER ON "+ident(schema, "items")+" TO "+ident(permission)+"; GRANT UPDATE, TRIGGER ON "+ident(schema, "blocked_items")+" TO "+ident(permission)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -67,7 +67,10 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 		RLS: map[string]RLSRequirement{
 			schema + ".items": {Enabled: true, Forced: true, RequiredPolicies: []string{"access_test_policy"}},
 		},
-		Forbidden: Forbidden{Privileges: []string{"TRIGGER"}},
+		Forbidden: Forbidden{
+			Privileges: []string{"TRIGGER"},
+			Mutations:  []string{schema + ".blocked_items"},
+		},
 	}
 	sql, err := RenderSQL(m)
 	if err != nil {
@@ -114,6 +117,13 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 	}
 	if !canSelect || canUpdate || canTrigger {
 		t.Fatalf("effective table privileges: select=%t update=%t trigger=%t", canSelect, canUpdate, canTrigger)
+	}
+	var canUpdateBlocked, canTriggerBlocked bool
+	if err := pool.QueryRow(ctx, "SELECT has_table_privilege($1, $2, 'UPDATE'), has_table_privilege($1, $2, 'TRIGGER')", login, schema+".blocked_items").Scan(&canUpdateBlocked, &canTriggerBlocked); err != nil {
+		t.Fatal(err)
+	}
+	if canUpdateBlocked || canTriggerBlocked {
+		t.Fatalf("negative-only forbidden object retained privileges: update=%t trigger=%t", canUpdateBlocked, canTriggerBlocked)
 	}
 	var rlsEnabled, rlsForced, policyExists bool
 	if err := pool.QueryRow(ctx, `

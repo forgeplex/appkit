@@ -81,6 +81,8 @@ func TestParseRejectsUnsafeDeclarations(t *testing.T) {
 		"unqualified table":    strings.Replace(validManifest, "merchant.admin_account: [SELECT, INSERT, UPDATE]", "admin_account: [SELECT]", 1),
 		"unknown privilege":    strings.Replace(validManifest, "[SELECT, INSERT, UPDATE]", "[SELECT, OWN]", 1),
 		"grant forbidden":      strings.Replace(validManifest, "privileges: [TRUNCATE, TRIGGER]", "privileges: [SELECT]", 1),
+		"unqualified rls":      strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  admin_account:", 1),
+		"overqualified rls":    strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  tenant.merchant.admin_account:", 1),
 		"weak rls":             strings.Replace(validManifest, "    forced: true", "    forced: false", 1),
 	}
 	for name, source := range tests {

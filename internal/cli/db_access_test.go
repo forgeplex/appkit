@@ -48,6 +48,13 @@ func TestDBAccessValidateRenderAndCheck(t *testing.T) {
 	if err := dbAccess([]string{"render", "-manifest", manifest, "-out", sqlPath}, &out, &diagnostics); err != nil {
 		t.Fatal(err)
 	}
+	info, err := os.Stat(sqlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got&0o022 != 0 {
+		t.Fatalf("generated migration is group/other writable: mode=%o", got)
+	}
 	if err := dbAccess([]string{"render", "-manifest", manifest, "-out", sqlPath}, &out, &diagnostics); err == nil {
 		t.Fatal("overwrote an existing migration")
 	}
