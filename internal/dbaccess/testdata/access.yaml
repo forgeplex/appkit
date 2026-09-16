@@ -1,0 +1,49 @@
+version: 1
+service: admin_api
+
+roles:
+  login:
+    name: psp_admin_api
+    managed: false
+    attributes:
+      login: true
+      inherit: true
+  permission:
+    name: app_admin_api
+    managed: true
+    attributes:
+      login: false
+      inherit: true
+
+memberships:
+  required: [app_admin_channel_test]
+  forbidden: [app_admin]
+
+grants:
+  schemas:
+    merchant: [USAGE]
+  tables:
+    merchant.admin_account: [SELECT, INSERT, UPDATE]
+  sequences:
+    merchant.admin_account_id_seq: [SELECT, USAGE]
+  columns:
+    - schema: merchant
+      table: admin_account
+      column: encrypted_key
+      privileges: [SELECT]
+  functions:
+    - schema: merchant
+      name: search_admin_account_keys
+      arguments: [text, pg_catalog.uuid]
+      privileges: [EXECUTE]
+
+rls:
+  merchant.admin_account:
+    enabled: true
+    forced: true
+    requiredPolicies: [admin_account_tenant_isolation]
+
+forbidden:
+  roleAttributes: [SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE]
+  privileges: [TRUNCATE, TRIGGER]
+  mutations: [ledger.ledger_entry]

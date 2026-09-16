@@ -1322,6 +1322,70 @@ keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可
 `appkit check` 拦下——包括"把规则改松"这一手。你写的代码在 `internal/`，
 和上面两类不共处一处。
 
+## 数据库 service-role 权限契约
+
+服务连接账号与对象 ACL 可选择由 `db/access.yaml` 声明，避免每个服务各写一套
+不可比较的 GRANT 脚本。该文件只描述角色名、membership、对象权限、RLS 要求与
+明确禁止项；**不得包含密码、DSN、Token 或其他秘密**。登录账号由 IaC/Secret
+Manager 创建，manifest 中必须标为 `managed: false`；AppKit 只管理 NOLOGIN 的
+permission role。
+
+```yaml
+version: 1
+service: admin_api
+roles:
+  login:
+    name: psp_admin_api
+    managed: false
+    attributes: {login: true, inherit: true}
+  permission:
+    name: app_admin_api
+    managed: true
+    attributes: {login: false, inherit: true}
+memberships:
+  required: [app_admin_channel_test]
+  forbidden: [app_admin]
+grants:
+  schemas:
+    merchant: [USAGE]
+  tables:
+    merchant.admin_account: [SELECT, INSERT, UPDATE]
+  functions:
+    - schema: merchant
+      name: search_admin_account_keys
+      arguments: [text]
+      privileges: [EXECUTE]
+rls:
+  merchant.admin_account:
+    enabled: true
+    forced: true
+    requiredPolicies: [admin_account_tenant_isolation]
+forbidden:
+  roleAttributes: [SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE]
+  privileges: [TRUNCATE, TRIGGER]
+  mutations: [ledger.ledger_entry]
+```
+
+工作流是先校验，再生成一个**新的**追加 migration；输出路径已存在时命令拒绝
+覆盖，已应用 migration 仍服从 pgmigrate 的 checksum 不可变规则：
+
+```sh
+appkit db-access validate -manifest db/access.yaml
+appkit db-access render -manifest db/access.yaml \
+  -out db/migrations/0003_service_access.sql
+appkit db-access check -manifest db/access.yaml \
+  -sql db/migrations/0003_service_access.sql
+```
+
+`render` 也可省略 `-out` 把 SQL 写到 stdout。生成器会创建/收紧 permission role、
+建立 required membership、撤销明确 forbidden membership/表写权限并授予声明的
+schema/table/column/sequence/function 权限。RLS 条目当前是验证契约，不生成任意
+policy predicate；策略仍由版本 migration 定义。当前 `validate/render/check` 是静态与
+生成证据，不是数据库验收：尚未检查实际 catalog、继承链、`PUBLIC` 有效权限或
+真实 `SET ROLE` 行为。权限被移出 grants 时须在新版本 manifest 的 forbidden 中
+显式写出撤销对象；后续 catalog verifier 才负责 managed scope 的 missing/unexpected
+精确比较。
+
 ## 独立 sqlc schema 快照
 
 迁移是数据库演进的事实源，sqlc 可以只读当前结构。新脚手架携带自包含的
