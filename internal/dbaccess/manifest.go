@@ -222,6 +222,9 @@ func (m Manifest) Validate() error {
 			if slices.Contains(m.Forbidden.Privileges, privilege) {
 				problems = append(problems, fmt.Sprintf("grants.tables.%s 的 %s 同时被 forbidden.privileges 禁止", object, privilege))
 			}
+			if slices.Contains(m.Forbidden.Mutations, object) && slices.Contains(mutationPrivileges, privilege) {
+				problems = append(problems, fmt.Sprintf("grants.tables.%s 的 %s 同时被 forbidden.mutations 禁止", object, privilege))
+			}
 		}
 	}
 	for i, grant := range m.Grants.Columns {
@@ -248,6 +251,7 @@ var (
 	sequencePrivileges = []string{"SELECT", "UPDATE", "USAGE"}
 	columnPrivileges   = []string{"INSERT", "REFERENCES", "SELECT", "UPDATE"}
 	functionPrivileges = []string{"EXECUTE"}
+	mutationPrivileges = []string{"DELETE", "INSERT", "TRUNCATE", "UPDATE"}
 	roleAttributeNames = []string{"BYPASSRLS", "CREATEDB", "CREATEROLE", "LOGIN", "SUPERUSER"}
 )
 
@@ -337,16 +341,24 @@ func validateIdentifier(path, value string) error {
 }
 
 func validateQualifiedName(path, value string) error {
-	parts := strings.Split(value, ".")
-	if len(parts) != 2 {
+	schema, object, ok := splitQualifiedName(value)
+	if !ok {
 		return fmt.Errorf("%s=%q 必须是 schema.object", path, value)
 	}
-	for _, part := range parts {
+	for _, part := range []string{schema, object} {
 		if err := validateIdentifier(path, part); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func splitQualifiedName(value string) (schema, object string, ok bool) {
+	parts := strings.Split(value, ".")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
 }
 
 func validateTypeName(path, value string) error {

@@ -49,6 +49,11 @@ func TestRenderSQLIsDeterministicAndSafe(t *testing.T) {
 			t.Errorf("rendered SQL missing %q:\n%s", want, text)
 		}
 	}
+	assertion := strings.Index(text, "required RLS policy % is missing")
+	enable := strings.Index(text, `ALTER TABLE "merchant"."admin_account" ENABLE ROW LEVEL SECURITY`)
+	if assertion < 0 || enable < 0 || assertion > enable {
+		t.Fatal("required RLS policy assertion must precede ENABLE/FORCE")
+	}
 }
 
 func TestRenderSQLCanonicalizesSetAndMapOrder(t *testing.T) {

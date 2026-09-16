@@ -81,6 +81,7 @@ func TestParseRejectsUnsafeDeclarations(t *testing.T) {
 		"unqualified table":    strings.Replace(validManifest, "merchant.admin_account: [SELECT, INSERT, UPDATE]", "admin_account: [SELECT]", 1),
 		"unknown privilege":    strings.Replace(validManifest, "[SELECT, INSERT, UPDATE]", "[SELECT, OWN]", 1),
 		"grant forbidden":      strings.Replace(validManifest, "privileges: [TRUNCATE, TRIGGER]", "privileges: [SELECT]", 1),
+		"mutation conflict":    strings.Replace(validManifest, "mutations: [ledger.ledger_entry]", "mutations: [merchant.admin_account]", 1),
 		"unqualified rls":      strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  admin_account:", 1),
 		"overqualified rls":    strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  tenant.merchant.admin_account:", 1),
 		"weak rls":             strings.Replace(validManifest, "    forced: true", "    forced: false", 1),
@@ -91,5 +92,14 @@ func TestParseRejectsUnsafeDeclarations(t *testing.T) {
 				t.Fatal("accepted unsafe manifest")
 			}
 		})
+	}
+}
+
+func TestParseAllowsReadOnlyGrantOnForbiddenMutationTable(t *testing.T) {
+	source := strings.Replace(validManifest,
+		"    merchant.admin_account: [SELECT, INSERT, UPDATE]",
+		"    merchant.admin_account: [SELECT, INSERT, UPDATE]\n    ledger.ledger_entry: [SELECT]", 1)
+	if _, err := Parse(strings.NewReader(source)); err != nil {
+		t.Fatalf("read-only access should coexist with forbidden mutations: %v", err)
 	}
 }

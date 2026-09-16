@@ -102,6 +102,25 @@ func TestDBAccessRenderRequiresExistingParentAndPreservesMode(t *testing.T) {
 	if got := info.Mode().Perm(); got != 0o700 {
 		t.Fatalf("parent mode changed to %o, want 700", got)
 	}
+
+	target := filepath.Join(dir, "unexpected.sql")
+	if err := os.WriteFile(target, []byte("preserve"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(privateDir, "0004_access.sql")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symbolic links unavailable: %v", err)
+	}
+	if err := dbAccess([]string{"render", "-manifest", manifest, "-out", link}, &out, &diagnostics); err == nil || !strings.Contains(err.Error(), "符号链接") {
+		t.Fatalf("did not reject output symlink explicitly: %v", err)
+	}
+	data, err = os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "preserve" {
+		t.Fatalf("symlink target changed: %q", data)
+	}
 }
 
 // Compile-time check that testdata remains a valid public example rather than

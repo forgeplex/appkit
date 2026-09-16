@@ -69,14 +69,14 @@ func renderRLSRequirements(b *strings.Builder, requirements map[string]RLSRequir
 	sort.Strings(tables)
 	for _, table := range tables {
 		requirement := requirements[table]
-		schema, relation, _ := strings.Cut(table, ".") // Validate guarantees exactly one separator.
-		fmt.Fprintf(b, "ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n", quoteQualified(table))
-		fmt.Fprintf(b, "ALTER TABLE %s FORCE ROW LEVEL SECURITY;\n", quoteQualified(table))
+		schema, relation, _ := splitQualifiedName(table) // Validate has already established this invariant.
 		for _, policy := range sortedUnique(requirement.RequiredPolicies) {
 			fmt.Fprintf(b, "DO $appkit$\nBEGIN\n    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = %s AND tablename = %s AND policyname = %s) THEN\n", quoteLiteral(schema), quoteLiteral(relation), quoteLiteral(policy))
 			fmt.Fprintf(b, "        RAISE EXCEPTION 'required RLS policy %% is missing on %%', %s, %s;\n", quoteLiteral(policy), quoteLiteral(table))
 			b.WriteString("    END IF;\nEND\n$appkit$;\n")
 		}
+		fmt.Fprintf(b, "ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n", quoteQualified(table))
+		fmt.Fprintf(b, "ALTER TABLE %s FORCE ROW LEVEL SECURITY;\n", quoteQualified(table))
 	}
 }
 
@@ -94,7 +94,7 @@ func renderForbiddenPrivileges(b *strings.Builder, m Manifest, role string) {
 		add(object, m.Forbidden.Privileges)
 	}
 	for _, object := range m.Forbidden.Mutations {
-		add(object, []string{"DELETE", "INSERT", "TRUNCATE", "UPDATE"})
+		add(object, mutationPrivileges)
 		add(object, m.Forbidden.Privileges)
 	}
 	objects := make([]string, 0, len(revokes))
@@ -132,7 +132,7 @@ func renderGrantMap(b *strings.Builder, kind string, grants map[string][]string,
 func quoteIdentifier(value string) string { return `"` + value + `"` }
 
 func quoteQualified(value string) string {
-	schema, object, _ := strings.Cut(value, ".") // Validate guarantees exactly one separator.
+	schema, object, _ := splitQualifiedName(value) // Validate has already established this invariant.
 	return quoteIdentifier(schema) + "." + quoteIdentifier(object)
 }
 

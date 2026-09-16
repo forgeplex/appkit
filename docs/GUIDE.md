@@ -1329,6 +1329,8 @@ keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可
 明确禁止项；**不得包含密码、DSN、Token 或其他秘密**。登录账号由 IaC/Secret
 Manager 创建，manifest 中必须标为 `managed: false`；AppKit 只管理 NOLOGIN 的
 permission role。
+`roles.permission.managed: true` 表示其安全属性由 manifest 权威管理；每次生成物都会
+把该 NOLOGIN role 收紧为声明状态，数据库中的临时手工漂移不会被保留。
 
 ```yaml
 version: 1
@@ -1388,12 +1390,17 @@ reconciliation scope：对象无需同时出现在 `grants.tables`，用于撤�
 `forbidden.privileges` 会从全部受管表及 mutation 表的 permission role 直接 ACL 撤销。
 继承与 `PUBLIC` 的有效权限仍由后续
 catalog verifier 检查。RLS 条目会生成 `ENABLE/FORCE ROW LEVEL SECURITY`，并在同一
-事务断言 `requiredPolicies` 已存在；policy predicate 仍由版本 migration 定义。当前
+事务先断言 `requiredPolicies` 已存在，再启用并强制 RLS；policy predicate 仍由版本
+migration 定义，包含 policy 的 migration 必须排在 access migration 之前。生成文件
+带 `DO NOT EDIT` 标记，不支持拆分或手工改写后绕开该原子顺序。当前
 `validate/render/check` 是静态与
 生成证据；`check -sql` 只比较指定生成物的字节漂移，不读取 pgmigrate 已应用清单，
 也不是数据库验收：尚未检查实际 catalog、继承链、`PUBLIC` 有效权限或
-真实 `SET ROLE` 行为。权限被移出 grants 时须在新版本 manifest 的 forbidden 中
-显式写出撤销对象；后续 catalog verifier 才负责 managed scope 的 missing/unexpected
+真实 `SET ROLE` 行为。权限或 required membership 被移出正向声明时，须在新版本
+manifest 的对应 forbidden 列表中显式写出撤销对象；缩减 forbidden 列表仅表示放松
+负向约束，不会恢复权限。`forbidden.mutations` 的值静态校验为 `schema.object`，语义
+限定为 table/view relation；实际 relation 类型由 PostgreSQL apply fail-closed，并由后续
+catalog verifier 负责 managed scope 的 missing/unexpected
 精确比较。
 
 ## 独立 sqlc schema 快照

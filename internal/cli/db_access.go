@@ -99,6 +99,14 @@ func writeNewAccessSQL(path string, data []byte) error {
 	if !info.IsDir() {
 		return fmt.Errorf("生成 SQL 的父路径 %s 不是目录", parent)
 	}
+	if target, err := os.Lstat(path); err == nil {
+		if target.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("拒绝通过符号链接写入生成 SQL %s", path)
+		}
+		return fmt.Errorf("拒绝覆盖已有文件 %s；权限变化必须生成新的追加 migration", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("检查生成 SQL 目标 %s: %w", path, err)
+	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		if errors.Is(err, os.ErrExist) {
