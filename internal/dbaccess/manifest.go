@@ -217,6 +217,20 @@ func (m Manifest) Validate() error {
 	}
 	problems = append(problems, validateEnumList("forbidden.roleAttributes", m.Forbidden.RoleAttributes, roleAttributeNames)...)
 	problems = append(problems, validateEnumList("forbidden.privileges", m.Forbidden.Privileges, tablePrivileges)...)
+	for object, privileges := range m.Grants.Tables {
+		for _, privilege := range privileges {
+			if slices.Contains(m.Forbidden.Privileges, privilege) {
+				problems = append(problems, fmt.Sprintf("grants.tables.%s 的 %s 同时被 forbidden.privileges 禁止", object, privilege))
+			}
+		}
+	}
+	for i, grant := range m.Grants.Columns {
+		for _, privilege := range grant.Privileges {
+			if slices.Contains(m.Forbidden.Privileges, privilege) {
+				problems = append(problems, fmt.Sprintf("grants.columns[%d] 的 %s 同时被 forbidden.privileges 禁止", i, privilege))
+			}
+		}
+	}
 	for i, name := range m.Forbidden.Mutations {
 		if err := validateQualifiedName(fmt.Sprintf("forbidden.mutations[%d]", i), name); err != nil {
 			problems = append(problems, err.Error())

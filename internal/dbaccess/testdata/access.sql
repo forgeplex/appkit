@@ -3,8 +3,6 @@
 -- manifest-sha256: fa45bc384716d6ec9522bf3fc90e05b2883157e2c93cba286bb9b01e98179f3a
 -- Append this output as a new migration; never replace an applied migration.
 
-BEGIN;
-
 DO $appkit$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_admin_api') THEN
@@ -22,6 +20,14 @@ GRANT INSERT, SELECT, UPDATE ON TABLE "merchant"."admin_account" TO "app_admin_a
 GRANT SELECT, USAGE ON SEQUENCE "merchant"."admin_account_id_seq" TO "app_admin_api";
 GRANT SELECT ("encrypted_key") ON TABLE "merchant"."admin_account" TO "app_admin_api";
 GRANT EXECUTE ON FUNCTION "merchant"."search_admin_account_keys"("text", "pg_catalog"."uuid") TO "app_admin_api";
-REVOKE DELETE, INSERT, TRUNCATE, UPDATE ON TABLE "ledger"."ledger_entry" FROM "app_admin_api";
-
-COMMIT;
+ALTER TABLE "merchant"."admin_account" ENABLE ROW LEVEL SECURITY;
+ALTER TABLE "merchant"."admin_account" FORCE ROW LEVEL SECURITY;
+DO $appkit$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'merchant' AND tablename = 'admin_account' AND policyname = 'admin_account_tenant_isolation') THEN
+        RAISE EXCEPTION 'required RLS policy % is missing on %', 'admin_account_tenant_isolation', 'merchant.admin_account';
+    END IF;
+END
+$appkit$;
+REVOKE DELETE, INSERT, TRIGGER, TRUNCATE, UPDATE ON TABLE "ledger"."ledger_entry" FROM "app_admin_api";
+REVOKE TRIGGER, TRUNCATE ON TABLE "merchant"."admin_account" FROM "app_admin_api";

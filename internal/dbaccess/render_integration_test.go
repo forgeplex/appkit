@@ -6,8 +6,11 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"testing/fstest"
 	"time"
 
+	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/pgmigrate"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -28,18 +31,23 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 
 	suffix := fmt.Sprintf("%d_%d", time.Now().UnixNano(), integrationSequence.Add(1))
 	schema := "access_test_" + suffix
+	migrationSchema := "access_migration_" + suffix
 	login := "access_login_" + suffix
 	permission := "access_perm_" + suffix
 	ident := func(parts ...string) string { return pgx.Identifier(parts).Sanitize() }
 	t.Cleanup(func() {
 		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+ident(schema)+" CASCADE")
+		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+ident(migrationSchema)+" CASCADE")
 		_, _ = pool.Exec(ctx, "DROP ROLE IF EXISTS "+ident(login))
 		_, _ = pool.Exec(ctx, "DROP ROLE IF EXISTS "+ident(permission))
 	})
 	if _, err := pool.Exec(ctx, "CREATE ROLE "+ident(login)+" LOGIN INHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+ident(schema)+"; CREATE TABLE "+ident(schema, "items")+" (id bigint PRIMARY KEY, value text); CREATE SEQUENCE "+ident(schema, "item_seq")+"; CREATE FUNCTION "+ident(schema, "echo")+"(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1'"); err != nil {
+	if _, err := pool.Exec(ctx, "CREATE ROLE "+ident(permission)+" NOLOGIN INHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+ident(schema)+"; CREATE TABLE "+ident(schema, "items")+" (id bigint PRIMARY KEY, tenant_id text NOT NULL, value text); CREATE TABLE "+ident(schema, "missing_items")+" (id bigint PRIMARY KEY, tenant_id text NOT NULL); CREATE POLICY access_test_policy ON "+ident(schema, "items")+" USING (true) WITH CHECK (true); CREATE SEQUENCE "+ident(schema, "item_seq")+"; CREATE FUNCTION "+ident(schema, "echo")+"(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1'; GRANT TRIGGER ON "+ident(schema, "items")+" TO "+ident(permission)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -56,21 +64,67 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 			Sequences: map[string][]string{schema + ".item_seq": {"USAGE"}},
 			Functions: []FunctionGrant{{Schema: schema, Name: "echo", Arguments: []string{"text"}, Privileges: []string{"EXECUTE"}}},
 		},
+		RLS: map[string]RLSRequirement{
+			schema + ".items": {Enabled: true, Forced: true, RequiredPolicies: []string{"access_test_policy"}},
+		},
+		Forbidden: Forbidden{Privileges: []string{"TRIGGER"}},
 	}
 	sql, err := RenderSQL(m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, string(sql)); err != nil {
+	run := pgmigrate.Runner(pool)
+	first := fstest.MapFS{"001_access.sql": {Data: sql}}
+	if err := run(ctx, []appkit.MigrationSet{{Schema: migrationSchema, FS: first, Module: "dbaccess-test"}}); err != nil {
 		t.Fatalf("execute rendered SQL: %v\n%s", err, sql)
 	}
-
-	var canSelect, canUpdate bool
-	if err := pool.QueryRow(ctx, "SELECT has_table_privilege($1, $2, 'SELECT'), has_table_privilege($1, $2, 'UPDATE')", login, schema+".items").Scan(&canSelect, &canUpdate); err != nil {
+	missingPolicy := m
+	missingPolicy.RLS = map[string]RLSRequirement{
+		schema + ".missing_items": {Enabled: true, Forced: true, RequiredPolicies: []string{"missing_policy"}},
+	}
+	missingSQL, err := RenderSQL(missingPolicy)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !canSelect || canUpdate {
-		t.Fatalf("effective table privileges: select=%t update=%t", canSelect, canUpdate)
+	withMissing := fstest.MapFS{
+		"001_access.sql":         {Data: sql},
+		"002_missing_policy.sql": {Data: missingSQL},
+	}
+	if err := run(ctx, []appkit.MigrationSet{{Schema: migrationSchema, FS: withMissing, Module: "dbaccess-test"}}); err == nil {
+		t.Fatal("rendered migration accepted a missing required RLS policy")
+	}
+	var missingApplied int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+ident(migrationSchema, "schema_migrations")+" WHERE version='002_missing_policy.sql'").Scan(&missingApplied); err != nil {
+		t.Fatal(err)
+	}
+	if missingApplied != 0 {
+		t.Fatal("failed RLS policy migration was recorded as applied")
+	}
+	var missingRLSEnabled, missingRLSForced bool
+	if err := pool.QueryRow(ctx, `SELECT c.relrowsecurity, c.relforcerowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relname='missing_items'`, schema).Scan(&missingRLSEnabled, &missingRLSForced); err != nil {
+		t.Fatal(err)
+	}
+	if missingRLSEnabled || missingRLSForced {
+		t.Fatalf("failed policy assertion did not roll back RLS DDL: enabled=%t forced=%t", missingRLSEnabled, missingRLSForced)
+	}
+
+	var canSelect, canUpdate, canTrigger bool
+	if err := pool.QueryRow(ctx, "SELECT has_table_privilege($1, $2, 'SELECT'), has_table_privilege($1, $2, 'UPDATE'), has_table_privilege($1, $2, 'TRIGGER')", login, schema+".items").Scan(&canSelect, &canUpdate, &canTrigger); err != nil {
+		t.Fatal(err)
+	}
+	if !canSelect || canUpdate || canTrigger {
+		t.Fatalf("effective table privileges: select=%t update=%t trigger=%t", canSelect, canUpdate, canTrigger)
+	}
+	var rlsEnabled, rlsForced, policyExists bool
+	if err := pool.QueryRow(ctx, `
+SELECT c.relrowsecurity, c.relforcerowsecurity,
+       EXISTS (SELECT 1 FROM pg_policies p WHERE p.schemaname=$1 AND p.tablename='items' AND p.policyname='access_test_policy')
+FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+WHERE n.nspname=$1 AND c.relname='items'`, schema).Scan(&rlsEnabled, &rlsForced, &policyExists); err != nil {
+		t.Fatal(err)
+	}
+	if !rlsEnabled || !rlsForced || !policyExists {
+		t.Fatalf("RLS contract: enabled=%t forced=%t policy=%t", rlsEnabled, rlsForced, policyExists)
 	}
 	var roleLogin, superuser, bypassRLS, createDB, createRole bool
 	if err := pool.QueryRow(ctx, "SELECT rolcanlogin, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole FROM pg_roles WHERE rolname=$1", permission).Scan(&roleLogin, &superuser, &bypassRLS, &createDB, &createRole); err != nil {

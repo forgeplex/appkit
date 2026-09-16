@@ -80,6 +80,7 @@ func TestParseRejectsUnsafeDeclarations(t *testing.T) {
 		"identifier injection": strings.Replace(validManifest, "app_admin_api", "app_admin_api;drop_role", 1),
 		"unqualified table":    strings.Replace(validManifest, "merchant.admin_account: [SELECT, INSERT, UPDATE]", "admin_account: [SELECT]", 1),
 		"unknown privilege":    strings.Replace(validManifest, "[SELECT, INSERT, UPDATE]", "[SELECT, OWN]", 1),
+		"grant forbidden":      strings.Replace(validManifest, "privileges: [TRUNCATE, TRIGGER]", "privileges: [SELECT]", 1),
 		"weak rls":             strings.Replace(validManifest, "    forced: true", "    forced: false", 1),
 	}
 	for name, source := range tests {

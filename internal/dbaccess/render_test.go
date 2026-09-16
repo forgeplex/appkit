@@ -39,8 +39,11 @@ func TestRenderSQLIsDeterministicAndSafe(t *testing.T) {
 		`GRANT INSERT, SELECT, UPDATE ON TABLE "merchant"."admin_account" TO "app_admin_api";`,
 		`GRANT SELECT ("encrypted_key") ON TABLE "merchant"."admin_account" TO "app_admin_api";`,
 		`GRANT EXECUTE ON FUNCTION "merchant"."search_admin_account_keys"("text", "pg_catalog"."uuid") TO "app_admin_api";`,
-		`REVOKE DELETE, INSERT, TRUNCATE, UPDATE ON TABLE "ledger"."ledger_entry" FROM "app_admin_api";`,
-		"COMMIT;",
+		`ALTER TABLE "merchant"."admin_account" ENABLE ROW LEVEL SECURITY;`,
+		`ALTER TABLE "merchant"."admin_account" FORCE ROW LEVEL SECURITY;`,
+		`RAISE EXCEPTION 'required RLS policy % is missing on %', 'admin_account_tenant_isolation', 'merchant.admin_account';`,
+		`REVOKE DELETE, INSERT, TRIGGER, TRUNCATE, UPDATE ON TABLE "ledger"."ledger_entry" FROM "app_admin_api";`,
+		`REVOKE TRIGGER, TRUNCATE ON TABLE "merchant"."admin_account" FROM "app_admin_api";`,
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("rendered SQL missing %q:\n%s", want, text)

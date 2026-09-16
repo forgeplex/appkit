@@ -1368,7 +1368,8 @@ forbidden:
 
 工作流是先校验，再生成一个**新的**追加 migration；输出路径的父目录必须预先
 存在，命令不会创建目录或改变目录权限；输出文件已存在时拒绝覆盖。已应用
-migration 仍服从 pgmigrate 的 checksum 不可变规则：
+migration 仍服从 pgmigrate 的 checksum 不可变规则。生成 SQL 不自带事务控制，
+由 pgmigrate 的单文件事务统一提交或回滚：
 
 ```sh
 appkit db-access validate -manifest db/access.yaml
@@ -1381,8 +1382,11 @@ appkit db-access check -manifest db/access.yaml \
 `render` 也可省略 `-out` 把纯 SQL 写到 stdout；诊断只写 stderr，可安全接 SQL
 管道。生成器会创建/收紧 permission role、
 建立 required membership、撤销明确 forbidden membership/表写权限并授予声明的
-schema/table/column/sequence/function 权限。RLS 条目当前是验证契约，不生成任意
-policy predicate；策略仍由版本 migration 定义。当前 `validate/render/check` 是静态与
+schema/table/column/sequence/function 权限。`forbidden.privileges` 会从全部受管表
+及 mutation 表的 permission role 直接 ACL 撤销；继承与 `PUBLIC` 的有效权限仍由后续
+catalog verifier 检查。RLS 条目会生成 `ENABLE/FORCE ROW LEVEL SECURITY`，并在同一
+事务断言 `requiredPolicies` 已存在；policy predicate 仍由版本 migration 定义。当前
+`validate/render/check` 是静态与
 生成证据；`check -sql` 只比较指定生成物的字节漂移，不读取 pgmigrate 已应用清单，
 也不是数据库验收：尚未检查实际 catalog、继承链、`PUBLIC` 有效权限或
 真实 `SET ROLE` 行为。权限被移出 grants 时须在新版本 manifest 的 forbidden 中
