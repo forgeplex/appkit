@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"sort"
 	"strings"
 
 	"go.yaml.in/yaml/v3"
@@ -349,6 +350,7 @@ func validateTypeName(path, value string) error {
 }
 
 func normalizedYAML(m Manifest) ([]byte, error) {
+	m = canonicalManifest(m)
 	var b bytes.Buffer
 	enc := yaml.NewEncoder(&b)
 	enc.SetIndent(2)
@@ -356,4 +358,46 @@ func normalizedYAML(m Manifest) ([]byte, error) {
 		return nil, err
 	}
 	return b.Bytes(), nil
+}
+
+func canonicalManifest(m Manifest) Manifest {
+	m.Memberships.Required = sortedUnique(m.Memberships.Required)
+	m.Memberships.Forbidden = sortedUnique(m.Memberships.Forbidden)
+	m.Grants.Schemas = canonicalGrantMap(m.Grants.Schemas)
+	m.Grants.Tables = canonicalGrantMap(m.Grants.Tables)
+	m.Grants.Sequences = canonicalGrantMap(m.Grants.Sequences)
+	m.Grants.Columns = append([]ColumnGrant(nil), m.Grants.Columns...)
+	for i := range m.Grants.Columns {
+		m.Grants.Columns[i].Privileges = sortedUnique(m.Grants.Columns[i].Privileges)
+	}
+	sort.Slice(m.Grants.Columns, func(i, j int) bool {
+		a, b := m.Grants.Columns[i], m.Grants.Columns[j]
+		return a.Schema+"."+a.Table+"."+a.Column < b.Schema+"."+b.Table+"."+b.Column
+	})
+	m.Grants.Functions = append([]FunctionGrant(nil), m.Grants.Functions...)
+	for i := range m.Grants.Functions {
+		m.Grants.Functions[i].Arguments = append([]string(nil), m.Grants.Functions[i].Arguments...)
+		m.Grants.Functions[i].Privileges = sortedUnique(m.Grants.Functions[i].Privileges)
+	}
+	sort.Slice(m.Grants.Functions, func(i, j int) bool {
+		return functionIdentity(m.Grants.Functions[i]) < functionIdentity(m.Grants.Functions[j])
+	})
+	rls := make(map[string]RLSRequirement, len(m.RLS))
+	for table, requirement := range m.RLS {
+		requirement.RequiredPolicies = sortedUnique(requirement.RequiredPolicies)
+		rls[table] = requirement
+	}
+	m.RLS = rls
+	m.Forbidden.RoleAttributes = sortedUnique(m.Forbidden.RoleAttributes)
+	m.Forbidden.Privileges = sortedUnique(m.Forbidden.Privileges)
+	m.Forbidden.Mutations = sortedUnique(m.Forbidden.Mutations)
+	return m
+}
+
+func canonicalGrantMap(in map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(in))
+	for object, privileges := range in {
+		out[object] = sortedUnique(privileges)
+	}
+	return out
 }

@@ -57,7 +57,7 @@ func dbAccess(args []string, out, diagnostics io.Writer) error {
 		}
 		return writeNewAccessSQL(*outputPath, sql)
 	case "check":
-		sqlPath := f.String("sql", "", "待比对的生成 SQL 文件")
+		sqlPath := f.String("sql", "", "待比对的生成 SQL 文件（只查生成物漂移，不连接数据库）")
 		if err := f.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -91,8 +91,13 @@ func loadAndRenderAccess(path string) ([]byte, error) {
 }
 
 func writeNewAccessSQL(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("创建生成 SQL 目录: %w", err)
+	parent := filepath.Dir(path)
+	info, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Errorf("检查生成 SQL 目录 %s: %w（目录必须预先存在，命令不会代建或改变权限）", parent, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("生成 SQL 的父路径 %s 不是目录", parent)
 	}
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {

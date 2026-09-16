@@ -27,6 +27,22 @@ func TestDBAccessValidateRenderAndCheck(t *testing.T) {
 	if !strings.Contains(out.String(), "service=admin_api") || diagnostics.Len() != 0 {
 		t.Fatalf("unexpected output: %q diagnostics=%q", out.String(), diagnostics.String())
 	}
+	m, err := dbaccess.LoadFile(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSQL, err := dbaccess.RenderSQL(*m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	diagnostics.Reset()
+	if err := dbAccess([]string{"render", "-manifest", manifest}, &out, &diagnostics); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out.Bytes(), wantSQL) || diagnostics.Len() != 0 {
+		t.Fatalf("stdout render polluted: stdout=%q diagnostics=%q", out.String(), diagnostics.String())
+	}
 
 	sqlPath := filepath.Join(dir, "0003_access.sql")
 	if err := dbAccess([]string{"render", "-manifest", manifest, "-out", sqlPath}, &out, &diagnostics); err != nil {
@@ -43,6 +59,41 @@ func TestDBAccessValidateRenderAndCheck(t *testing.T) {
 	}
 	if err := dbAccess([]string{"check", "-manifest", manifest, "-sql", sqlPath}, &out, &diagnostics); err == nil {
 		t.Fatal("accepted drifted SQL")
+	}
+}
+
+func TestDBAccessRenderRequiresExistingParentAndPreservesMode(t *testing.T) {
+	dir := t.TempDir()
+	manifest := filepath.Join(dir, "access.yaml")
+	data, err := os.ReadFile("../dbaccess/testdata/access.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, diagnostics bytes.Buffer
+	missing := filepath.Join(dir, "missing", "0003_access.sql")
+	if err := dbAccess([]string{"render", "-manifest", manifest, "-out", missing}, &out, &diagnostics); err == nil {
+		t.Fatal("created a missing parent directory")
+	}
+	if _, err := os.Stat(filepath.Dir(missing)); !os.IsNotExist(err) {
+		t.Fatalf("missing parent was created: %v", err)
+	}
+
+	privateDir := filepath.Join(dir, "private-migrations")
+	if err := os.Mkdir(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := dbAccess([]string{"render", "-manifest", manifest, "-out", filepath.Join(privateDir, "0003_access.sql")}, &out, &diagnostics); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(privateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("parent mode changed to %o, want 700", got)
 	}
 }
 

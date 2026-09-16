@@ -1366,8 +1366,9 @@ forbidden:
   mutations: [ledger.ledger_entry]
 ```
 
-工作流是先校验，再生成一个**新的**追加 migration；输出路径已存在时命令拒绝
-覆盖，已应用 migration 仍服从 pgmigrate 的 checksum 不可变规则：
+工作流是先校验，再生成一个**新的**追加 migration；输出路径的父目录必须预先
+存在，命令不会创建目录或改变目录权限；输出文件已存在时拒绝覆盖。已应用
+migration 仍服从 pgmigrate 的 checksum 不可变规则：
 
 ```sh
 appkit db-access validate -manifest db/access.yaml
@@ -1377,11 +1378,13 @@ appkit db-access check -manifest db/access.yaml \
   -sql db/migrations/0003_service_access.sql
 ```
 
-`render` 也可省略 `-out` 把 SQL 写到 stdout。生成器会创建/收紧 permission role、
+`render` 也可省略 `-out` 把纯 SQL 写到 stdout；诊断只写 stderr，可安全接 SQL
+管道。生成器会创建/收紧 permission role、
 建立 required membership、撤销明确 forbidden membership/表写权限并授予声明的
 schema/table/column/sequence/function 权限。RLS 条目当前是验证契约，不生成任意
 policy predicate；策略仍由版本 migration 定义。当前 `validate/render/check` 是静态与
-生成证据，不是数据库验收：尚未检查实际 catalog、继承链、`PUBLIC` 有效权限或
+生成证据；`check -sql` 只比较指定生成物的字节漂移，不读取 pgmigrate 已应用清单，
+也不是数据库验收：尚未检查实际 catalog、继承链、`PUBLIC` 有效权限或
 真实 `SET ROLE` 行为。权限被移出 grants 时须在新版本 manifest 的 forbidden 中
 显式写出撤销对象；后续 catalog verifier 才负责 managed scope 的 missing/unexpected
 精确比较。
