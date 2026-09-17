@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/forgeplex/appkit/internal/dbaccess"
 )
@@ -94,45 +93,4 @@ func loadAndRenderAccess(path string) ([]byte, error) {
 func writeNewAccessSQL(path string, data []byte) error {
 	requestedParent := filepath.Dir(path)
 	return publishAccessSQL(requestedParent, filepath.Base(path), data)
-}
-
-func validateAccessOutputDirectory(path string) (string, error) {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "", fmt.Errorf("解析生成 SQL 目录 %s: %w", path, err)
-	}
-	requested, err := os.Lstat(abs)
-	if err != nil {
-		return "", fmt.Errorf("检查生成 SQL 目录 %s: %w（目录必须预先存在，命令不会代建或改变权限）", abs, err)
-	}
-	if requested.Mode()&os.ModeSymlink != 0 {
-		return "", fmt.Errorf("拒绝通过符号链接目录写入生成 SQL: %s", abs)
-	}
-	abs, err = filepath.EvalSymlinks(abs)
-	if err != nil {
-		return "", fmt.Errorf("解析生成 SQL 目录真实路径 %s: %w", path, err)
-	}
-	volume := filepath.VolumeName(abs)
-	current := volume + string(os.PathSeparator)
-	for _, part := range strings.Split(strings.TrimPrefix(abs, current), string(os.PathSeparator)) {
-		if part == "" {
-			continue
-		}
-		current = filepath.Join(current, part)
-		info, err := os.Lstat(current)
-		if err != nil {
-			return "", fmt.Errorf("检查生成 SQL 目录 %s: %w（目录必须预先存在，命令不会代建或改变权限）", current, err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return "", fmt.Errorf("拒绝通过符号链接目录写入生成 SQL: %s", current)
-		}
-	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return "", fmt.Errorf("检查生成 SQL 目录 %s: %w", abs, err)
-	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("生成 SQL 的父路径 %s 不是目录", abs)
-	}
-	return abs, nil
 }

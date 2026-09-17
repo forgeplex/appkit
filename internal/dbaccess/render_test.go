@@ -69,16 +69,42 @@ func TestRenderSQLRevokesForbiddenPrivilegesFromColumnOnlyTables(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.Grants.Columns = append(m.Grants.Columns, ColumnGrant{
-		Schema: "merchant", Table: "column_only", Column: "visible", Privileges: []string{"SELECT"},
-	})
+	m.Grants.Tables = nil
+	m.Grants.Columns = []ColumnGrant{{Schema: "merchant", Table: "column_only", Column: "visible", Privileges: []string{"SELECT"}}}
+	m.RLS = nil
+	m.Forbidden.Privileges = []string{"INSERT", "REFERENCES", "UPDATE"}
+	m.Forbidden.Mutations = nil
 	sql, err := RenderSQL(*m)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `REVOKE TRIGGER, TRUNCATE ON TABLE "merchant"."column_only" FROM "app_admin_api";`
+	for _, want := range []string{
+		`REVOKE INSERT, REFERENCES, UPDATE ON TABLE "merchant"."column_only" FROM "app_admin_api";`,
+		`REVOKE INSERT (%I), REFERENCES (%I), UPDATE (%I) ON TABLE %I.%I FROM %I`,
+	} {
+		if !strings.Contains(string(sql), want) {
+			t.Fatalf("column-only table missing forbidden privilege reconciliation %q:\n%s", want, sql)
+		}
+	}
+}
+
+func TestRenderSQLRevokesEveryColumnCapableForbiddenPrivilege(t *testing.T) {
+	m, err := Parse(strings.NewReader(validManifest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Grants.Tables = map[string][]string{"merchant.historical_column_acls": {"DELETE"}}
+	m.Grants.Columns = nil
+	m.RLS = nil
+	m.Forbidden.Privileges = append([]string(nil), columnPrivileges...)
+	m.Forbidden.Mutations = nil
+	sql, err := RenderSQL(*m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `REVOKE INSERT (%I), REFERENCES (%I), SELECT (%I), UPDATE (%I) ON TABLE %I.%I FROM %I`
 	if !strings.Contains(string(sql), want) {
-		t.Fatalf("column-only table missing forbidden privilege reconciliation:\n%s", sql)
+		t.Fatalf("managed table missing complete forbidden column privilege reconciliation:\n%s", sql)
 	}
 }
 

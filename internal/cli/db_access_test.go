@@ -134,6 +134,23 @@ func TestDBAccessRenderRequiresExistingParentAndPreservesMode(t *testing.T) {
 	if err := dbAccess([]string{"render", "-manifest", manifest, "-out", filepath.Join(linkedParent, "0005_access.sql")}, &out, &diagnostics); err == nil || !strings.Contains(err.Error(), "符号链接目录") {
 		t.Fatalf("did not reject symlink parent explicitly: %v", err)
 	}
+
+	realAncestor := filepath.Join(dir, "real-ancestor")
+	realMigrations := filepath.Join(realAncestor, "migrations")
+	if err := os.MkdirAll(realMigrations, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkedAncestor := filepath.Join(dir, "linked-ancestor")
+	if err := os.Symlink(realAncestor, linkedAncestor); err != nil {
+		t.Skipf("symbolic links unavailable: %v", err)
+	}
+	throughAncestor := filepath.Join(linkedAncestor, "migrations", "0006_access.sql")
+	if err := dbAccess([]string{"render", "-manifest", manifest, "-out", throughAncestor}, &out, &diagnostics); err != nil {
+		t.Fatalf("rejected canonicalizable ancestor symlink: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(realMigrations, "0006_access.sql")); err != nil {
+		t.Fatalf("migration was not published through canonicalized ancestor: %v", err)
+	}
 }
 
 func TestWriteNewAccessSQLPublishesAtomicallyWithoutOverwrite(t *testing.T) {

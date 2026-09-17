@@ -3,7 +3,6 @@ package dbaccess
 import (
 	"crypto/sha256"
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
 )
@@ -120,9 +119,7 @@ func renderForbiddenPrivileges(b *strings.Builder, m Manifest, role string) {
 		if len(privileges) > 0 {
 			fmt.Fprintf(b, "REVOKE %s ON TABLE %s FROM %s;\n", strings.Join(privileges, ", "), quoteQualified(object), role)
 		}
-		if slices.Contains(m.Forbidden.Mutations, object) {
-			renderColumnMutationRevokes(b, object, role)
-		}
+		renderColumnPrivilegeRevokes(b, object, role, privileges)
 	}
 }
 
@@ -142,12 +139,37 @@ func renderForbiddenMembership(b *strings.Builder, role, login string) {
 	b.WriteString("    END IF;\nEND\n$appkit$;\n")
 }
 
-func renderColumnMutationRevokes(b *strings.Builder, object, role string) {
+func renderColumnPrivilegeRevokes(b *strings.Builder, object, role string, privileges []string) {
+	var columnRevokes []string
+	for _, privilege := range privileges {
+		if contains(columnPrivileges, privilege) {
+			columnRevokes = append(columnRevokes, privilege)
+		}
+	}
+	if len(columnRevokes) == 0 {
+		return
+	}
 	schema, table, _ := splitQualifiedName(object)
+	clauses := make([]string, 0, len(columnRevokes))
+	formatArgs := make([]string, 0, len(columnRevokes)+3)
+	for _, privilege := range columnRevokes {
+		clauses = append(clauses, privilege+" (%I)")
+		formatArgs = append(formatArgs, "appkit_column")
+	}
+	formatArgs = append(formatArgs, quoteLiteral(schema), quoteLiteral(table), quoteLiteral(strings.Trim(role, `"`)))
 	b.WriteString("DO $appkit$\nDECLARE\n    appkit_column text;\nBEGIN\n")
 	fmt.Fprintf(b, "    FOR appkit_column IN SELECT a.attname FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = %s AND c.relname = %s AND a.attnum > 0 AND NOT a.attisdropped LOOP\n", quoteLiteral(schema), quoteLiteral(table))
-	fmt.Fprintf(b, "        EXECUTE format('REVOKE INSERT (%%I), UPDATE (%%I) ON TABLE %%I.%%I FROM %%I', appkit_column, appkit_column, %s, %s, %s);\n", quoteLiteral(schema), quoteLiteral(table), quoteLiteral(strings.Trim(role, `"`)))
+	fmt.Fprintf(b, "        EXECUTE format('REVOKE %s ON TABLE %%I.%%I FROM %%I', %s);\n", strings.Join(clauses, ", "), strings.Join(formatArgs, ", "))
 	b.WriteString("    END LOOP;\nEND\n$appkit$;\n")
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func renderGrantMap(b *strings.Builder, kind string, grants map[string][]string, role string) {

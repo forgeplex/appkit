@@ -15,13 +15,9 @@ import (
 )
 
 func publishAccessSQL(requestedParent, targetName string, data []byte) error {
-	parent, err := validateAccessOutputDirectory(requestedParent)
+	dirfd, parent, err := openValidatedAccessDirectory(requestedParent)
 	if err != nil {
 		return err
-	}
-	dirfd, err := openAccessDirectory(parent)
-	if err != nil {
-		return fmt.Errorf("打开生成 SQL 目录 %s: %w", parent, err)
 	}
 	defer unix.Close(dirfd)
 
@@ -63,10 +59,40 @@ func publishAccessSQL(requestedParent, targetName string, data []byte) error {
 	return nil
 }
 
+func openValidatedAccessDirectory(path string) (int, string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return -1, "", fmt.Errorf("解析生成 SQL 目录 %s: %w", path, err)
+	}
+	var expected unix.Stat_t
+	if err := unix.Lstat(abs, &expected); err != nil {
+		return -1, "", fmt.Errorf("检查生成 SQL 目录 %s: %w（目录必须预先存在，命令不会代建或改变权限）", abs, err)
+	}
+	if expected.Mode&unix.S_IFMT == unix.S_IFLNK {
+		return -1, "", fmt.Errorf("拒绝通过符号链接目录写入生成 SQL: %s", abs)
+	}
+	if expected.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return -1, "", fmt.Errorf("生成 SQL 的父路径 %s 不是目录", abs)
+	}
+	parent, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return -1, "", fmt.Errorf("解析生成 SQL 目录真实路径 %s: %w", path, err)
+	}
+	dirfd, err := openAccessDirectory(parent)
+	if err != nil {
+		return -1, "", fmt.Errorf("打开生成 SQL 目录 %s: %w", parent, err)
+	}
+	if err := verifyAccessDirectoryIdentity(dirfd, &expected, parent); err != nil {
+		_ = unix.Close(dirfd)
+		return -1, "", err
+	}
+	return dirfd, parent, nil
+}
+
 // openAccessDirectory walks the canonical absolute path from a root directory
-// descriptor. Every component is opened relative to the previously verified
-// descriptor with O_NOFOLLOW, so concurrent path replacement cannot redirect
-// the final descriptor after validation.
+// descriptor. O_NOFOLLOW rejects a symlink introduced into the canonical path;
+// the caller separately verifies that the final fd is the object observed
+// before canonicalization, closing ordinary-directory replacement races.
 func openAccessDirectory(path string) (int, error) {
 	current, err := unix.Open(string(os.PathSeparator), unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
@@ -84,6 +110,17 @@ func openAccessDirectory(path string) (int, error) {
 		current = next
 	}
 	return current, nil
+}
+
+func verifyAccessDirectoryIdentity(dirfd int, expected *unix.Stat_t, path string) error {
+	var actual unix.Stat_t
+	if err := unix.Fstat(dirfd, &actual); err != nil {
+		return fmt.Errorf("复核生成 SQL 目录 %s: %w", path, err)
+	}
+	if actual.Dev != expected.Dev || actual.Ino != expected.Ino {
+		return fmt.Errorf("拒绝写入校验后被替换的生成 SQL 目录: %s", path)
+	}
+	return nil
 }
 
 func ensureAccessTargetAbsent(dirfd int, displayPath, targetName string) error {

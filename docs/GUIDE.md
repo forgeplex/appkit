@@ -1393,7 +1393,9 @@ reconciliation scope：对象无需同时出现在 `grants.tables`，用于撤�
 同表的 table 或 column `INSERT/UPDATE` 等写授权会在校验阶段被拒绝；
 生成 SQL 也会枚举 relation 的现有列并撤销历史列级 `INSERT/UPDATE` ACL；
 `forbidden.privileges` 会从 table grant、column grant 和 mutation 涉及的全部受管表撤销
-permission role 的直接 ACL。不存在的 forbidden membership 会安全跳过，以便不同环境
+permission role 的直接表级 ACL；对 PostgreSQL 支持列级授权的 `SELECT`、`INSERT`、
+`UPDATE`、`REFERENCES`，生成器也会枚举现有列并撤销历史列级 ACL。不存在的
+forbidden membership 会安全跳过，以便不同环境
 收敛；存在时会撤权。`forbidden.roleAttributes` 必须完整声明 `SUPERUSER`、`BYPASSRLS`、
 `CREATEDB`、`CREATEROLE`，生成器据此创建或收紧 permission role；`NOLOGIN` 是 permission
 role 的固定边界。
