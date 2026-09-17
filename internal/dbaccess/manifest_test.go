@@ -43,7 +43,14 @@ rls:
   merchant.admin_account:
     enabled: true
     forced: true
-    requiredPolicies: [admin_account_tenant_isolation]
+    exactPolicies: true
+    policies:
+      - name: admin_account_tenant_isolation
+        command: ALL
+        mode: PERMISSIVE
+        roles: [PUBLIC]
+        using: "true"
+        withCheck: "true"
 forbidden:
   roleAttributes: [SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE]
   privileges: [TRUNCATE, TRIGGER]
@@ -99,6 +106,10 @@ func TestParseRejectsUnsafeDeclarations(t *testing.T) {
 		"unqualified rls":          strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  admin_account:", 1),
 		"overqualified rls":        strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  tenant.merchant.admin_account:", 1),
 		"weak rls":                 strings.Replace(validManifest, "    forced: true", "    forced: false", 1),
+		"non-exact rls":            strings.Replace(validManifest, "    exactPolicies: true", "    exactPolicies: false", 1),
+		"unknown policy command":   strings.Replace(validManifest, "        command: ALL", "        command: MERGE", 1),
+		"empty policy roles":       strings.Replace(validManifest, "        roles: [PUBLIC]", "        roles: []", 1),
+		"insert using predicate":   strings.Replace(validManifest, "        command: ALL", "        command: INSERT", 1),
 		"missing forbidden role attribute": strings.Replace(validManifest,
 			"roleAttributes: [SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE]",
 			"roleAttributes: [SUPERUSER, BYPASSRLS, CREATEDB]", 1),

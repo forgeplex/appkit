@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -35,6 +36,8 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 	migrationSchema := "access_migration_" + suffix
 	dependencyMigrationSchema := "access_dependency_" + suffix
 	columnACLsMigrationSchema := "access_column_acls_" + suffix
+	unexpectedPolicyMigrationSchema := "access_unexpected_policy_" + suffix
+	driftedPolicyMigrationSchema := "access_drifted_policy_" + suffix
 	login := "access_login_" + suffix
 	permission := "access_perm_" + suffix
 	ident := func(parts ...string) string { return pgx.Identifier(parts).Sanitize() }
@@ -43,6 +46,8 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+ident(migrationSchema)+" CASCADE")
 		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+ident(dependencyMigrationSchema)+" CASCADE")
 		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+ident(columnACLsMigrationSchema)+" CASCADE")
+		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+ident(unexpectedPolicyMigrationSchema)+" CASCADE")
+		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+ident(driftedPolicyMigrationSchema)+" CASCADE")
 		_, _ = pool.Exec(ctx, "DROP ROLE IF EXISTS "+ident(login))
 		_, _ = pool.Exec(ctx, "DROP ROLE IF EXISTS "+ident(permission))
 	})
@@ -72,7 +77,15 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 			Functions: []FunctionGrant{{Schema: schema, Name: "echo", Arguments: []string{"text"}, Privileges: []string{"EXECUTE"}}},
 		},
 		RLS: map[string]RLSRequirement{
-			schema + ".items": {Enabled: true, Forced: true, RequiredPolicies: []string{"access_test_policy"}},
+			schema + ".items": {
+				Enabled:       true,
+				Forced:        true,
+				ExactPolicies: true,
+				Policies: []RLSPolicyContract{{
+					Name: "access_test_policy", Command: "ALL", Mode: "PERMISSIVE", Roles: []string{"PUBLIC"},
+					Using: stringPointer("true"), WithCheck: stringPointer("true"),
+				}},
+			},
 		},
 		Forbidden: Forbidden{
 			RoleAttributes: append([]string(nil), mandatoryForbiddenRoleAttributes...),
@@ -109,7 +122,10 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 	}
 	missingPolicy := m
 	missingPolicy.RLS = map[string]RLSRequirement{
-		schema + ".missing_items": {Enabled: true, Forced: true, RequiredPolicies: []string{"missing_policy"}},
+		schema + ".missing_items": {
+			Enabled: true, Forced: true, ExactPolicies: true,
+			Policies: []RLSPolicyContract{{Name: "missing_policy", Command: "ALL", Mode: "PERMISSIVE", Roles: []string{"PUBLIC"}, Using: stringPointer("true"), WithCheck: stringPointer("true")}},
+		},
 	}
 	missingSQL, err := RenderSQL(missingPolicy)
 	if err != nil {
@@ -121,6 +137,8 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 	}
 	if err := run(ctx, []appkit.MigrationSet{{Schema: migrationSchema, FS: withMissing, Module: "dbaccess-test"}}); err == nil {
 		t.Fatal("rendered migration accepted a missing required RLS policy")
+	} else if !strings.Contains(err.Error(), "RLS policy set mismatch") {
+		t.Fatalf("missing policy failed for the wrong reason: %v", err)
 	}
 	var missingApplied int
 	if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+ident(migrationSchema, "schema_migrations")+" WHERE version='002_missing_policy.sql'").Scan(&missingApplied); err != nil {
@@ -135,6 +153,35 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 	}
 	if missingRLSEnabled || missingRLSForced {
 		t.Fatalf("failed policy assertion did not roll back RLS DDL: enabled=%t forced=%t", missingRLSEnabled, missingRLSForced)
+	}
+
+	if _, err := pool.Exec(ctx, "CREATE POLICY access_test_unexpected_policy ON "+ident(schema, "items")+" FOR SELECT USING (true)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(ctx, []appkit.MigrationSet{{Schema: unexpectedPolicyMigrationSchema, FS: fstest.MapFS{"001_unexpected_policy.sql": {Data: sql}}, Module: "dbaccess-unexpected-policy-test"}}); err == nil {
+		t.Fatal("rendered migration accepted an unexpected permissive RLS policy")
+	} else if !strings.Contains(err.Error(), "RLS policy set mismatch") {
+		t.Fatalf("unexpected policy failed for the wrong reason: %v", err)
+	}
+	if _, err := pool.Exec(ctx, "DROP POLICY access_test_unexpected_policy ON "+ident(schema, "items")); err != nil {
+		t.Fatal(err)
+	}
+
+	driftedPolicy := m
+	driftedPolicy.RLS = map[string]RLSRequirement{
+		schema + ".items": {
+			Enabled: true, Forced: true, ExactPolicies: true,
+			Policies: []RLSPolicyContract{{Name: "access_test_policy", Command: "ALL", Mode: "PERMISSIVE", Roles: []string{"PUBLIC"}, Using: stringPointer("false"), WithCheck: stringPointer("true")}},
+		},
+	}
+	driftedSQL, err := RenderSQL(driftedPolicy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := run(ctx, []appkit.MigrationSet{{Schema: driftedPolicyMigrationSchema, FS: fstest.MapFS{"001_drifted_policy.sql": {Data: driftedSQL}}, Module: "dbaccess-drifted-policy-test"}}); err == nil {
+		t.Fatal("rendered migration accepted a drifted RLS policy predicate")
+	} else if !strings.Contains(err.Error(), "RLS policy access_test_policy definition mismatch") {
+		t.Fatalf("drifted policy failed for the wrong reason: %v", err)
 	}
 
 	missingDependency := m

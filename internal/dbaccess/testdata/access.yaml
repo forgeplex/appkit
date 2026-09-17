@@ -41,7 +41,14 @@ rls:
   merchant.admin_account:
     enabled: true
     forced: true
-    requiredPolicies: [admin_account_tenant_isolation]
+    exactPolicies: true
+    policies:
+      - name: admin_account_tenant_isolation
+        command: ALL
+        mode: PERMISSIVE
+        roles: [PUBLIC]
+        using: "true"
+        withCheck: "true"
 
 forbidden:
   roleAttributes: [SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE]

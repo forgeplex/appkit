@@ -78,9 +78,19 @@ type FunctionGrant struct {
 }
 
 type RLSRequirement struct {
-	Enabled          bool     `yaml:"enabled"`
-	Forced           bool     `yaml:"forced"`
-	RequiredPolicies []string `yaml:"requiredPolicies,omitempty"`
+	Enabled       bool                `yaml:"enabled"`
+	Forced        bool                `yaml:"forced"`
+	ExactPolicies bool                `yaml:"exactPolicies"`
+	Policies      []RLSPolicyContract `yaml:"policies"`
+}
+
+type RLSPolicyContract struct {
+	Name      string   `yaml:"name"`
+	Command   string   `yaml:"command"`
+	Mode      string   `yaml:"mode"`
+	Roles     []string `yaml:"roles"`
+	Using     *string  `yaml:"using,omitempty"`
+	WithCheck *string  `yaml:"withCheck,omitempty"`
 }
 
 type Forbidden struct {
@@ -232,7 +242,10 @@ func (m Manifest) Validate() error {
 		if !required.Enabled || !required.Forced {
 			problems = append(problems, "rls."+table+" 必须同时声明 enabled: true 与 forced: true")
 		}
-		problems = append(problems, validateIdentifiers("rls."+table+".requiredPolicies", required.RequiredPolicies)...)
+		if !required.ExactPolicies {
+			problems = append(problems, "rls."+table+".exactPolicies 必须为 true：RLS policy 集合必须 fail-closed 精确匹配")
+		}
+		problems = append(problems, validateRLSPolicyContracts("rls."+table+".policies", required.Policies)...)
 	}
 	problems = append(problems, validateEnumList("forbidden.roleAttributes", m.Forbidden.RoleAttributes, mandatoryForbiddenRoleAttributes)...)
 	for _, attribute := range mandatoryForbiddenRoleAttributes {
@@ -281,9 +294,50 @@ var (
 	columnMutationPrivileges         = []string{"INSERT", "UPDATE"}
 	functionPrivileges               = []string{"EXECUTE"}
 	mutationPrivileges               = []string{"DELETE", "INSERT", "TRUNCATE", "UPDATE"}
+	rlsPolicyCommands                = []string{"ALL", "DELETE", "INSERT", "SELECT", "UPDATE"}
+	rlsPolicyModes                   = []string{"PERMISSIVE", "RESTRICTIVE"}
 	mandatoryForbiddenRoleAttributes = []string{"BYPASSRLS", "CREATEDB", "CREATEROLE", "SUPERUSER"}
 	builtinTypeNames                 = []string{"bigint", "bit", "bool", "boolean", "box", "bpchar", "bytea", "char", "cidr", "circle", "date", "decimal", "float4", "float8", "inet", "int2", "int4", "int8", "integer", "interval", "json", "jsonb", "line", "lseg", "macaddr", "macaddr8", "money", "name", "numeric", "oid", "path", "point", "polygon", "real", "record", "regclass", "regconfig", "regdictionary", "regnamespace", "regoper", "regoperator", "regproc", "regprocedure", "regrole", "regtype", "smallint", "text", "time", "timestamp", "timestamptz", "timetz", "tsquery", "tsvector", "txid_snapshot", "uuid", "varbit", "varchar", "void", "xml"}
 )
+
+func validateRLSPolicyContracts(path string, policies []RLSPolicyContract) []string {
+	var problems []string
+	seen := map[string]bool{}
+	for i, policy := range policies {
+		prefix := fmt.Sprintf("%s[%d]", path, i)
+		if err := validateIdentifier(prefix+".name", policy.Name); err != nil {
+			problems = append(problems, err.Error())
+		}
+		if seen[policy.Name] {
+			problems = append(problems, fmt.Sprintf("%s 重复声明 policy %q", path, policy.Name))
+		}
+		seen[policy.Name] = true
+		problems = append(problems, validateEnumList(prefix+".command", []string{policy.Command}, rlsPolicyCommands)...)
+		problems = append(problems, validateEnumList(prefix+".mode", []string{policy.Mode}, rlsPolicyModes)...)
+		if len(policy.Roles) == 0 {
+			problems = append(problems, prefix+".roles 不得为空；PUBLIC 必须显式声明")
+		}
+		roleSeen := map[string]bool{}
+		for j, role := range policy.Roles {
+			if role != "PUBLIC" {
+				if err := validateIdentifier(fmt.Sprintf("%s.roles[%d]", prefix, j), role); err != nil {
+					problems = append(problems, err.Error())
+				}
+			}
+			if roleSeen[role] {
+				problems = append(problems, fmt.Sprintf("%s.roles 重复声明 %q", prefix, role))
+			}
+			roleSeen[role] = true
+		}
+		if policy.Command == "INSERT" && policy.Using != nil {
+			problems = append(problems, prefix+".using 不适用于 INSERT policy")
+		}
+		if (policy.Command == "SELECT" || policy.Command == "DELETE") && policy.WithCheck != nil {
+			problems = append(problems, prefix+".withCheck 不适用于 SELECT/DELETE policy")
+		}
+	}
+	return problems
+}
 
 func validateRoleLists(m Memberships, roles Roles) []string {
 	var problems []string
@@ -440,7 +494,13 @@ func canonicalManifest(m Manifest) Manifest {
 	})
 	rls := make(map[string]RLSRequirement, len(m.RLS))
 	for table, requirement := range m.RLS {
-		requirement.RequiredPolicies = sortedUnique(requirement.RequiredPolicies)
+		requirement.Policies = append([]RLSPolicyContract(nil), requirement.Policies...)
+		for i := range requirement.Policies {
+			requirement.Policies[i].Roles = sortedUnique(requirement.Policies[i].Roles)
+		}
+		sort.Slice(requirement.Policies, func(i, j int) bool {
+			return requirement.Policies[i].Name < requirement.Policies[j].Name
+		})
 		rls[table] = requirement
 	}
 	m.RLS = rls

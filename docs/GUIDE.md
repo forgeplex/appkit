@@ -1361,7 +1361,14 @@ rls:
   merchant.admin_account:
     enabled: true
     forced: true
-    requiredPolicies: [admin_account_tenant_isolation]
+    exactPolicies: true
+    policies:
+      - name: admin_account_tenant_isolation
+        command: ALL
+        mode: PERMISSIVE
+        roles: [PUBLIC]
+        using: "true"
+        withCheck: "true"
 forbidden:
   roleAttributes: [SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE]
   privileges: [TRUNCATE, TRIGGER]
@@ -1400,9 +1407,13 @@ forbidden membership 会安全跳过，以便不同环境
 `CREATEDB`、`CREATEROLE`，生成器据此创建或收紧 permission role；`NOLOGIN` 是 permission
 role 的固定边界。
 继承与 `PUBLIC` 的有效权限仍由后续
-catalog verifier 检查。RLS 条目会生成 `ENABLE/FORCE ROW LEVEL SECURITY`，并在同一
-事务先对目标表取得排他锁、断言 `requiredPolicies` 已存在，再启用并强制 RLS；policy predicate 仍由版本
-migration 定义，包含 policy 的 migration 必须排在 access migration 之前。生成文件
+catalog verifier 检查。RLS 条目必须使用 `exactPolicies: true` 声明该表完整的 policy
+集合，以及每个 policy 的 command、PERMISSIVE/RESTRICTIVE 模式、roles 和 catalog
+规范化后的 `USING`/`WITH CHECK` 表达式。生成 SQL 会在同一事务先对目标表取得排他锁，
+再精确比较 `pg_policy`；缺失、额外 policy 或任一定义漂移都会 fail-closed，避免多个
+PERMISSIVE policy 通过 `OR` 意外放宽访问，或 RESTRICTIVE policy 通过 `AND` 意外收紧。
+Policy DDL 仍由版本 migration 定义，包含 policy 的 migration 必须排在 access migration
+之前；表达式应使用 `pg_get_expr`/schema 文档显示的规范化文本。生成文件
 带 `DO NOT EDIT` 标记，不支持拆分或手工改写后绕开该原子顺序。当前
 所有被引用的 schema/table/sequence/function/type/policy 都是前置依赖，必须由编号更小
 的 migration 创建；顺序错误会使 access migration 整体失败并回滚。函数参数中的

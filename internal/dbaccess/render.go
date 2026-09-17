@@ -75,14 +75,61 @@ func renderRLSRequirements(b *strings.Builder, requirements map[string]RLSRequir
 		requirement := requirements[table]
 		schema, relation, _ := splitQualifiedName(table) // Validate has already established this invariant.
 		fmt.Fprintf(b, "LOCK TABLE %s IN ACCESS EXCLUSIVE MODE;\n", quoteQualified(table))
-		for _, policy := range sortedUnique(requirement.RequiredPolicies) {
-			fmt.Fprintf(b, "DO $appkit$\nBEGIN\n    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = %s AND tablename = %s AND policyname = %s) THEN\n", quoteLiteral(schema), quoteLiteral(relation), quoteLiteral(policy))
-			fmt.Fprintf(b, "        RAISE EXCEPTION 'required RLS policy %% is missing on %%', %s, %s;\n", quoteLiteral(policy), quoteLiteral(table))
-			b.WriteString("    END IF;\nEND\n$appkit$;\n")
+		policies := append([]RLSPolicyContract(nil), requirement.Policies...)
+		sort.Slice(policies, func(i, j int) bool { return policies[i].Name < policies[j].Name })
+		names := make([]string, len(policies))
+		for i, policy := range policies {
+			names[i] = policy.Name
 		}
+		b.WriteString("DO $appkit$\nDECLARE\n    appkit_actual_policies text[];\nBEGIN\n")
+		fmt.Fprintf(b, "    SELECT COALESCE(array_agg(p.polname::text ORDER BY p.polname::text), ARRAY[]::text[]) INTO appkit_actual_policies FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = %s AND c.relname = %s;\n", quoteLiteral(schema), quoteLiteral(relation))
+		fmt.Fprintf(b, "    IF appkit_actual_policies <> %s THEN\n", renderTextArray(names))
+		fmt.Fprintf(b, "        RAISE EXCEPTION 'RLS policy set mismatch on %%: expected %%, actual %%', %s, %s, appkit_actual_policies;\n", quoteLiteral(table), renderTextArray(names))
+		b.WriteString("    END IF;\n")
+		for _, policy := range policies {
+			renderRLSPolicyAssertion(b, schema, relation, table, policy)
+		}
+		b.WriteString("END\n$appkit$;\n")
 		fmt.Fprintf(b, "ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n", quoteQualified(table))
 		fmt.Fprintf(b, "ALTER TABLE %s FORCE ROW LEVEL SECURITY;\n", quoteQualified(table))
 	}
+}
+
+func renderRLSPolicyAssertion(b *strings.Builder, schema, relation, table string, policy RLSPolicyContract) {
+	roles := sortedUnique(policy.Roles)
+	fmt.Fprintf(b, "    IF NOT EXISTS (SELECT 1 FROM pg_policy p JOIN pg_class c ON c.oid = p.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = %s AND c.relname = %s AND p.polname = %s", quoteLiteral(schema), quoteLiteral(relation), quoteLiteral(policy.Name))
+	fmt.Fprintf(b, " AND p.polcmd = %s AND p.polpermissive = %s", quoteLiteral(rlsPolicyCommandCode(policy.Command)), sqlBool(policy.Mode == "PERMISSIVE"))
+	fmt.Fprintf(b, " AND ARRAY(SELECT CASE WHEN policy_role.role_oid = 0 THEN 'PUBLIC' ELSE r.rolname::text END FROM unnest(p.polroles) AS policy_role(role_oid) LEFT JOIN pg_roles r ON r.oid = policy_role.role_oid ORDER BY 1) = %s", renderTextArray(roles))
+	fmt.Fprintf(b, " AND pg_get_expr(p.polqual, p.polrelid) IS NOT DISTINCT FROM %s", renderNullableText(policy.Using))
+	fmt.Fprintf(b, " AND pg_get_expr(p.polwithcheck, p.polrelid) IS NOT DISTINCT FROM %s) THEN\n", renderNullableText(policy.WithCheck))
+	fmt.Fprintf(b, "        RAISE EXCEPTION 'RLS policy %% definition mismatch on %%', %s, %s;\n", quoteLiteral(policy.Name), quoteLiteral(table))
+	b.WriteString("    END IF;\n")
+}
+
+func renderTextArray(values []string) string {
+	quoted := make([]string, len(values))
+	for i, value := range values {
+		quoted[i] = quoteLiteral(value)
+	}
+	return "ARRAY[" + strings.Join(quoted, ", ") + "]::text[]"
+}
+
+func renderNullableText(value *string) string {
+	if value == nil {
+		return "NULL"
+	}
+	return quoteLiteral(*value)
+}
+
+func rlsPolicyCommandCode(command string) string {
+	return map[string]string{"ALL": "*", "SELECT": "r", "INSERT": "a", "UPDATE": "w", "DELETE": "d"}[command]
+}
+
+func sqlBool(value bool) string {
+	if value {
+		return "TRUE"
+	}
+	return "FALSE"
 }
 
 func renderForbiddenPrivileges(b *strings.Builder, m Manifest, role string) {

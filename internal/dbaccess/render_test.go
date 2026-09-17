@@ -47,7 +47,8 @@ func TestRenderSQLIsDeterministicAndSafe(t *testing.T) {
 		`LOCK TABLE "merchant"."admin_account" IN ACCESS EXCLUSIVE MODE;`,
 		`ALTER TABLE "merchant"."admin_account" ENABLE ROW LEVEL SECURITY;`,
 		`ALTER TABLE "merchant"."admin_account" FORCE ROW LEVEL SECURITY;`,
-		`RAISE EXCEPTION 'required RLS policy % is missing on %', 'admin_account_tenant_isolation', 'merchant.admin_account';`,
+		`RAISE EXCEPTION 'RLS policy set mismatch on %: expected %, actual %', 'merchant.admin_account', ARRAY['admin_account_tenant_isolation']::text[], appkit_actual_policies;`,
+		`RAISE EXCEPTION 'RLS policy % definition mismatch on %', 'admin_account_tenant_isolation', 'merchant.admin_account';`,
 		`REVOKE DELETE, INSERT, TRIGGER, TRUNCATE, UPDATE ON TABLE "ledger"."ledger_entry" FROM "app_admin_api";`,
 		`REVOKE INSERT (%I), UPDATE (%I) ON TABLE %I.%I FROM %I`,
 		`REVOKE TRIGGER, TRUNCATE ON TABLE "merchant"."admin_account" FROM "app_admin_api";`,
@@ -57,7 +58,7 @@ func TestRenderSQLIsDeterministicAndSafe(t *testing.T) {
 		}
 	}
 	lock := strings.Index(text, `LOCK TABLE "merchant"."admin_account" IN ACCESS EXCLUSIVE MODE`)
-	assertion := strings.Index(text, "required RLS policy % is missing")
+	assertion := strings.Index(text, "RLS policy set mismatch on %")
 	enable := strings.Index(text, `ALTER TABLE "merchant"."admin_account" ENABLE ROW LEVEL SECURITY`)
 	if lock < 0 || assertion < 0 || enable < 0 || lock > assertion || assertion > enable {
 		t.Fatal("table lock and required RLS policy assertion must precede ENABLE/FORCE")
@@ -125,8 +126,16 @@ func TestRenderSQLCanonicalizesSetAndMapOrder(t *testing.T) {
 	right.Grants.Tables["merchant.admin_account"] = []string{"INSERT", "UPDATE", "SELECT"}
 	left.Forbidden.RoleAttributes = []string{"SUPERUSER", "CREATEDB", "BYPASSRLS", "CREATEROLE"}
 	right.Forbidden.RoleAttributes = []string{"CREATEROLE", "BYPASSRLS", "CREATEDB", "SUPERUSER"}
-	left.RLS["merchant.admin_account"] = RLSRequirement{Enabled: true, Forced: true, RequiredPolicies: []string{"z_policy", "admin_account_tenant_isolation", "a_policy"}}
-	right.RLS["merchant.admin_account"] = RLSRequirement{Enabled: true, Forced: true, RequiredPolicies: []string{"a_policy", "admin_account_tenant_isolation", "z_policy"}}
+	left.RLS["merchant.admin_account"] = RLSRequirement{Enabled: true, Forced: true, ExactPolicies: true, Policies: []RLSPolicyContract{
+		{Name: "z_policy", Command: "SELECT", Mode: "RESTRICTIVE", Roles: []string{"app_zeta", "PUBLIC"}, Using: stringPointer("tenant_id = current_setting('app.tenant_id'::text)")},
+		{Name: "admin_account_tenant_isolation", Command: "ALL", Mode: "PERMISSIVE", Roles: []string{"PUBLIC"}, Using: stringPointer("true"), WithCheck: stringPointer("true")},
+		{Name: "a_policy", Command: "INSERT", Mode: "PERMISSIVE", Roles: []string{"app_alpha", "PUBLIC"}, WithCheck: stringPointer("true")},
+	}}
+	right.RLS["merchant.admin_account"] = RLSRequirement{Enabled: true, Forced: true, ExactPolicies: true, Policies: []RLSPolicyContract{
+		{Name: "a_policy", Command: "INSERT", Mode: "PERMISSIVE", Roles: []string{"PUBLIC", "app_alpha"}, WithCheck: stringPointer("true")},
+		{Name: "admin_account_tenant_isolation", Command: "ALL", Mode: "PERMISSIVE", Roles: []string{"PUBLIC"}, Using: stringPointer("true"), WithCheck: stringPointer("true")},
+		{Name: "z_policy", Command: "SELECT", Mode: "RESTRICTIVE", Roles: []string{"PUBLIC", "app_zeta"}, Using: stringPointer("tenant_id = current_setting('app.tenant_id'::text)")},
+	}}
 
 	leftSQL, err := RenderSQL(*left)
 	if err != nil {
@@ -139,4 +148,8 @@ func TestRenderSQLCanonicalizesSetAndMapOrder(t *testing.T) {
 	if !bytes.Equal(leftSQL, rightSQL) {
 		t.Fatalf("semantic set/map order changed output:\nleft:\n%s\nright:\n%s", leftSQL, rightSQL)
 	}
+}
+
+func stringPointer(value string) *string {
+	return &value
 }
