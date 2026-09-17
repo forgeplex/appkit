@@ -1392,10 +1392,14 @@ schema/table/column/sequence/function 权限。`forbidden.mutations` 是独立�
 reconciliation scope：对象无需同时出现在 `grants.tables`，用于撤销遗留写 ACL；
 同表的 table 或 column `INSERT/UPDATE` 等写授权会在校验阶段被拒绝；
 生成 SQL 也会枚举 relation 的现有列并撤销历史列级 `INSERT/UPDATE` ACL；
-`forbidden.privileges` 会从全部受管表及 mutation 表的 permission role 直接 ACL 撤销。
+`forbidden.privileges` 会从 table grant、column grant 和 mutation 涉及的全部受管表撤销
+permission role 的直接 ACL。不存在的 forbidden membership 会安全跳过，以便不同环境
+收敛；存在时会撤权。`forbidden.roleAttributes` 必须完整声明 `SUPERUSER`、`BYPASSRLS`、
+`CREATEDB`、`CREATEROLE`，生成器据此创建或收紧 permission role；`NOLOGIN` 是 permission
+role 的固定边界。
 继承与 `PUBLIC` 的有效权限仍由后续
 catalog verifier 检查。RLS 条目会生成 `ENABLE/FORCE ROW LEVEL SECURITY`，并在同一
-事务先断言 `requiredPolicies` 已存在，再启用并强制 RLS；policy predicate 仍由版本
+事务先对目标表取得排他锁、断言 `requiredPolicies` 已存在，再启用并强制 RLS；policy predicate 仍由版本
 migration 定义，包含 policy 的 migration 必须排在 access migration 之前。生成文件
 带 `DO NOT EDIT` 标记，不支持拆分或手工改写后绕开该原子顺序。当前
 所有被引用的 schema/table/sequence/function/type/policy 都是前置依赖，必须由编号更小

@@ -50,7 +50,7 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 	if _, err := pool.Exec(ctx, "CREATE ROLE "+ident(permission)+" NOLOGIN INHERIT NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+ident(schema)+"; CREATE TABLE "+ident(schema, "items")+" (id bigint PRIMARY KEY, tenant_id text NOT NULL, value text); CREATE TABLE "+ident(schema, "blocked_items")+" (id bigint PRIMARY KEY); CREATE TABLE "+ident(schema, "missing_items")+" (id bigint PRIMARY KEY, tenant_id text NOT NULL); CREATE POLICY access_test_policy ON "+ident(schema, "items")+" USING (true) WITH CHECK (true); CREATE SEQUENCE "+ident(schema, "item_seq")+"; CREATE FUNCTION "+ident(schema, "echo")+"(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1'; GRANT TRIGGER ON "+ident(schema, "items")+" TO "+ident(permission)+"; GRANT UPDATE, TRIGGER ON "+ident(schema, "blocked_items")+" TO "+ident(permission)+"; GRANT INSERT (id), UPDATE (id) ON "+ident(schema, "blocked_items")+" TO "+ident(permission)); err != nil {
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+ident(schema)+"; CREATE TABLE "+ident(schema, "items")+" (id bigint PRIMARY KEY, tenant_id text NOT NULL, value text); CREATE TABLE "+ident(schema, "column_only_items")+" (id bigint PRIMARY KEY, visible text); CREATE TABLE "+ident(schema, "blocked_items")+" (id bigint PRIMARY KEY); CREATE TABLE "+ident(schema, "missing_items")+" (id bigint PRIMARY KEY, tenant_id text NOT NULL); CREATE POLICY access_test_policy ON "+ident(schema, "items")+" USING (true) WITH CHECK (true); CREATE SEQUENCE "+ident(schema, "item_seq")+"; CREATE FUNCTION "+ident(schema, "echo")+"(text) RETURNS text LANGUAGE sql IMMUTABLE AS 'SELECT $1'; GRANT TRIGGER ON "+ident(schema, "items")+" TO "+ident(permission)+"; GRANT TRIGGER ON "+ident(schema, "column_only_items")+" TO "+ident(permission)+"; GRANT UPDATE, TRIGGER ON "+ident(schema, "blocked_items")+" TO "+ident(permission)+"; GRANT INSERT (id), UPDATE (id) ON "+ident(schema, "blocked_items")+" TO "+ident(permission)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -61,9 +61,11 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 			Login:      Role{Name: login, Attributes: RoleAttributes{Login: true, Inherit: true}},
 			Permission: Role{Name: permission, Managed: true, Attributes: RoleAttributes{Inherit: true}},
 		},
+		Memberships: Memberships{Forbidden: []string{"access_missing_legacy_" + suffix}},
 		Grants: Grants{
 			Schemas:   map[string][]string{schema: {"USAGE"}},
 			Tables:    map[string][]string{schema + ".items": {"SELECT"}},
+			Columns:   []ColumnGrant{{Schema: schema, Table: "column_only_items", Column: "visible", Privileges: []string{"SELECT"}}},
 			Sequences: map[string][]string{schema + ".item_seq": {"USAGE"}},
 			Functions: []FunctionGrant{{Schema: schema, Name: "echo", Arguments: []string{"text"}, Privileges: []string{"EXECUTE"}}},
 		},
@@ -71,8 +73,9 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 			schema + ".items": {Enabled: true, Forced: true, RequiredPolicies: []string{"access_test_policy"}},
 		},
 		Forbidden: Forbidden{
-			Privileges: []string{"TRIGGER"},
-			Mutations:  []string{schema + ".blocked_items"},
+			RoleAttributes: append([]string(nil), mandatoryForbiddenRoleAttributes...),
+			Privileges:     []string{"TRIGGER"},
+			Mutations:      []string{schema + ".blocked_items"},
 		},
 	}
 	sql, err := RenderSQL(m)
@@ -117,7 +120,7 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 	missingDependency := m
 	missingDependency.Grants.Tables = map[string][]string{schema + ".not_created": {"SELECT"}}
 	missingDependency.RLS = nil
-	missingDependency.Forbidden = Forbidden{}
+	missingDependency.Forbidden = Forbidden{RoleAttributes: append([]string(nil), mandatoryForbiddenRoleAttributes...)}
 	dependencySQL, err := RenderSQL(missingDependency)
 	if err != nil {
 		t.Fatal(err)
@@ -140,6 +143,13 @@ func TestRenderSQLExecutesOnPostgres(t *testing.T) {
 	}
 	if !canSelect || canUpdate || canTrigger {
 		t.Fatalf("effective table privileges: select=%t update=%t trigger=%t", canSelect, canUpdate, canTrigger)
+	}
+	var canSelectColumnOnly, canTriggerColumnOnly bool
+	if err := pool.QueryRow(ctx, "SELECT has_column_privilege($1, $2, 'visible', 'SELECT'), has_table_privilege($1, $2, 'TRIGGER')", login, schema+".column_only_items").Scan(&canSelectColumnOnly, &canTriggerColumnOnly); err != nil {
+		t.Fatal(err)
+	}
+	if !canSelectColumnOnly || canTriggerColumnOnly {
+		t.Fatalf("column-only table privileges: select-column=%t trigger=%t", canSelectColumnOnly, canTriggerColumnOnly)
 	}
 	var canUpdateBlocked, canTriggerBlocked bool
 	if err := pool.QueryRow(ctx, "SELECT has_table_privilege($1, $2, 'UPDATE'), has_table_privilege($1, $2, 'TRIGGER')", login, schema+".blocked_items").Scan(&canUpdateBlocked, &canTriggerBlocked); err != nil {
@@ -209,6 +219,7 @@ func TestRenderSQLConcurrentRoleCreation(t *testing.T) {
 			Login:      Role{Name: login, Attributes: RoleAttributes{Login: true, Inherit: true}},
 			Permission: Role{Name: permission, Managed: true, Attributes: RoleAttributes{Inherit: true}},
 		},
+		Forbidden: Forbidden{RoleAttributes: append([]string(nil), mandatoryForbiddenRoleAttributes...)},
 	}
 	sql, err := RenderSQL(m)
 	if err != nil {

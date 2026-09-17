@@ -105,11 +105,18 @@ func LoadFile(path string) (*Manifest, error) {
 	if info.Size() > maxManifestSize {
 		return nil, fmt.Errorf("数据库权限 manifest %s 超过 %d 字节上限", path, maxManifestSize)
 	}
-	return Parse(io.LimitReader(f, maxManifestSize+1))
+	return Parse(f)
 }
 
 func Parse(r io.Reader) (*Manifest, error) {
-	dec := yaml.NewDecoder(r)
+	source, err := io.ReadAll(io.LimitReader(r, maxManifestSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("读取数据库权限 manifest: %w", err)
+	}
+	if len(source) > maxManifestSize {
+		return nil, fmt.Errorf("数据库权限 manifest 超过 %d 字节上限", maxManifestSize)
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(source))
 	dec.KnownFields(true)
 	var m Manifest
 	if err := dec.Decode(&m); err != nil {
@@ -227,7 +234,12 @@ func (m Manifest) Validate() error {
 		}
 		problems = append(problems, validateIdentifiers("rls."+table+".requiredPolicies", required.RequiredPolicies)...)
 	}
-	problems = append(problems, validateEnumList("forbidden.roleAttributes", m.Forbidden.RoleAttributes, roleAttributeNames)...)
+	problems = append(problems, validateEnumList("forbidden.roleAttributes", m.Forbidden.RoleAttributes, mandatoryForbiddenRoleAttributes)...)
+	for _, attribute := range mandatoryForbiddenRoleAttributes {
+		if !slices.Contains(m.Forbidden.RoleAttributes, attribute) {
+			problems = append(problems, fmt.Sprintf("forbidden.roleAttributes 必须包含 %s", attribute))
+		}
+	}
 	problems = append(problems, validateEnumList("forbidden.privileges", m.Forbidden.Privileges, tablePrivileges)...)
 	for object, privileges := range m.Grants.Tables {
 		for _, privilege := range privileges {
@@ -262,15 +274,15 @@ func (m Manifest) Validate() error {
 }
 
 var (
-	schemaPrivileges         = []string{"CREATE", "USAGE"}
-	tablePrivileges          = []string{"DELETE", "INSERT", "REFERENCES", "SELECT", "TRIGGER", "TRUNCATE", "UPDATE"}
-	sequencePrivileges       = []string{"SELECT", "UPDATE", "USAGE"}
-	columnPrivileges         = []string{"INSERT", "REFERENCES", "SELECT", "UPDATE"}
-	columnMutationPrivileges = []string{"INSERT", "UPDATE"}
-	functionPrivileges       = []string{"EXECUTE"}
-	mutationPrivileges       = []string{"DELETE", "INSERT", "TRUNCATE", "UPDATE"}
-	roleAttributeNames       = []string{"BYPASSRLS", "CREATEDB", "CREATEROLE", "LOGIN", "SUPERUSER"}
-	builtinTypeNames         = []string{"bigint", "bit", "bool", "boolean", "box", "bpchar", "bytea", "char", "cidr", "circle", "date", "decimal", "float4", "float8", "inet", "int2", "int4", "int8", "integer", "interval", "json", "jsonb", "line", "lseg", "macaddr", "macaddr8", "money", "name", "numeric", "oid", "path", "point", "polygon", "real", "record", "regclass", "regconfig", "regdictionary", "regnamespace", "regoper", "regoperator", "regproc", "regprocedure", "regrole", "regtype", "smallint", "text", "time", "timestamp", "timestamptz", "timetz", "tsquery", "tsvector", "txid_snapshot", "uuid", "varbit", "varchar", "void", "xml"}
+	schemaPrivileges                 = []string{"CREATE", "USAGE"}
+	tablePrivileges                  = []string{"DELETE", "INSERT", "REFERENCES", "SELECT", "TRIGGER", "TRUNCATE", "UPDATE"}
+	sequencePrivileges               = []string{"SELECT", "UPDATE", "USAGE"}
+	columnPrivileges                 = []string{"INSERT", "REFERENCES", "SELECT", "UPDATE"}
+	columnMutationPrivileges         = []string{"INSERT", "UPDATE"}
+	functionPrivileges               = []string{"EXECUTE"}
+	mutationPrivileges               = []string{"DELETE", "INSERT", "TRUNCATE", "UPDATE"}
+	mandatoryForbiddenRoleAttributes = []string{"BYPASSRLS", "CREATEDB", "CREATEROLE", "SUPERUSER"}
+	builtinTypeNames                 = []string{"bigint", "bit", "bool", "boolean", "box", "bpchar", "bytea", "char", "cidr", "circle", "date", "decimal", "float4", "float8", "inet", "int2", "int4", "int8", "integer", "interval", "json", "jsonb", "line", "lseg", "macaddr", "macaddr8", "money", "name", "numeric", "oid", "path", "point", "polygon", "real", "record", "regclass", "regconfig", "regdictionary", "regnamespace", "regoper", "regoperator", "regproc", "regprocedure", "regrole", "regtype", "smallint", "text", "time", "timestamp", "timestamptz", "timetz", "tsquery", "tsvector", "txid_snapshot", "uuid", "varbit", "varchar", "void", "xml"}
 )
 
 func validateRoleLists(m Memberships, roles Roles) []string {

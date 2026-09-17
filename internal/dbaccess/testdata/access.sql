@@ -8,23 +8,30 @@ DO $appkit$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_admin_api') THEN
         BEGIN
-            CREATE ROLE "app_admin_api" NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE INHERIT;
+            CREATE ROLE "app_admin_api" NOLOGIN NOBYPASSRLS NOCREATEDB NOCREATEROLE NOSUPERUSER INHERIT;
         EXCEPTION
             WHEN duplicate_object OR unique_violation THEN NULL; -- concurrent migration created the same cluster-wide role
         END;
     END IF;
 END
 $appkit$;
-ALTER ROLE "app_admin_api" NOLOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE INHERIT;
+ALTER ROLE "app_admin_api" NOLOGIN NOBYPASSRLS NOCREATEDB NOCREATEROLE NOSUPERUSER INHERIT;
 
 GRANT "app_admin_api" TO "psp_admin_api";
 GRANT "app_admin_channel_test" TO "psp_admin_api";
-REVOKE "app_admin" FROM "psp_admin_api";
+DO $appkit$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_admin') THEN
+        EXECUTE format('REVOKE %I FROM %I', 'app_admin', 'psp_admin_api');
+    END IF;
+END
+$appkit$;
 GRANT USAGE ON SCHEMA "merchant" TO "app_admin_api";
 GRANT INSERT, SELECT, UPDATE ON TABLE "merchant"."admin_account" TO "app_admin_api";
 GRANT SELECT, USAGE ON SEQUENCE "merchant"."admin_account_id_seq" TO "app_admin_api";
 GRANT SELECT ("encrypted_key") ON TABLE "merchant"."admin_account" TO "app_admin_api";
 GRANT EXECUTE ON FUNCTION "merchant"."search_admin_account_keys"("text", "pg_catalog"."uuid") TO "app_admin_api";
+LOCK TABLE "merchant"."admin_account" IN ACCESS EXCLUSIVE MODE;
 DO $appkit$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'merchant' AND tablename = 'admin_account' AND policyname = 'admin_account_tenant_isolation') THEN

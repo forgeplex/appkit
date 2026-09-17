@@ -73,6 +73,13 @@ func TestParseRejectsUnknownSecretAndMultipleDocuments(t *testing.T) {
 	}
 }
 
+func TestParseRejectsOversizeReader(t *testing.T) {
+	source := validManifest + strings.Repeat(" ", maxManifestSize-len(validManifest)+1)
+	if _, err := Parse(strings.NewReader(source)); err == nil || !strings.Contains(err.Error(), "超过 1048576 字节上限") {
+		t.Fatalf("Parse did not enforce reader size limit: %v", err)
+	}
+}
+
 func TestParseRejectsUnsafeDeclarations(t *testing.T) {
 	tests := map[string]string{
 		"managed login":        strings.Replace(validManifest, "managed: false", "managed: true", 1),
@@ -92,6 +99,9 @@ func TestParseRejectsUnsafeDeclarations(t *testing.T) {
 		"unqualified rls":          strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  admin_account:", 1),
 		"overqualified rls":        strings.Replace(validManifest, "rls:\n  merchant.admin_account:", "rls:\n  tenant.merchant.admin_account:", 1),
 		"weak rls":                 strings.Replace(validManifest, "    forced: true", "    forced: false", 1),
+		"missing forbidden role attribute": strings.Replace(validManifest,
+			"roleAttributes: [SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE]",
+			"roleAttributes: [SUPERUSER, BYPASSRLS, CREATEDB]", 1),
 	}
 	for name, source := range tests {
 		t.Run(name, func(t *testing.T) {
