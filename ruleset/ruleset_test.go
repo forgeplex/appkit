@@ -261,6 +261,34 @@ func TestWorkflows_合法YAML(t *testing.T) {
 	}
 }
 
+func TestDomainCI_隔离数据库满足域测试安全契约(t *testing.T) {
+	body, err := os.ReadFile("../.github/workflows/domain-ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(body)
+	for _, required := range []string{
+		"TEST_DATABASE_URL: postgres://postgres:appkit@127.0.0.1:55499/appkit_test?sslmode=disable",
+		"mktemp -d /tmp/webhook-db-test.XXXXXXXX",
+		"WEBHOOK_TEST_DATABASE_URL=postgresql:///appkit_test?host=",
+		"WEBHOOK_TEST_DISPOSABLE=1",
+		"--publish 127.0.0.1:55499:5432",
+		"--tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m",
+		"shared_preload_libraries=pg_stat_statements",
+		"CREATE EXTENSION pg_stat_statements",
+		"if: ${{ always() }}",
+		"unlink -- \"$entry\"",
+		"rmdir -- \"$APPKIT_TEST_DB_ROOT/socket\" \"$APPKIT_TEST_DB_ROOT\"",
+	} {
+		if !strings.Contains(s, required) {
+			t.Errorf("domain-ci.yml 缺少数据库隔离条件 %q", required)
+		}
+	}
+	if strings.Contains(s, "services:\n") {
+		t.Error("domain-ci.yml 不应再依赖无法提供可审计 Unix socket 的共享服务容器")
+	}
+}
+
 func TestWorkflows_供应链引用不可变(t *testing.T) {
 	for _, path := range []string{"../.github/workflows/domain-ci.yml", "../.github/workflows/ci.yml"} {
 		body, err := os.ReadFile(path)
