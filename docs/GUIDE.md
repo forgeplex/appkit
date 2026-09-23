@@ -1812,6 +1812,48 @@ schema 文档使用 `appkit plan schema -allow-temp-db`：临时库执行需显�
 同一契约需要多份实现时使用 `ProvideContractNamed` / `ResolveNamed` / `RemoteNamed`，
 保持实例名与 tenant / partition / merchant 身份分离。
 
+同一类型需要注册多个扩展实现（例如 Provider/Channel Factory）时，使用独立的
+Contribution 集合，而不是将 `ProvideNamed` 当作枚举 API：
+
+```go
+import (
+    "context"
+
+    "github.com/forgeplex/appkit"
+)
+
+type ChannelFactory interface{ Name() string }
+type slackFactory struct{}
+func (slackFactory) Name() string { return "slack" }
+
+type channelModule struct{}
+func (channelModule) Name() string { return "channel" }
+func (channelModule) Register(reg *appkit.Registry) error {
+    appkit.Contribute[ChannelFactory](reg, "slack", func(*appkit.Registry) (ChannelFactory, error) {
+        return slackFactory{}, nil
+    })
+
+    reg.Setup(func(context.Context) error {
+        factories, err := appkit.ResolveContributions[ChannelFactory](reg)
+        if err != nil {
+            return err
+        }
+        for _, contribution := range factories {
+            _ = contribution.Name   // 稳定的组合名称
+            _ = contribution.Module // 声明该实现的 Module
+            _ = contribution.Value
+        }
+        return nil
+    })
+    return nil
+}
+```
+
+`Contribute` 仅能在 `Module.Register` 中声明；同一类型内名称必须唯一，不同类型可复用
+同名。构造器在启动依赖解析阶段 eager 执行一次，只能解析普通 Registry binding；
+`ResolveContributions` 在所有条目构造完成后（例如 `Setup`）返回按名称排序的新切片。
+名称只用于装配和排序，不是 tenant、授权或隔离边界；选择优先级和 fallback 由消费方负责。
+
 完整可执行示例、JSON 协议、退出码和恢复限制见 [AGENT_WORKFLOW.md](AGENT_WORKFLOW.md)。
 
 ## 可选业务引用：refs

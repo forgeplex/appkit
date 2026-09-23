@@ -17,6 +17,9 @@ import (
 type Registry struct {
 	bindings map[bindingKey]*binding
 	remotes  map[bindingKey]*binding
+	// contributions 使用独立于 binding 的 (type, name) 集合命名空间。
+	contributions         map[bindingKey]*binding
+	contributionsResolved bool
 
 	mounts     []mountReg
 	setups     []namedHook
@@ -32,6 +35,8 @@ type Registry struct {
 	permDecls    map[string]permDeclReg
 	permBindings []permBinding
 	registered   bool
+	// registeringModule 仅在 Module.Register 回调执行期间为 true。
+	registeringModule bool
 	// startStages 记录每个模块最近一次 OnStart 的 stage，供 OnStop 定序。
 	startStages map[string]int
 	runtime     *registryRuntime
@@ -119,12 +124,13 @@ type ConsumerReg struct {
 
 func newRegistry() *Registry {
 	return &Registry{
-		bindings:    make(map[bindingKey]*binding),
-		remotes:     make(map[bindingKey]*binding),
-		health:      health.NewRegistry(),
-		startStages: make(map[string]int),
-		runtime:     &registryRuntime{workerErr: make(chan error, 1)},
-		permDecls:   make(map[string]permDeclReg),
+		bindings:      make(map[bindingKey]*binding),
+		remotes:       make(map[bindingKey]*binding),
+		contributions: make(map[bindingKey]*binding),
+		health:        health.NewRegistry(),
+		startStages:   make(map[string]int),
+		runtime:       &registryRuntime{workerErr: make(chan error, 1)},
+		permDecls:     make(map[string]permDeclReg),
 	}
 }
 
@@ -321,8 +327,23 @@ func (r *Registry) cyclePath(key bindingKey) string {
 
 // resolveAll 强制实例化全部本地绑定：缺依赖、循环依赖、构造失败都在启动期暴露。
 func (r *Registry) resolveAll() error {
-	keys := make([]bindingKey, 0, len(r.bindings))
-	for key := range r.bindings {
+	for _, key := range sortedBindingKeys(r.bindings) {
+		if _, err := r.resolve(key); err != nil {
+			return err
+		}
+	}
+	for _, key := range sortedBindingKeys(r.contributions) {
+		if err := r.resolveContribution(key); err != nil {
+			return err
+		}
+	}
+	r.contributionsResolved = true
+	return nil
+}
+
+func sortedBindingKeys(bindings map[bindingKey]*binding) []bindingKey {
+	keys := make([]bindingKey, 0, len(bindings))
+	for key := range bindings {
 		keys = append(keys, key)
 	}
 	sort.Slice(keys, func(i, j int) bool {
@@ -334,11 +355,33 @@ func (r *Registry) resolveAll() error {
 		}
 		return keys[i].name < keys[j].name
 	})
-	for _, key := range keys {
-		if _, err := r.resolve(key); err != nil {
-			return err
-		}
+	return keys
+}
+
+func (r *Registry) resolveContribution(key bindingKey) error {
+	b, ok := r.contributions[key]
+	if !ok {
+		return fmt.Errorf("appkit: Contribution %s 未注册", key)
 	}
+	if b.resolved {
+		return nil
+	}
+	if b.inflight {
+		return fmt.Errorf("appkit: Contribution 依赖循环：%s", r.cyclePath(key))
+	}
+	b.inflight = true
+	r.resolving = append(r.resolving, key)
+	previousModule := r.current
+	r.current = b.module
+	v, err := b.ctor(r)
+	r.current = previousModule
+	r.resolving = r.resolving[:len(r.resolving)-1]
+	b.inflight = false
+	if err != nil {
+		return fmt.Errorf("appkit: 构造 Contribution %s（模块 %q）失败: %w", key, b.module, err)
+	}
+	b.value = v
+	b.resolved = true
 	return nil
 }
 
