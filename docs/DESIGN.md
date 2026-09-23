@@ -393,6 +393,17 @@ contract.yaml 生成同一接口的进程内 wrapper 与 HTTP client，方法体
 漏了 `contract.Call`、两侧 DTO 的 json key 对不上、领域错误在 problem+json 往返后
 换了码——这些都只在真正拆分部署的那天才暴露，除非有一条一致性测试提前把它逼出来。
 
+流式调用使用独立的 `contract.Stream` / `contract.ClientStream` 与 `OpenLocal`，
+不复用 Unary `Call` 的 5 秒 timeout，也不改变上述 Unary 拦截器链。Stream 配置
+必须明确最大时长、Close 等待预算和每方向队列上限；正的 idle timeout 可选。每个
+操作 Context 只取消一次 Send/Recv/CloseSend 等待，根 Context、最大时长、idle timeout 或
+Close 才决定整条 Stream 的终态。Local Handler 的同步 Open 校验失败表示未建连；
+建连后 Handler 错误由 Recv 稳定返回，成功结束为 `io.EOF`，应用终态仍由 DTO 表达。
+`contract/streamtest` 的测试套件接收 Adapter 的 Open 函数与测试 Handler，复用值、
+顺序、背压、取消、错误、EOF、Firewall 与 Close 断言；本地实现由 `OpenLocal` 运行，
+后续 Transport 可在自己的测试服务器上接同一套断言。它不扩展当前 V1 contract
+生成器，也不声称 SSE 是双向流。按 ADR-0047 §8，这组新 API 在明确提升前保持实验性。
+
 跨模块一致性只有两条路：**同步契约调用**（视为可失败、须幂等）或 **outbox 事件**。
 禁止：跨模块共享事务、跨 schema JOIN、传指针。
 
@@ -605,6 +616,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 
 | 规则 | 落点 | 强度 |
 |---|---|---|
+| Stream 不继承 Unary 调用期限与值边界 | `contract.OpenLocal` 显式校验事务、应用 `Firewall`、根最大时长/idle policy 与有界双向队列；`contract/streamtest` 锁定本地行为 | ▲ 运行时 + 测试级；仅 Local Adapter，未覆盖网络 Transport |
 | 同契约的多个实例不误回退到无名绑定 | `ProvideContractNamed` / `ResolveNamed` 精确匹配 `(Go 类型, 实例名)`，共享启动期重复/缺失/循环检查 | ▲ 运行时装配级；名字不是租户隔离或消费方 binding manifest |
 | Agent 不用旧生成结果覆盖已修改的目标 | plan 绑定输入及全部输出的选定文件快照，`apply` 在协作锁内复核；schema 另绑定迁移/产出目录成员 | ▲ 工具运行时级；非整个仓库摘要，外部编辑器不受锁约束 |
 | 多文件生成失败可恢复 | 同文件系统暂存、备份、持久日志、回滚与 exact-plan replay | ▲ 工具运行时级；非外部读者的全局原子可见性，非授权/签名证明 |
