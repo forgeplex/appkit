@@ -1,0 +1,45 @@
+version: 2
+package: fixturev2
+system: greet
+types:
+  - name: EventMeta
+    doc: Additional application event metadata.
+    fields:
+      - {name: source, type: string}
+methods:
+  - name: Ping
+    path: /v2/ping
+    doc: Checks the V2 unary transport.
+    kind: unary
+    idempotent: true
+    request:
+      - {name: name, type: string, required: true}
+    response:
+      - {name: message, type: string}
+  - name: Watch
+    path: /v2/watch
+    doc: Streams ordered application events.
+    kind: server_stream
+    request:
+      - {name: topic, type: string, required: true}
+    response:
+      - {name: event_id, type: string}
+      - {name: event, type: string}
+      - {name: meta, type: EventMeta}
+    cursor_field: event_id
+    terminal_event: feed.completed
+  - name: Tail
+    path: /v2/tail
+    doc: Streams events without an initial request payload.
+    kind: server_stream
+    response:
+      - {name: sequence, type: string, required: true}
+    cursor_field: sequence
+  - name: Chat
+    path: /v2/chat
+    doc: Exchanges bidirectional messages.
+    kind: bidi_stream
+    request:
+      - {name: text, type: string, required: true}
+    response:
+      - {name: text, type: string}
