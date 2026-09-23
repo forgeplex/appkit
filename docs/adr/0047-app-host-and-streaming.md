@@ -1,6 +1,6 @@
 # ADR-0047：应用宿主与流式契约
 
-- 状态：Proposed（Phase 0 决策稿；PR 合并后供后续子 Issue 执行）
+- 状态：Accepted（Phase 0 决策；由 PR [#49](https://github.com/forgeplex/appkit/pull/49) 于 2026-09-23 合并生效）
 - 日期：2026-09-23
 - 关联：[#47 扩展 AppKit 应用宿主与流式契约](https://github.com/forgeplex/appkit/issues/47)、[#48 Phase 0](https://github.com/forgeplex/appkit/issues/48)
 - 基线：`main@7f798494f70d9e30a1035a2f22ce1154381ffd7b`，release `v0.9.5`
@@ -152,7 +152,7 @@ Phase 0 (#48, 本 Issue)
 | 层级 | 结果 |
 |---|---|
 | 源码/本地 | Go 1.26.6 下 `make check`、`make test-lint` 通过；`go test -race . -run '^TestRunStopsOnOSSignal$' -count=3` 通过；根 module DB 集成测试按无 DSN 默认 skip |
-| API 兼容 | 本 PR 仅新增测试与 ADR，未改运行时导出 API；按 CI 固定工具版本本地运行 `apidiff`，相对 `v0.9.5` 无 incompatible；required CI 门禁待 PR 运行 |
+| API 兼容 | 本 PR 仅新增测试与 ADR，未改运行时导出 API；按 CI 固定工具版本本地运行 `apidiff`，相对 `v0.9.5` 无 incompatible；required CI `#35831470225` 通过 |
 | 下游固定提交 | ledger `25b7dea` build PASS / 21 race test pass / 0 fail；notification `cd1a2fa` build PASS / 58 race test pass / 12 PostgreSQL test skip / 0 fail。完整隔离 DB 验收未运行：主机缺 PostgreSQL server binary |
-| CI/PR | 待创建 PR 后记录 exact head、required checks、review、merge 状态 |
+| CI/PR | PR [#49](https://github.com/forgeplex/appkit/pull/49) exact head `fc813fc89d4b3cd1986f8118190225e733100eb8`；required `ci` run `35831470225` 通过（含 race、PostgreSQL 18.6 集成、lint、rules、apidiff）；Wen Review 正式 APPROVED；squash merge commit `08dead92e432d9e76f46e91d08527063bdd03e6a`；#48 已关闭 |
 | 发布/运行时/业务 | Phase 0 不发布、不部署；Wen 运行时和业务验收尚未执行 |
