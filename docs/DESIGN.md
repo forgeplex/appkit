@@ -202,6 +202,17 @@ psp-contracts/
   CI 跑 oasdiff（对 openapi.yaml 判破坏性）与 drift check（生成物未手改）→ tag。
 - HTTP 形态唯一：全方法 POST + JSON body，错误一律 problem+json。
   契约调用是 RPC 语义而非 REST 资源语义，client/server 编解码因此只有一份约定。
+- `version: 1` 永远只表达 Unary；生成物与 OpenAPI 保持逐字节兼容。`version: 2`
+  显式声明 Unary、Server Stream 或 Bidi Stream，Streaming interface 与 V1 `Service`
+  分离，生成至独立 `_v2` 文件。V2 OpenAPI 以 `x-appkit-call-shape` 和
+  `x-appkit-stream` 扩展描述方向、cursor 映射和应用终态元数据；V2 Unary 可生成
+  HTTP client/server，Server Stream 生成 POST + SSE server adapter，Bidi 生成 WSS
+  client/server adapter，并复用 `contract.OpenLocal` 的生命周期与有界队列。WebSocket
+  Upgrade 前遵守分类路由和认证边界，Upgrade 后不刷新凭证；Host 通过受管 Hub 跟踪
+  hijacked socket。AsyncAPI 不作为首期事实源或输出。
+- `contract-check` 对相同 schema version 做保守比较；V2 方法形态、消息字段、
+  requiredness、cursor 映射和 terminal event 变化均参与兼容判定。V1 与 V2 之间
+  不做隐式迁移；新增方法不能静默扩宽已有生成 interface。
 
 ## 4. 业务域 repo（以 ledger 为例，`appkit new domain ledger` 生成）
 
@@ -299,6 +310,9 @@ type Module interface {
 // Registry —— 模块向系统贡献能力（fx value groups 思想，手写实现，无反射魔法）
 func Provide[T any](reg *Registry, ctor func(*Registry) (T, error)) // 注册契约实现（惰性构造）
 func Resolve[T any](reg *Registry) (T, error)                       // 取依赖；启动期缺失 fail-fast、循环依赖报错
+type Contribution[T any] struct { Name, Module string; Value T }
+func Contribute[T any](reg *Registry, name string, ctor func(*Registry) (T, error)) // 注册扩展集合条目
+func ResolveContributions[T any](reg *Registry) ([]Contribution[T], error)           // Setup 中读确定性快照
 func Security(mode SecurityMode) Option                              // HTTP 身份边界模式，Run 必须显式选择
 func Headless() Option                                               // 不启用业务 HTTP；声明路由或 pprof 时启动拒绝
 func DisableMigrations() Option                                       // 未启用迁移 capability 时拒绝有迁移的模块
@@ -321,6 +335,13 @@ func (r *Registry) ManagedService(name string, policy ServicePolicy, factory Man
 实例。ManagedService 的 Host 关停顺序是全体反序 Drain、取消 Service Run Context、
 等待全体 Run 退出、全体反序 Close；普通 `Worker` 与 `ManagedSubscriber` 保持各自现有
 语义，不隐式升级为 ManagedService。
+
+Contribution 使用独立于普通、具名与 Remote binding 的 `(reflect.Type, name)` 集合
+命名空间。同类型同名在 Register 阶段失败，不同类型可同名；启动解析先完成普通
+binding，再按类型身份和 name 稳定 eager 构造每项一次，并记录来源 Module。
+`ResolveContributions[T]` 只在统一解析完成后可用（例如 Setup），返回按 name 排序的新
+切片；构造器只依赖普通 Registry binding，不能读取尚未完成的 Contribution 集合。
+名称只用于组装，不是租户、权限或隔离边界。
 
 新的 `bootstrap.Core` 把进程资源和工作负载入口与旧完整 Profile 分开：
 
@@ -401,8 +422,10 @@ Close 才决定整条 Stream 的终态。Local Handler 的同步 Open 校验失�
 建连后 Handler 错误由 Recv 稳定返回，成功结束为 `io.EOF`，应用终态仍由 DTO 表达。
 `contract/streamtest` 的测试套件接收 Adapter 的 Open 函数与测试 Handler，复用值、
 顺序、背压、取消、错误、EOF、Firewall 与 Close 断言；本地实现由 `OpenLocal` 运行，
-后续 Transport 可在自己的测试服务器上接同一套断言。它不扩展当前 V1 contract
-生成器，也不声称 SSE 是双向流。按 ADR-0047 §8，这组新 API 在明确提升前保持实验性。
+HTTP server adapter `httpserver.NewSSEHandler` 通过 `OpenLocal` 复用这些本地生命周期，
+并额外锁定 POST + SSE wire 行为、flush、deadline、慢写背压、断连与 Host drain。
+该 Adapter 不扩展当前 V1 contract 生成器，也不声称 SSE 是双向流。按 ADR-0047 §8，
+这组新 API 在明确提升前保持实验性。
 
 跨模块一致性只有两条路：**同步契约调用**（视为可失败、须幂等）或 **outbox 事件**。
 禁止：跨模块共享事务、跨 schema JOIN、传指针。
@@ -616,13 +639,14 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 
 | 规则 | 落点 | 强度 |
 |---|---|---|
-| Stream 不继承 Unary 调用期限与值边界 | `contract.OpenLocal` 显式校验事务、应用 `Firewall`、根最大时长/idle policy 与有界双向队列；`contract/streamtest` 锁定本地行为 | ▲ 运行时 + 测试级；仅 Local Adapter，未覆盖网络 Transport |
+| Stream 不继承 Unary 调用期限与值边界 | `contract.OpenLocal` 显式校验事务、应用 `Firewall`、根最大时长/idle policy 与有界双向队列；`contract/streamtest` 锁定 Local 行为；SSE 与 WSS adapter 分别锁定 framing、per-frame deadline、背压、取消、终态、凭证过期及 Host drain | ▲ 运行时 + 本地/HTTP 集成测试；含 Local、SSE 与 WSS 传输测试，不代表 required CI、下游运行、发布或业务验收 |
 | 同契约的多个实例不误回退到无名绑定 | `ProvideContractNamed` / `ResolveNamed` 精确匹配 `(Go 类型, 实例名)`，共享启动期重复/缺失/循环检查 | ▲ 运行时装配级；名字不是租户隔离或消费方 binding manifest |
+| 多实现扩展集合不污染 binding 命名空间 | `Contribute` 使用独立 `(reflect.Type, name)` map；target 过滤后仅对已注册条目 eager 构造一次，保留 Module 并稳定排序；`ResolveContributions` 只读缓存快照 | ▲ Register/启动解析守卫 + 本地测试；不提供授权或租户隔离语义 |
 | Agent 不用旧生成结果覆盖已修改的目标 | plan 绑定输入及全部输出的选定文件快照，`apply` 在协作锁内复核；schema 另绑定迁移/产出目录成员 | ▲ 工具运行时级；非整个仓库摘要，外部编辑器不受锁约束 |
 | 多文件生成失败可恢复 | 同文件系统暂存、备份、持久日志、回滚与 exact-plan replay | ▲ 工具运行时级；非外部读者的全局原子可见性，非授权/签名证明 |
-| 契约生成检查不改工作区 | `gen contract -check` 复用内存 renderer，比对五份产物 | ▲ 本地/CI 级；不等于跨版本语义兼容检查 |
+| 契约生成检查不改工作区 | `gen contract -check` 复用内存 renderer；V1 比对五份产物，V2 比对独立的四份 `_v2` 产物 | ▲ 本地/CI 级；不等于跨版本语义兼容检查 |
 | 复用模块升级不靠肉眼猜测 | `internal/acceptance` 的四个独立 Go module 验证两消费者共享实现、兼容升级与指定编译拒绝；含本地/HTTP 边界断言 | ▲ 测试/CI 级；只证明夹具及断言范围，不是任意业务语义证明 |
-| 契约升级的结构性破坏可提前发现 | `contract-check` 比较 AppKit contract.yaml 模型的方法、字段、类型、路径及重试语义 | ▲ 本地/CI 级；候选模型门禁，不替代通用 OpenAPI、滚动版本或消费方测试 |
+| 契约升级的结构性破坏可提前发现 | `contract-check` 比较 V1 方法/字段/路径/重试语义；V2 另比较调用形态、方向字段、cursor 与终态元数据 | ▲ 本地/CI 级；保守模型门禁，不替代通用 OpenAPI、滚动版本或消费方测试 |
 | Agent 初始化/单文件生成共享同一事实源 | events/errors/wrap 使用捕获字节的纯 renderer；new 的直接生成和计划复用内置模板及 DDL 库函数 | ▲ 工具运行时级；new 只 create，wrap 显式选接口源文件 |
 | Schema 计划不漏掉新增迁移或误清手写文件 | 捕获迁移内容为不可变 fs.FS；v1alpha2 绑定迁移及输出目录成员；只为带生成头的旧文档规划删除 | ▲ 工具运行时级；SQL 在授权的临时库执行而非沙箱，apply 是离线文件变更 |
 | 域 repo 互不依赖、看不到彼此实现 | 独立 module + internal/ + CI 检查 go.mod require 清单 | ★ 编译器级，不可绕过 |

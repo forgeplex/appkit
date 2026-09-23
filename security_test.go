@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/callctx"
@@ -173,19 +174,21 @@ func TestServicePrincipalAudienceIsSnapshot(t *testing.T) {
 
 func TestIdentityBoundaryDropsUnverifiedIdentityAndAllowsVerifiedRebuild(t *testing.T) {
 	var verifierSawUntrusted bool
+	verifiedExpiry := time.Now().Add(time.Hour)
 	verifier := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, hasActor := ActorFrom(r.Context())
 			_, hasService := ServicePrincipalFrom(r.Context())
+			_, hasExpiry := IdentityExpiryFrom(r.Context())
 			m := callctx.From(r.Context())
-			verifierSawUntrusted = hasActor || hasService || m.Partition != "" || m.TenantID != "" || m.Caller != "" ||
+			verifierSawUntrusted = hasActor || hasService || hasExpiry || m.Partition != "" || m.TenantID != "" || m.Caller != "" ||
 				r.Header.Get(callctx.HeaderPartition) != "" ||
 				r.Header.Get(callctx.HeaderTenantID) != "" || r.Header.Get(callctx.HeaderCaller) != "" ||
 				r.Header.Get("X-Merchant-Id") != ""
 
 			m.Partition = "verified-partition"
 			m.TenantID = "verified-tenant"
-			ctx := callctx.With(WithActor(r.Context(), Actor{UserID: "verified-user", TenantID: m.TenantID}), m)
+			ctx := callctx.With(WithIdentityExpiry(WithActor(r.Context(), Actor{UserID: "verified-user", TenantID: m.TenantID}), verifiedExpiry), m)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -193,9 +196,12 @@ func TestIdentityBoundaryDropsUnverifiedIdentityAndAllowsVerifiedRebuild(t *test
 	var gotMeta callctx.Meta
 	var gotActor Actor
 	var gotActorOK bool
+	var gotExpiry time.Time
+	var gotExpiryOK bool
 	target := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMeta = callctx.From(r.Context())
 		gotActor, gotActorOK = ActorFrom(r.Context())
+		gotExpiry, gotExpiryOK = IdentityExpiryFrom(r.Context())
 		w.WriteHeader(http.StatusNoContent)
 	})
 	app := New(nil, Security(SecurityUserFacing), Middleware(verifier))
@@ -211,6 +217,7 @@ func TestIdentityBoundaryDropsUnverifiedIdentityAndAllowsVerifiedRebuild(t *test
 	})
 	ctx = WithActor(ctx, Actor{UserID: "forged-user"})
 	ctx = WithServicePrincipal(ctx, ServicePrincipal{Subject: "forged-service"})
+	ctx = WithIdentityExpiry(ctx, time.Now().Add(24*time.Hour))
 	req = req.WithContext(ctx)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -223,6 +230,9 @@ func TestIdentityBoundaryDropsUnverifiedIdentityAndAllowsVerifiedRebuild(t *test
 	}
 	if !gotActorOK || gotActor.UserID != "verified-user" || gotMeta.Partition != "verified-partition" || gotMeta.TenantID != "verified-tenant" {
 		t.Fatalf("验签中间件应能在边界内重建身份，actor=%+v ok=%v meta=%+v", gotActor, gotActorOK, gotMeta)
+	}
+	if !gotExpiryOK || !gotExpiry.Equal(verifiedExpiry) {
+		t.Fatalf("verified identity expiry should be rebuilt after the boundary: %v (ok=%v)", gotExpiry, gotExpiryOK)
 	}
 	if gotMeta.RequestID != "req-1" || gotMeta.Caller != "" {
 		t.Fatalf("边界应保留 request id、清除 caller，实际 %+v", gotMeta)

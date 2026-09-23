@@ -24,6 +24,8 @@ require (
 	golang.org/x/mod v0.40.0
 )
 
+require github.com/coder/websocket v1.8.15
+
 require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

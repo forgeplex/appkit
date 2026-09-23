@@ -103,7 +103,7 @@ func TestRenderContractSourceDiagnostics(t *testing.T) {
 		want  string
 	}{
 		{"version: [", sourceName + ": 解析 yaml"},
-		{"version: 2\n", sourceName + ": 不支持的 version 2"},
+		{"version: 3\n", sourceName + ": 不支持的 version 3"},
 		{"version: 1\npackage: p\nsystem: s\nmethods:\n  - {name: bad, path: /b, doc: d}\n", sourceName + ":5:"},
 	} {
 		_, err := RenderContractSource(sourceName, []byte(tc.input))

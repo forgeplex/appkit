@@ -48,3 +48,30 @@ func TestContractCheckJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestContractCheckV2JSON(t *testing.T) {
+	base, err := os.ReadFile("../gen/testdata/contract_v2.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	old := filepath.Join(dir, "old-v2.yaml")
+	candidate := filepath.Join(dir, "new-v2.yaml")
+	if err := os.WriteFile(old, base, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next := []byte(strings.Replace(string(base), "cursor_field: event_id", "cursor_field: event", 1))
+	if err := os.WriteFile(candidate, next, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, diagnostics bytes.Buffer
+	err = contractCheck([]string{"-base", old, "-candidate", candidate}, &out, &diagnostics)
+	var result agentResult
+	if jsonErr := json.Unmarshal(out.Bytes(), &result); jsonErr != nil {
+		t.Fatal(jsonErr)
+	}
+	var exit *agentExit
+	if !errors.As(err, &exit) || exit.code != 3 || result.OK || result.Command != "contract-check" || result.Error == nil || result.Error.Code != "contract_incompatible" || !strings.Contains(out.String(), "cursor_mapping_changed") || diagnostics.Len() != 0 {
+		t.Fatalf("wrong V2 result: %s %v", out.String(), err)
+	}
+}

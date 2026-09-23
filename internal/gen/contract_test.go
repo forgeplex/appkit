@@ -31,7 +31,7 @@ func TestContractInvalid(t *testing.T) {
 		yaml    string
 		wantErr string
 	}{
-		{"版本不支持", "version: 2\npackage: p\nsystem: s\nmethods: [{name: M, path: /m, doc: d}]", "version 2"},
+		{"版本不支持", "version: 3\npackage: p\nsystem: s\nmethods: [{name: M, path: /m, doc: d}]", "version 3"},
 		{"包名非法", "version: 1\npackage: LedgerV1\nsystem: s\nmethods: [{name: M, path: /m, doc: d}]", "package"},
 		{"system 非法", "version: 1\npackage: p\nsystem: Ledger\nmethods: [{name: M, path: /m, doc: d}]", "system"},
 		{"methods 为空", "version: 1\npackage: p\nsystem: s\nmethods: []", "methods 为空"},

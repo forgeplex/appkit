@@ -591,6 +591,60 @@ appkit gen contract -in identityv1/contract.yaml -dir identityv1
 （DESIGN §5.3）。`idempotent: true` 的方法，生成 client 会对可用性故障做
 有界重试；`doc` 必填——契约是给别的团队读的。
 
+### Streaming Contract v2
+
+V1 永远表示 Unary。需要描述流时使用 `version: 2`，每个方法必须显式声明
+`kind: unary|server_stream|bidi_stream`。Streaming 接口单独生成为
+`StreamingServiceV2`，不会向 V1 `Service` 增加方法。V2 产物使用独立文件名，
+可与同包中的 V1 生成物并存：
+
+```yaml
+version: 2
+package: feedv2
+system: feed
+methods:
+  - name: Watch
+    path: /v2/watch
+    doc: 按顺序返回更新。
+    kind: server_stream
+    request:
+      - {name: topic, type: string, required: true}
+    response:
+      - {name: event_id, type: string}
+      - {name: payload, type: string}
+    cursor_field: event_id
+    terminal_event: feed.completed
+  - name: Chat
+    path: /v2/chat
+    doc: 双向传送消息。
+    kind: bidi_stream
+    request:
+      - {name: text, type: string, required: true}
+    response:
+      - {name: text, type: string}
+```
+
+`server_stream` 的 `request` 是一次性命令，`response` 是事件 DTO；若无 `request`
+字段，SSE 的 POST body 仍须发送 `{}`，而 Local opener 不带请求参数。`bidi_stream`
+的 `request/response` 分别是客户端与服务端消息。`cursor_field` 只能引用
+`response` 中的 string 字段，生成的 SSE adapter 会把它作为 opaque SSE `id`；
+`terminal_event` 是应用拥有的稳定终态标识，框架不解释它，但兼容检查会拒绝修改。
+Stream 方法不能声明 `idempotent`，框架不会自动重试流。
+
+```sh
+appkit gen contract -in feedv2/contract.yaml -dir feedv2
+appkit gen contract -check -in feedv2/contract.yaml -dir feedv2
+appkit contract-check -base feedv2/contract.yaml -candidate feedv2-next/contract.yaml
+```
+
+V2 会生成 `service_v2.gen.go`、`client_v2.gen.go`、`server_v2.gen.go` 和
+`openapi_v2.yaml`。V2 Unary 有独立的 `ServiceV2`、HTTP client/server 与
+`WrapServiceV2`；Server Stream 生成 Local opener 和 `New<Method>SSEHandlerV2`；
+Bidi 生成 transport-neutral 接口、Local opener、`New<Method>WebSocketHandlerV2`
+和 `Dial<Method>WebSocketV2`。OpenAPI 用 `x-appkit-call-shape` /
+`x-appkit-stream` 扩展表达流形态；不生成 AsyncAPI。V1 五份生成文件与 OpenAPI
+保持逐字节稳定，V1 schema 也拒绝 V2 流形态字段。
+
 ### Local 双向 Stream
 
 `contract.OpenLocal` 是独立于 Unary `contract.Call` 的双向流入口；它不继承
@@ -653,6 +707,147 @@ func streamGreeting(ctx context.Context) (retErr error) {
 `contract.Call` 的 timeout 是协作式的：deadline 会传给实现，已经启动的同步
 实现若忽略 ctx 仍可能迟到返回，框架不会强杀 goroutine。涉及写入时，超时后的
 结果应按成功或未知结果处理，并用幂等键、查询或对账确认。
+
+### 远程双向 Stream：WSS
+
+V2 Bidi 的远程 Transport 使用 `httpserver` 子包；公开类型不会进入根包。
+服务器必须把 `WebSocketHub` 注册为 Host `ManagedService`，这样 Host 才能停止
+新连接、发送 GoingAway 并在关停预算耗尽时关闭 hijacked socket：
+
+```go
+hub := httpserver.NewWebSocketHub()
+if err := reg.ManagedService("websocket-hub", appkit.ServiceCritical,
+    func(*appkit.Registry) (appkit.ManagedService, error) { return hub, nil }); err != nil {
+    return err
+}
+
+handler, err := chatv2.NewChatWebSocketHandlerV2(httpserver.WebSocketConfig{
+    Stream: contract.StreamConfig{
+        MaxDuration: 10 * time.Minute, IdleTimeout: time.Minute,
+        CloseTimeout: 5 * time.Second, QueueSize: 16,
+    },
+    MaxMessageBytes: 1 << 20, HandshakeTimeout: 5 * time.Second,
+    WriteTimeout: 10 * time.Second,
+    OriginPatterns: []string{"https://console.example.test"},
+    Hub: hub,
+}, chatService)
+if err != nil { return err }
+reg.MountAuthenticated("GET /v2/chat", handler)
+```
+
+按具体授权模型选择 `MountAuthenticated`、`MountPermission` 或
+`MountInternalService`；认证和路由分类在 Upgrade 前执行。生成 Handler 默认从
+已验签的 Actor / ServicePrincipal 重建身份，可通过 `IdentityResolver` 适配自定义
+认证器。它不从 query、URL 参数或消息帧读取身份。跨 Origin 浏览器只允许显式
+配置的 Origin pattern；缺少 Origin 的非浏览器客户端仍必须经过认证路由。
+同源判断同时比较 scheme 与 host。若 TLS 在反向代理终止、appkit 收到的是明文
+HTTP，请显式配置浏览器外部 Origin 的完整 scheme（例如 `https://console.example.test`）；
+appkit 不信任任意 `X-Forwarded-Proto` 来推断外部 scheme。
+认证主体保留在连接根 Context 中用于连接安全与到期管理；进入 Streaming Contract
+实现时仍经过 `contract.OpenLocal` 的 Context Firewall，因此 Actor、ServicePrincipal
+和任意 Context value 不会越过契约边界，只有 trace、deadline/cancellation 与白名单
+`callctx.Meta` 会传递。不要把连接认证误当成跨模块身份委托。
+
+服务客户端只接受 WSS，并通过现有 secure credential provider 在握手时获取一次
+短期服务凭证：
+
+```go
+stream, err := chatv2.DialChatWebSocketV2(ctx, "wss://chat.example.test/v2/chat",
+    httpserver.WebSocketConfig{
+        Stream: contract.StreamConfig{
+            MaxDuration: 10 * time.Minute, IdleTimeout: time.Minute,
+            CloseTimeout: 5 * time.Second, QueueSize: 16,
+        },
+        MaxMessageBytes: 1 << 20, HandshakeTimeout: 5 * time.Second,
+        WriteTimeout: 10 * time.Second,
+    },
+    contract.SecureClientOptions{Audience: "chat-service", Credentials: credentialProvider},
+)
+if err != nil { return err }
+defer stream.Close()
+```
+
+凭证过期后不刷新；客户端或服务端已提供的 expiry 到期即停止应用帧收发并结束
+连接。协议使用 `appkit.contract.bidi.v1` 子协议和 JSON text frame：`data` 携带
+契约 DTO，客户端以 `half_close` 结束发送方向，服务端以 `end` 或仅含稳定错误码的
+`error` 终结；Upgrade 前错误仍是 `application/problem+json`。队列按 Stream 的帧数
+容量和单帧字节上限共同约束，满队列会阻塞适配器而不是丢帧。该 Transport 不提供
+自动重连、cursor/replay、Session 或业务终态；调用方仍负责这些领域语义。
+
+### HTTP Server Streaming：POST + SSE
+
+`httpserver.NewSSEHandler` 把一次 JSON `POST` 和同一个响应中的 SSE 输出接到
+`contract.OpenLocal`。它面向 `fetch` 等普通 HTTP 客户端，不兼容浏览器原生
+`EventSource`，也不创建第二阶段的 GET 资源。请求体必须恰好包含一个 JSON 值，
+大小受 `MaxRequestBodyBytes` 限制；输出按序列化后的 JSON 写入 `data` frame。
+
+```go
+import (
+    "context"
+    "time"
+
+    "github.com/forgeplex/appkit"
+    "github.com/forgeplex/appkit/contract"
+    "github.com/forgeplex/appkit/httpserver"
+)
+
+type StreamRequest struct{ Prompt string }
+type StreamEvent struct{ Text string }
+
+func registerEventRoute(reg *appkit.Registry) error {
+    streamHandler, err := httpserver.NewSSEHandler[StreamRequest, StreamEvent](
+        httpserver.SSEConfig{
+            System: "assistant",
+            Method: "Generate",
+            Stream: contract.StreamConfig{
+                MaxDuration:  2 * time.Minute,
+                IdleTimeout:  30 * time.Second,
+                CloseTimeout: 3 * time.Second,
+                QueueSize:    16,
+            },
+            MaxRequestBodyBytes: 1 << 20,
+            WriteTimeout:        10 * time.Second,
+            HeartbeatInterval:   15 * time.Second,
+        },
+        func(ctx context.Context, cursor string, peer contract.Stream[httpserver.SSEEvent[StreamEvent], StreamRequest]) error {
+            request, err := peer.Recv(ctx)
+            if err != nil {
+                return err
+            }
+            // cursor 是原样透传的 Last-Event-ID；重放和 cursor 语义由应用实现。
+            _ = cursor
+            return peer.Send(ctx, httpserver.SSEEvent[StreamEvent]{
+                ID:   "application-cursor-1",
+                Data: StreamEvent{Text: request.Prompt},
+            })
+        },
+    )
+    if err != nil {
+        return err
+    }
+
+    // 在 AppKit Module 的 Register/Setup 中使用分类路由；不要用裸 Mount。
+    reg.MountAuthenticated("/events", streamHandler)
+    return nil
+}
+```
+
+路由仍经过 AppKit 的 identity boundary 与认证/权限守卫。`Last-Event-ID` 不由框架
+解释、保存或 replay，事件 ID 也必须由应用提供。首个 SSE frame 提交前的错误仍是
+`problem+json`；提交后只发送固定 `error` 事件，JSON data 仅含稳定错误码，不含
+message、cause 或身份信息。正常 `io.EOF` 关闭响应，不生成错误事件；业务完成状态
+应由应用 DTO 表达。
+
+若要让错误方法也由 Adapter 返回结构化 `problem+json`，路由 pattern 使用路径形式
+（如 `"/events"`），而不是 `"POST /events"`；后者会由 `http.ServeMux` 在进入
+Adapter 前直接拒绝。
+
+`Stream.QueueSize` 限制流内的有界事件队列，HTTP 写入受背压；单个 DTO 的尺寸仍应由
+应用控制。`WriteTimeout` 是每个 frame 的写入预算，不改变普通 HTTP Server 的默认
+60 秒超时。heartbeat 是不影响应用 idle 计时的 SSE 注释。响应会附加
+`X-Accel-Buffering: no`，但部署时仍需检查每一层代理/网关是否缓冲并配置其 flush
+策略。客户端断开会取消生产 Context；Host Shutdown 先 drain 在途请求，到达预算后
+强制关闭。可运行的 API 形态示例见 `httpserver/sse_example_test.go`。
 
 然后：
 
@@ -1616,6 +1811,48 @@ schema 文档使用 `appkit plan schema -allow-temp-db`：临时库执行需显�
 真实跨项目复用/升级与 PostgreSQL 验收入口见 [FRAMEWORK_ACCEPTANCE.md](FRAMEWORK_ACCEPTANCE.md)。
 同一契约需要多份实现时使用 `ProvideContractNamed` / `ResolveNamed` / `RemoteNamed`，
 保持实例名与 tenant / partition / merchant 身份分离。
+
+同一类型需要注册多个扩展实现（例如 Provider/Channel Factory）时，使用独立的
+Contribution 集合，而不是将 `ProvideNamed` 当作枚举 API：
+
+```go
+import (
+    "context"
+
+    "github.com/forgeplex/appkit"
+)
+
+type ChannelFactory interface{ Name() string }
+type slackFactory struct{}
+func (slackFactory) Name() string { return "slack" }
+
+type channelModule struct{}
+func (channelModule) Name() string { return "channel" }
+func (channelModule) Register(reg *appkit.Registry) error {
+    appkit.Contribute[ChannelFactory](reg, "slack", func(*appkit.Registry) (ChannelFactory, error) {
+        return slackFactory{}, nil
+    })
+
+    reg.Setup(func(context.Context) error {
+        factories, err := appkit.ResolveContributions[ChannelFactory](reg)
+        if err != nil {
+            return err
+        }
+        for _, contribution := range factories {
+            _ = contribution.Name   // 稳定的组合名称
+            _ = contribution.Module // 声明该实现的 Module
+            _ = contribution.Value
+        }
+        return nil
+    })
+    return nil
+}
+```
+
+`Contribute` 仅能在 `Module.Register` 中声明；同一类型内名称必须唯一，不同类型可复用
+同名。构造器在启动依赖解析阶段 eager 执行一次，只能解析普通 Registry binding；
+`ResolveContributions` 在所有条目构造完成后（例如 `Setup`）返回按名称排序的新切片。
+名称只用于装配和排序，不是 tenant、授权或隔离边界；选择优先级和 fallback 由消费方负责。
 
 完整可执行示例、JSON 协议、退出码和恢复限制见 [AGENT_WORKFLOW.md](AGENT_WORKFLOW.md)。
 
