@@ -310,6 +310,9 @@ type Module interface {
 // Registry —— 模块向系统贡献能力（fx value groups 思想，手写实现，无反射魔法）
 func Provide[T any](reg *Registry, ctor func(*Registry) (T, error)) // 注册契约实现（惰性构造）
 func Resolve[T any](reg *Registry) (T, error)                       // 取依赖；启动期缺失 fail-fast、循环依赖报错
+type Contribution[T any] struct { Name, Module string; Value T }
+func Contribute[T any](reg *Registry, name string, ctor func(*Registry) (T, error)) // 注册扩展集合条目
+func ResolveContributions[T any](reg *Registry) ([]Contribution[T], error)           // Setup 中读确定性快照
 func Security(mode SecurityMode) Option                              // HTTP 身份边界模式，Run 必须显式选择
 func Headless() Option                                               // 不启用业务 HTTP；声明路由或 pprof 时启动拒绝
 func DisableMigrations() Option                                       // 未启用迁移 capability 时拒绝有迁移的模块
@@ -332,6 +335,13 @@ func (r *Registry) ManagedService(name string, policy ServicePolicy, factory Man
 实例。ManagedService 的 Host 关停顺序是全体反序 Drain、取消 Service Run Context、
 等待全体 Run 退出、全体反序 Close；普通 `Worker` 与 `ManagedSubscriber` 保持各自现有
 语义，不隐式升级为 ManagedService。
+
+Contribution 使用独立于普通、具名与 Remote binding 的 `(reflect.Type, name)` 集合
+命名空间。同类型同名在 Register 阶段失败，不同类型可同名；启动解析先完成普通
+binding，再按类型身份和 name 稳定 eager 构造每项一次，并记录来源 Module。
+`ResolveContributions[T]` 只在统一解析完成后可用（例如 Setup），返回按 name 排序的新
+切片；构造器只依赖普通 Registry binding，不能读取尚未完成的 Contribution 集合。
+名称只用于组装，不是租户、权限或隔离边界。
 
 新的 `bootstrap.Core` 把进程资源和工作负载入口与旧完整 Profile 分开：
 
@@ -631,6 +641,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 |---|---|---|
 | Stream 不继承 Unary 调用期限与值边界 | `contract.OpenLocal` 显式校验事务、应用 `Firewall`、根最大时长/idle policy 与有界双向队列；`contract/streamtest` 锁定 Local 行为；SSE 与 WSS adapter 分别锁定 framing、per-frame deadline、背压、取消、终态、凭证过期及 Host drain | ▲ 运行时 + 本地/HTTP 集成测试；含 Local、SSE 与 WSS 传输测试，不代表 required CI、下游运行、发布或业务验收 |
 | 同契约的多个实例不误回退到无名绑定 | `ProvideContractNamed` / `ResolveNamed` 精确匹配 `(Go 类型, 实例名)`，共享启动期重复/缺失/循环检查 | ▲ 运行时装配级；名字不是租户隔离或消费方 binding manifest |
+| 多实现扩展集合不污染 binding 命名空间 | `Contribute` 使用独立 `(reflect.Type, name)` map；target 过滤后仅对已注册条目 eager 构造一次，保留 Module 并稳定排序；`ResolveContributions` 只读缓存快照 | ▲ Register/启动解析守卫 + 本地测试；不提供授权或租户隔离语义 |
 | Agent 不用旧生成结果覆盖已修改的目标 | plan 绑定输入及全部输出的选定文件快照，`apply` 在协作锁内复核；schema 另绑定迁移/产出目录成员 | ▲ 工具运行时级；非整个仓库摘要，外部编辑器不受锁约束 |
 | 多文件生成失败可恢复 | 同文件系统暂存、备份、持久日志、回滚与 exact-plan replay | ▲ 工具运行时级；非外部读者的全局原子可见性，非授权/签名证明 |
 | 契约生成检查不改工作区 | `gen contract -check` 复用内存 renderer；V1 比对五份产物，V2 比对独立的四份 `_v2` 产物 | ▲ 本地/CI 级；不等于跨版本语义兼容检查 |
