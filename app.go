@@ -20,19 +20,21 @@ type App struct {
 }
 
 type appConfig struct {
-	target          string
-	httpAddr        string
-	middleware      []func(http.Handler) http.Handler
-	securityMode    SecurityMode
-	logger          *slog.Logger
-	shutdownTimeout time.Duration
-	drainDelay      time.Duration
-	remotes         []func(*Registry) error
-	migrator        func(ctx context.Context, sets []MigrationSet) error
-	skipMigrations  bool
-	bus             Subscriber
-	httpServerOpts  []func(*http.Server)
-	pprof           bool
+	target            string
+	httpAddr          string
+	httpEnabled       bool
+	middleware        []func(http.Handler) http.Handler
+	securityMode      SecurityMode
+	logger            *slog.Logger
+	shutdownTimeout   time.Duration
+	drainDelay        time.Duration
+	remotes           []func(*Registry) error
+	migrator          func(ctx context.Context, sets []MigrationSet) error
+	skipMigrations    bool
+	disableMigrations bool
+	bus               Subscriber
+	httpServerOpts    []func(*http.Server)
+	pprof             bool
 }
 
 // Option 配置 App。
@@ -47,6 +49,13 @@ func Target(t string) Option {
 // 即使 target 内没有任何模块路由（worker 角色也需要探针）。
 func HTTPAddr(addr string) Option {
 	return func(c *appConfig) { c.httpAddr = addr }
+}
+
+// Headless 禁用 appkit 业务 HTTP Listener。若模块注册了 HTTP 路由或启用 pprof，
+// 启动会 fail-fast，不会静默丢弃；就绪状态仍可通过 RunningApp.Readiness 在进程内
+// 查询，或由独立 Probe Service 暴露。App.Run 仍拥有进程信号，App.Start 仍用于嵌入式调用。
+func Headless() Option {
+	return func(c *appConfig) { c.httpEnabled = false }
 }
 
 // Middleware 设置根 HTTP 中间件链（外层在前）。通常传 httpserver.Base(...)。
@@ -125,12 +134,19 @@ func SkipMigrations() Option {
 	return func(c *appConfig) { c.skipMigrations = true }
 }
 
+// DisableMigrations 表示当前 Profile 未提供迁移能力；若启用模块声明迁移，
+// 启动会失败，而不会静默应用或跳过迁移。适用于未提供数据库的组合 Profile。
+func DisableMigrations() Option {
+	return func(c *appConfig) { c.disableMigrations = true }
+}
+
 // New 构造 App。modules 全集在此声明，实际启用集由 Target 决定。
 // 会调用 Run 的 App 必须通过 Security 显式选择 HTTP 安全模式；Migrate 不需要。
 func New(modules []Module, opts ...Option) *App {
 	cfg := appConfig{
 		target:          "all",
 		httpAddr:        ":8080",
+		httpEnabled:     true,
 		shutdownTimeout: 20 * time.Second,
 	}
 	for _, o := range opts {

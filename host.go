@@ -142,6 +142,19 @@ func (h *RunningApp) Wait() error {
 	return h.err
 }
 
+// Readiness 在进程内执行 App 的就绪检查，不要求开启 HTTP Listener。空结果表示
+// Host 就绪；关停开始后会包含框架 not-ready 检查项。返回错误仅供进程内受信代码
+// 使用，不应复制到未认证的探针响应中。
+func (h *RunningApp) Readiness(ctx context.Context) (map[string]error, error) {
+	if h == nil || h.app == nil {
+		return nil, apperr.InvalidArgument("RunningApp 不能为空")
+	}
+	if ctx == nil {
+		return nil, apperr.InvalidArgument("Readiness Context 不能为空")
+	}
+	return h.app.reg.health.Ready(ctx), nil
+}
+
 // Shutdown 请求 Host 优雅关停并等待完成。ctx 同时限制本次关停预算；预算
 // 耗尽时返回 ctx.Err，Host 仍会继续执行剩余清理并走强制关闭路径。
 func (h *RunningApp) Shutdown(ctx context.Context) error {

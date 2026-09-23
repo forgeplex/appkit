@@ -17,6 +17,7 @@ forgeplex 的 Go 后端运行时框架：任何业务域拿来即用；用工具
 | `appkit`（根） | 运行时核心：`Module` / `Registry` / `Provide` / `Resolve` / `App.Run` / `App.Start`，只依赖标准库 |
 | `contract` | 跨模块契约调用边界：事务守卫、ctx 防火墙、超时、错误规范化 |
 | `config` | koanf 分层配置（file→env）+ 强类型校验，启动 fail-fast |
+| `bootstrap` | 保留现有完整 HTTP/PostgreSQL/Bus 入口；新 `Core` 可组合 Headless、Probe-only、One-shot、Embedded 与进程 Runner |
 | `apperr` | 统一错误形态：错误身份 = 错误码，RFC 9457 problem+json |
 | `health` | liveness/readiness 探针注册表 |
 | `telemetry` | slog + OpenTelemetry 三信号统一初始化 |
@@ -61,6 +62,9 @@ go run github.com/forgeplex/appkit/cmd/appkit help
 
 可选引用见 [examples/refsorder](examples/refsorder)：同一个订单类型表达 PSP 四个引用与无 merchant 的门店订单，
 `go run ./examples/refsorder` 无需数据库即可运行；真实业务归属与存储仍由域实现。
+
+工作负载 Profile、Probe Listener 安全边界和 Signal 所有权见
+[docs/GUIDE.md §6](docs/GUIDE.md#bootstrap-core-与工作负载-profile)。
 
 ## 测试
 
