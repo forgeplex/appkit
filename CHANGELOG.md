@@ -2,6 +2,73 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.9.5（2026-09-17）
+
+v0.9.5 — declarative database access manifests
+
+This patch adds an opt-in, fail-closed workflow for declaring and reviewing
+PostgreSQL service-role access without changing existing application APIs or
+automatically modifying downstream databases.
+
+- Add a strict `db/access.yaml` contract for login and permission roles,
+  memberships, schema/table/column/sequence/function grants, forbidden role
+  attributes, forbidden privileges, and forbidden table mutations.
+- Add `appkit db-access validate`, `render`, and `check` commands. Rendering is
+  deterministic and produces an append-only migration; checking detects byte
+  drift between the manifest and the generated artifact.
+- Reconcile permission roles and negative ACLs, including historical column
+  privileges, while keeping login-role credentials and secrets outside the
+  manifest.
+- Require exact RLS policy contracts. Generated migrations lock each managed
+  table and reject missing, unexpected, or definition-drifted policies before
+  enabling and forcing row-level security; policy DDL remains in an earlier
+  schema migration.
+- Publish generated migration files through an anchored directory descriptor
+  on Darwin/Linux, rejecting symlink and directory-replacement races, existing
+  output files, partial writes, and unsupported safe `-out` platforms.
+- Cover deterministic generation, validation failures, concurrent publication,
+  role creation, ACL reconciliation, RLS rollback, dependency ordering, and
+  exact policy conflicts, including race-enabled tests against disposable
+  PostgreSQL.
+
+The merged implementation passed Go 1.26 formatting, vet, build and unit tests,
+lint-module tests, materialized rules, the public API compatibility gate, and
+real PostgreSQL integration tests. No production or development database was
+changed by this release. Downstream repositories adopt the feature explicitly
+by authoring a reviewed manifest, generating a new migration, and validating
+the resulting catalog and low-privilege behavior before deployment.
+
+## v0.9.4（2026-09-16）
+
+v0.9.4 — harden transaction, idempotency, and relay boundaries
+
+This patch closes correctness gaps at the transaction, Inbox, HTTP idempotency,
+cleanup, and audit relay boundaries while preserving the v0.9.3 public API
+compatibility contract.
+
+- Route Inbox handling through pgtx.Transactor.Do so Inbox and service writes
+  share one transaction, with same-scope nested calls using savepoints. Add
+  explicit tenant, routed, and routed+tenant coverage; routed Inbox requires an
+  empty schema and uses the transaction search_path.
+- Make oversized or failed HTTP idempotency responses terminal `executed`
+  results. They return a stable 409 with
+  `IDEMPOTENCY_RESULT_UNAVAILABLE`, never replay a truncated body, and never
+  re-execute the handler.
+- Fence audit relay claim completion, retry, dead-letter, and release updates
+  with a per-claim token so a previous lease owner cannot mutate a takeover.
+- Give database rollback and other cleanup operations cancellation isolation
+  with a bounded five-second deadline.
+- Add forward-only outbox and idempotency upgrade SQL, update scaffold output,
+  and document migration ordering and cooperative contract.Call timeouts.
+- Make CI prefetch the complete Go module graph before offline scaffold checks,
+  avoiding dependence on an incidental runner cache.
+
+Validation passed in CI on the merged implementation: Go 1.26 formatting,
+vet, build, race tests with disposable PostgreSQL, lint, materialized rules,
+and the v0.9.3 API compatibility gate. Existing domains must apply the new
+forward migrations before using the new relay/idempotency paths; no production
+or development database migration is included in this tag.
+
 ## v0.9.3（2026-09-06）
 
 v0.9.3 — optional sqlc schema snapshots and nested transaction isolation

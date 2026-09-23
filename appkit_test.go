@@ -531,7 +531,7 @@ func TestRunConsumesServerError(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("启动超时")
 	}
-	app.serverErr <- errors.New("accept 循环崩溃")
+	app.runtime.serverErr <- errors.New("accept 循环崩溃")
 	select {
 	case err := <-runDone:
 		if err == nil || !strings.Contains(err.Error(), "HTTP 服务异常退出") ||

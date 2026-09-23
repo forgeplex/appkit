@@ -63,7 +63,7 @@ func (r *Registry) worker(name string, run func(ctx context.Context) error) *wor
 // 第一个死掉的 worker 决定关停原因，后续的由 OnStop 汇总）。
 func (r *Registry) reportWorkerExit(name string, err error) {
 	select {
-	case r.workerErr <- fmt.Errorf("appkit: worker %q 异常退出: %w", name, err):
+	case r.runtime.workerErr <- fmt.Errorf("appkit: worker %q 异常退出: %w", name, err):
 	default:
 	}
 }

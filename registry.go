@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/health"
 )
 
@@ -33,8 +34,7 @@ type Registry struct {
 	registered   bool
 	// startStages 记录每个模块最近一次 OnStart 的 stage，供 OnStop 定序。
 	startStages map[string]int
-	// workerErr 承接 Worker 的异常退出，带缓冲避免写侧阻塞。
-	workerErr chan error
+	runtime     *registryRuntime
 
 	// current 是正在 Register/Setup 的模块名，用于归属与报错。
 	current string
@@ -90,6 +90,18 @@ type stopHook struct {
 	module string
 }
 
+type serviceReg struct {
+	name    string
+	module  string
+	policy  ServicePolicy
+	factory ManagedServiceFactory
+}
+
+type registryRuntime struct {
+	workerErr chan error
+	services  []serviceReg
+}
+
 // MigrationSet 是一个模块声明的数据库迁移：fsys 中的 *.sql 按文件名序应用，
 // 且只允许操作 schema 名下的对象（appkit check 校验）。
 type MigrationSet struct {
@@ -111,7 +123,7 @@ func newRegistry() *Registry {
 		remotes:     make(map[bindingKey]*binding),
 		health:      health.NewRegistry(),
 		startStages: make(map[string]int),
-		workerErr:   make(chan error, 1),
+		runtime:     &registryRuntime{workerErr: make(chan error, 1)},
 		permDecls:   make(map[string]permDeclReg),
 	}
 }
@@ -171,6 +183,34 @@ func (r *Registry) OnStop(fn HookFunc) {
 		stage = StageWorker
 	}
 	r.stops = append(r.stops, stopHook{stage: stage, seq: len(r.stops), fn: fn, module: r.current})
+}
+
+// ManagedService 声明一个由 Host 托管的服务。factory 在常规依赖解析与 Setup
+// 后调用；ServiceCritical 是默认策略，提前退出会令 Host 关停。仅可在 Register
+// 阶段声明；name 在同一模块内必须唯一。
+func (r *Registry) ManagedService(name string, policy ServicePolicy, factory ManagedServiceFactory) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return apperr.InvalidArgument("ManagedService name 不能为空")
+	}
+	if factory == nil {
+		return apperr.InvalidArgument("ManagedService %q factory 不能为空", name)
+	}
+	if policy != ServiceCritical && policy != ServiceOptional {
+		return apperr.InvalidArgument("ManagedService %q policy 无效: %d", name, policy)
+	}
+	if r.registered {
+		return apperr.Conflict("ManagedService %q 只能在 Register 阶段声明", name)
+	}
+	for _, existing := range r.runtime.services {
+		if existing.module == r.current && existing.name == name {
+			return apperr.Conflict("模块 %q 重复声明 ManagedService %q", r.current, name)
+		}
+	}
+	r.runtime.services = append(r.runtime.services, serviceReg{
+		name: name, module: r.current, policy: policy, factory: factory,
+	})
+	return nil
 }
 
 // HealthRegistry 暴露给框架内部（httpserver 装配）使用。
