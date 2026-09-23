@@ -654,6 +654,81 @@ func streamGreeting(ctx context.Context) (retErr error) {
 实现若忽略 ctx 仍可能迟到返回，框架不会强杀 goroutine。涉及写入时，超时后的
 结果应按成功或未知结果处理，并用幂等键、查询或对账确认。
 
+### HTTP Server Streaming：POST + SSE
+
+`httpserver.NewSSEHandler` 把一次 JSON `POST` 和同一个响应中的 SSE 输出接到
+`contract.OpenLocal`。它面向 `fetch` 等普通 HTTP 客户端，不兼容浏览器原生
+`EventSource`，也不创建第二阶段的 GET 资源。请求体必须恰好包含一个 JSON 值，
+大小受 `MaxRequestBodyBytes` 限制；输出按序列化后的 JSON 写入 `data` frame。
+
+```go
+import (
+    "context"
+    "time"
+
+    "github.com/forgeplex/appkit"
+    "github.com/forgeplex/appkit/contract"
+    "github.com/forgeplex/appkit/httpserver"
+)
+
+type StreamRequest struct{ Prompt string }
+type StreamEvent struct{ Text string }
+
+func registerEventRoute(reg *appkit.Registry) error {
+    streamHandler, err := httpserver.NewSSEHandler[StreamRequest, StreamEvent](
+        httpserver.SSEConfig{
+            System: "assistant",
+            Method: "Generate",
+            Stream: contract.StreamConfig{
+                MaxDuration:  2 * time.Minute,
+                IdleTimeout:  30 * time.Second,
+                CloseTimeout: 3 * time.Second,
+                QueueSize:    16,
+            },
+            MaxRequestBodyBytes: 1 << 20,
+            WriteTimeout:        10 * time.Second,
+            HeartbeatInterval:   15 * time.Second,
+        },
+        func(ctx context.Context, cursor string, peer contract.Stream[httpserver.SSEEvent[StreamEvent], StreamRequest]) error {
+            request, err := peer.Recv(ctx)
+            if err != nil {
+                return err
+            }
+            // cursor 是原样透传的 Last-Event-ID；重放和 cursor 语义由应用实现。
+            _ = cursor
+            return peer.Send(ctx, httpserver.SSEEvent[StreamEvent]{
+                ID:   "application-cursor-1",
+                Data: StreamEvent{Text: request.Prompt},
+            })
+        },
+    )
+    if err != nil {
+        return err
+    }
+
+    // 在 AppKit Module 的 Register/Setup 中使用分类路由；不要用裸 Mount。
+    reg.MountAuthenticated("/events", streamHandler)
+    return nil
+}
+```
+
+路由仍经过 AppKit 的 identity boundary 与认证/权限守卫。`Last-Event-ID` 不由框架
+解释、保存或 replay，事件 ID 也必须由应用提供。首个 SSE frame 提交前的错误仍是
+`problem+json`；提交后只发送固定 `error` 事件，JSON data 仅含稳定错误码，不含
+message、cause 或身份信息。正常 `io.EOF` 关闭响应，不生成错误事件；业务完成状态
+应由应用 DTO 表达。
+
+若要让错误方法也由 Adapter 返回结构化 `problem+json`，路由 pattern 使用路径形式
+（如 `"/events"`），而不是 `"POST /events"`；后者会由 `http.ServeMux` 在进入
+Adapter 前直接拒绝。
+
+`Stream.QueueSize` 限制流内的有界事件队列，HTTP 写入受背压；单个 DTO 的尺寸仍应由
+应用控制。`WriteTimeout` 是每个 frame 的写入预算，不改变普通 HTTP Server 的默认
+60 秒超时。heartbeat 是不影响应用 idle 计时的 SSE 注释。响应会附加
+`X-Accel-Buffering: no`，但部署时仍需检查每一层代理/网关是否缓冲并配置其 flush
+策略。客户端断开会取消生产 Context；Host Shutdown 先 drain 在途请求，到达预算后
+强制关闭。可运行的 API 形态示例见 `httpserver/sse_example_test.go`。
+
 然后：
 
 - **提供方 identity**：`.appkit.yml` 填 `contracts: github.com/forgeplex/sso-contracts/go`，
