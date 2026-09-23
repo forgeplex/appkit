@@ -21,55 +21,64 @@ import (
 // 然后优雅关停。调用前必须通过 Security 显式选择 HTTP 安全模式。
 //
 // 启动顺序：Register（声明）→ Remote 绑定 → 依赖图解析（fail-fast）→ 迁移 →
-// Setup（装配）→ 消费者订阅 Bus → OnStart 按 stage 升序 → HTTP 监听 → 置 ready。
-// 就绪后阻塞在三件事上：关停信号、HTTP 服务异常退出、长驻 Worker 异常退出。
-// 关停顺序：readyz 置 503 摘流量 → drain 等待 → HTTP Shutdown → OnStop 按启动
-// 逆序（stage 降序、同 stage 注册逆序）。启动中途失败时，先取消启动钩子派生的
-// ctx（叫停已启动的 worker），再只对实际启动过的 stage 执行 OnStop。
+// Setup（装配）→ 消费者订阅 Bus → OnStart 按 stage 升序（含 HTTP Listener）→
+// ManagedService Start/Run/Ready → 全局 Ready。就绪后阻塞在关停信号、HTTP、Worker 或 Critical
+// ManagedService 退出上。关停时 readyz 先置 503，HTTP 开始 Shutdown；ManagedService
+// 反序 Drain 后取消其 Run Context、等待所有 Run、反序 Close，最后 OnStop 按启动
+// 逆序（stage 降序、同 stage 注册逆序）。启动中途失败时，先取消普通运行 ctx，
+// ManagedService 仅回滚已调用 Start 的实例，再只对已开始的 stage 执行 OnStop。
 func (a *App) Run(ctx context.Context) error {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	host, err := a.start(ctx, "Run")
+	if err != nil {
+		return err
+	}
+	return host.Wait()
+}
 
+func (a *App) runHost(host *RunningApp) error {
+	ctx := host.ctx
 	log := a.cfg.logger
-	// 健康检查失败详情走 App 统一 logger，而非 slog.Default()。
 	a.reg.health.SetLogger(log)
+	host.setState(hostRegistering)
 
 	enabled, err := a.enabledModules()
 	if err != nil {
 		return err
 	}
 	log.Info("appkit: 启动", "target", a.cfg.target, "modules", moduleNames(enabled))
-
 	if err := a.register(enabled); err != nil {
 		return err
 	}
-	// 安全模式是监听 HTTP 的前置条件，零值不能退化成匿名服务。
-	// Migrate 不走 Run，因此迁移专用进程不受这条 HTTP 约束影响。
 	if err := validateSecurityMode(a.cfg.securityMode); err != nil {
 		return err
 	}
 	cancelBus := a.registerBusLifecycle(ctx)
 	defer cancelBus()
+
+	host.setState(hostResolving)
 	if err := a.reg.resolveAll(); err != nil {
 		return err
 	}
+	host.setState(hostMigrating)
 	if err := a.migrate(ctx); err != nil {
 		return err
 	}
+	host.setState(hostSettingUp)
 	if err := a.reg.runSetups(ctx); err != nil {
 		return err
 	}
-	// Setup 也允许挂路由，因此必须等全部 Setup 完成后再校验；校验仍发生在
-	// buildMux/listen 之前，任何未分类路由都不可能先监听再暴露。
+	if err := a.resolveManagedServices(host); err != nil {
+		return err
+	}
+	// Setup 也允许挂路由，因此校验必须发生在 buildMux/listen 之前。
 	if err := a.reg.validateRouteSecurity(a.cfg.securityMode, a.cfg.pprof); err != nil {
 		return err
 	}
-	// 全部 Setup 之后统一校验权限绑定 ⊆ 声明——模块内部 mux 在 Setup 期
-	// 绑的码也要覆盖；拼错的码在监听之前曝光，而不是等到运行时 403。
 	if err := a.reg.validatePermBindings(); err != nil {
 		return err
 	}
-	// 消费者装配放在全部 Setup 之后：Register 与 Setup 阶段登记的都会生效。
 	if err := a.subscribeConsumers(); err != nil {
 		return err
 	}
@@ -80,37 +89,55 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	server := a.buildServer(a.wrap(mux))
 
-	// runCtx 覆盖全部启动钩子（含其派生的 worker goroutine）。进入关停前
-	// 无条件取消：启动失败路径也必须叫停已启动的 worker，否则等它退出的
-	// OnStop 会永久阻塞。
-	runCtx, cancelRun := context.WithCancel(ctx)
-	defer cancelRun()
-
-	// 启动钩子：模块钩子 + 框架的 HTTP 监听（StageServer）。
-	maxStage, startErr := a.startHooks(runCtx, server)
-
-	var serveErr error
+	host.setState(hostStarting)
+	maxStage, startErr := a.startHooks(ctx, server)
 	if startErr == nil {
-		a.reg.health.SetReady(true)
-		log.Info("appkit: 就绪", "addr", a.cfg.httpAddr)
+		startErr = host.startManagedServices(ctx)
+	}
+	if startErr == nil {
 		select {
-		case <-ctx.Done():
-			log.Info("appkit: 收到关停信号")
-		case err := <-a.serverErr:
-			serveErr = fmt.Errorf("appkit: HTTP 服务异常退出: %w", err)
-			log.Error("appkit: HTTP 服务异常退出，进入关停", "err", err)
-		case err := <-a.reg.workerErr:
-			// 长驻 worker 死了而进程还活着 = 探针绿着但事件停摆。同 HTTP 异常退出处理。
-			serveErr = err
-			log.Error("appkit: 后台 worker 异常退出，进入关停", "err", err)
+		case startErr = <-host.serviceErr:
+		default:
 		}
-	} else {
+	}
+	if startErr != nil {
 		log.Error("appkit: 启动失败，进入关停", "err", startErr)
+		host.draining.Store(true)
+		host.setState(hostStopping)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), a.cfg.shutdownTimeout)
+		shutdownErr := a.shutdown(server, maxStage, host, cleanupCtx)
+		cancel()
+		return errors.Join(startErr, shutdownErr)
 	}
 
-	cancelRun()
-	shutdownErr := a.shutdown(server, maxStage)
-	return errors.Join(startErr, serveErr, shutdownErr)
+	a.reg.health.SetReady(true)
+	log.Info("appkit: 就绪", "addr", a.cfg.httpAddr)
+	host.markReady()
+
+	var triggerErr error
+	cleanupParent := context.Background()
+	select {
+	case <-ctx.Done():
+		log.Info("appkit: 收到关停信号")
+	case err := <-a.runtime.serverErr:
+		triggerErr = fmt.Errorf("appkit: HTTP 服务异常退出: %w", err)
+		log.Error("appkit: HTTP 服务异常退出，进入关停", "err", err)
+	case err := <-a.reg.runtime.workerErr:
+		triggerErr = err
+		log.Error("appkit: 后台 worker 异常退出，进入关停", "err", err)
+	case err := <-host.serviceErr:
+		triggerErr = err
+		log.Error("appkit: Critical ManagedService 异常退出，进入关停", "err", err)
+	case request := <-host.stop:
+		cleanupParent = request.ctx
+	}
+
+	host.draining.Store(true)
+	host.setState(hostDraining)
+	cleanupCtx, cancel := context.WithTimeout(cleanupParent, a.cfg.shutdownTimeout)
+	shutdownErr := a.shutdown(server, maxStage, host, cleanupCtx)
+	cancel()
+	return errors.Join(triggerErr, shutdownErr, errors.Join(host.serviceExitErrorsSnapshot()...))
 }
 
 // registerBusLifecycle 把可选的持久化 Broker 生命周期纳入 App 的标准启动、
@@ -170,6 +197,9 @@ func (a *App) registerBusLifecycle(ctx context.Context) context.CancelFunc {
 // 迁移清单与 Run 用的是同一份模块声明，不存在「迁移用的清单和服务用的不是
 // 同一份」这种漂移。必须注入 Migrator，否则报错（此处 SkipMigrations 无意义）。
 func (a *App) Migrate(ctx context.Context) error {
+	if err := a.claimUse("Migrate"); err != nil {
+		return err
+	}
 	enabled, err := a.enabledModules()
 	if err != nil {
 		return err
@@ -346,27 +376,79 @@ func (a *App) listen(server *http.Server) error {
 	}
 	go func() {
 		if err := server.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			a.serverErr <- err
+			a.runtime.serverErr <- err
 		}
 	}()
 	return nil
 }
 
-// shutdown 执行优雅关停：摘流量 → drain → HTTP Shutdown → OnStop 按启动逆序。
-// 使用独立的超时 ctx（不能复用已取消的信号 ctx）。maxStartedStage 之上的
-// OnStop 直接跳过——对应的 OnStart 从未执行过。
-func (a *App) shutdown(server *http.Server, maxStartedStage int) error {
+// shutdown 执行优雅关停：撤销 readiness；HTTP Shutdown 与 ManagedService Drain
+// 并行开始；反序 Drain 全部服务后取消 Service Run Context、等待退出、反序 Close，
+// 最后 OnStop 按启动逆序。ctx 是总关停预算；maxStartedStage 之上的 OnStop 跳过。
+func (a *App) shutdown(server *http.Server, maxStartedStage int, host *RunningApp, ctx context.Context) error {
 	a.reg.health.SetReady(false)
+	// 先撤销 readiness，再取消普通 Worker Context；ManagedService 使用独立
+	// Run Context，保持到全部 Drain 完成后才由 cancelServices 取消。
+	host.cancelRun()
+	var errs []error
 	if a.cfg.drainDelay > 0 {
-		time.Sleep(a.cfg.drainDelay)
+		timer := time.NewTimer(a.cfg.drainDelay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			errs = append(errs, fmt.Errorf("appkit: 摘流延迟耗尽关停预算: %w", ctx.Err()))
+		}
 	}
 
-	sctx, cancel := context.WithTimeout(context.Background(), a.cfg.shutdownTimeout)
-	defer cancel()
+	// Shutdown 立即关闭 Listener/新连接，同时与 ManagedService Drain 并行等待
+	// 在途 HTTP 请求；Drain 时 Service Run Context 仍保持有效。
+	serverDone := make(chan error, 1)
+	go func() { serverDone <- server.Shutdown(ctx) }()
 
-	var errs []error
-	if err := server.Shutdown(sctx); err != nil {
-		errs = append(errs, fmt.Errorf("appkit: HTTP 关停: %w", err))
+	for i := len(host.services) - 1; i >= 0; i-- {
+		service := host.services[i]
+		if !service.runStarted {
+			continue
+		}
+		if err := runManagedServicePhase(ctx, service, "Drain", service.service.Drain); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	host.setState(hostStopping)
+	host.cancelServices()
+	for i := len(host.services) - 1; i >= 0; i-- {
+		service := host.services[i]
+		if service.runStarted {
+			if err := waitManagedServiceRun(ctx, service); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	for i := len(host.services) - 1; i >= 0; i-- {
+		service := host.services[i]
+		if service.startAttempted.Load() {
+			if err := runManagedServicePhase(ctx, service, "Close", service.service.Close); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			errs = append(errs, fmt.Errorf("appkit: HTTP 关停: %w", err))
+			if closeErr := server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+				errs = append(errs, fmt.Errorf("appkit: HTTP 强制关闭: %w", closeErr))
+			}
+		}
+	case <-ctx.Done():
+		if closeErr := server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+			errs = append(errs, fmt.Errorf("appkit: HTTP 强制关闭: %w", closeErr))
+		}
+		if err := <-serverDone; err != nil {
+			errs = append(errs, fmt.Errorf("appkit: HTTP 关停: %w", err))
+		}
 	}
 
 	stops := make([]stopHook, len(a.reg.stops))
@@ -382,11 +464,27 @@ func (a *App) shutdown(server *http.Server, maxStartedStage int) error {
 		if s.stage > maxStartedStage {
 			continue
 		}
-		if err := a.runStop(sctx, s); err != nil {
+		if err := a.runStop(ctx, s); err != nil {
 			errs = append(errs, err)
 		}
 	}
+	if budgetErr := ctx.Err(); budgetErr != nil && !errors.Is(errors.Join(errs...), budgetErr) {
+		errs = append(errs, fmt.Errorf("appkit: 关停预算耗尽: %w", budgetErr))
+	}
 	return errors.Join(errs...)
+}
+
+func waitManagedServiceRun(ctx context.Context, service *managedServiceRuntime) error {
+	select {
+	case <-service.done:
+		err := service.result()
+		if err == nil || errors.Is(err, context.Canceled) || service.unexpected.Load() {
+			return nil
+		}
+		return fmt.Errorf("appkit: 模块 %q ManagedService %q Run 关停失败: %w", service.reg.module, service.reg.name, err)
+	case <-ctx.Done():
+		return fmt.Errorf("appkit: 模块 %q ManagedService %q Run 未在关停预算内退出: %w", service.reg.module, service.reg.name, ctx.Err())
+	}
 }
 
 // runStop 在独立 goroutine 里执行单个 OnStop，超出关停预算即放弃等待、
