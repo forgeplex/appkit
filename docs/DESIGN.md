@@ -206,8 +206,10 @@ psp-contracts/
   显式声明 Unary、Server Stream 或 Bidi Stream，Streaming interface 与 V1 `Service`
   分离，生成至独立 `_v2` 文件。V2 OpenAPI 以 `x-appkit-call-shape` 和
   `x-appkit-stream` 扩展描述方向、cursor 映射和应用终态元数据；V2 Unary 可生成
-  HTTP client/server，Server Stream 生成 POST + SSE server adapter，Bidi 的 wire
-  adapter 由后续 WebSocket 切片负责。AsyncAPI 不作为首期事实源或输出。
+  HTTP client/server，Server Stream 生成 POST + SSE server adapter，Bidi 生成 WSS
+  client/server adapter，并复用 `contract.OpenLocal` 的生命周期与有界队列。WebSocket
+  Upgrade 前遵守分类路由和认证边界，Upgrade 后不刷新凭证；Host 通过受管 Hub 跟踪
+  hijacked socket。AsyncAPI 不作为首期事实源或输出。
 - `contract-check` 对相同 schema version 做保守比较；V2 方法形态、消息字段、
   requiredness、cursor 映射和 terminal event 变化均参与兼容判定。V1 与 V2 之间
   不做隐式迁移；新增方法不能静默扩宽已有生成 interface。
@@ -627,7 +629,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 
 | 规则 | 落点 | 强度 |
 |---|---|---|
-| Stream 不继承 Unary 调用期限与值边界 | `contract.OpenLocal` 显式校验事务、应用 `Firewall`、根最大时长/idle policy 与有界双向队列；`contract/streamtest` 锁定 Local 行为；`httpserver.NewSSEHandler` 锁定 POST + SSE framing、per-frame deadline、flush、背压、断连及 Host drain | ▲ 运行时 + 本地/HTTP 集成测试；覆盖 Local 与 HTTP Server Stream，尚未覆盖远程/双向 Transport、发布与业务运行验收 |
+| Stream 不继承 Unary 调用期限与值边界 | `contract.OpenLocal` 显式校验事务、应用 `Firewall`、根最大时长/idle policy 与有界双向队列；`contract/streamtest` 锁定 Local 行为；SSE 与 WSS adapter 分别锁定 framing、per-frame deadline、背压、取消、终态、凭证过期及 Host drain | ▲ 运行时 + 本地/HTTP 集成测试；含 Local、SSE 与 WSS 传输测试，不代表 required CI、下游运行、发布或业务验收 |
 | 同契约的多个实例不误回退到无名绑定 | `ProvideContractNamed` / `ResolveNamed` 精确匹配 `(Go 类型, 实例名)`，共享启动期重复/缺失/循环检查 | ▲ 运行时装配级；名字不是租户隔离或消费方 binding manifest |
 | Agent 不用旧生成结果覆盖已修改的目标 | plan 绑定输入及全部输出的选定文件快照，`apply` 在协作锁内复核；schema 另绑定迁移/产出目录成员 | ▲ 工具运行时级；非整个仓库摘要，外部编辑器不受锁约束 |
 | 多文件生成失败可恢复 | 同文件系统暂存、备份、持久日志、回滚与 exact-plan replay | ▲ 工具运行时级；非外部读者的全局原子可见性，非授权/签名证明 |

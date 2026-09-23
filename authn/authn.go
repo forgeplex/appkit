@@ -203,7 +203,8 @@ func MultiIssuer(issuers map[string]Issuer) func(http.Handler) http.Handler {
 			if issuer.Partition != "" {
 				meta.Partition = issuer.Partition
 			}
-			ctx := callctx.With(appkit.WithActor(r.Context(), actor), meta)
+			ctx := appkit.WithIdentityExpiry(appkit.WithActor(r.Context(), actor), ac.ExpiresAt.Time)
+			ctx = callctx.With(ctx, meta)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

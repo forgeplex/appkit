@@ -10,16 +10,16 @@ func renderServerV2(doc *contractDocV2) []byte {
 	var b bytes.Buffer
 	b.WriteString(header)
 	fmt.Fprintf(&b, "package %s\n\n", doc.Package)
-	if !hasV2Unary(doc) && !hasV2ServerStream(doc) {
+	if !hasV2Unary(doc) && !hasV2ServerStream(doc) && !hasV2BidiStream(doc) {
 		return b.Bytes()
 	}
 	b.WriteString("import (\n")
-	if hasV2ServerStream(doc) {
+	if hasV2ServerStream(doc) || hasV2BidiStream(doc) {
 		b.WriteString("\t\"context\"\n\t\"net/http\"\n")
 	}
 	if hasV2Unary(doc) {
 		b.WriteString("\t\"encoding/json\"\n")
-		if !hasV2ServerStream(doc) {
+		if !hasV2ServerStream(doc) && !hasV2BidiStream(doc) {
 			b.WriteString("\t\"net/http\"\n")
 		}
 		if v2UnaryUsesRefs(doc) {
@@ -29,11 +29,20 @@ func renderServerV2(doc *contractDocV2) []byte {
 	if hasV2Streaming(doc) {
 		b.WriteString("\n\t\"github.com/forgeplex/appkit/contract\"\n")
 	}
-	if hasV2ServerStream(doc) {
+	if hasV2ServerStream(doc) || hasV2BidiStream(doc) {
 		b.WriteString("\t\"github.com/forgeplex/appkit/httpserver\"\n")
 	}
+	if hasV2BidiStream(doc) {
+		b.WriteString("\t\"github.com/forgeplex/appkit\"\n")
+	}
 	if hasV2Unary(doc) {
-		b.WriteString("\t\"github.com/forgeplex/appkit/apperr\"\n\t\"github.com/forgeplex/appkit/callctx\"\n")
+		if !hasV2BidiStream(doc) {
+			b.WriteString("\t\"github.com/forgeplex/appkit/apperr\"\n")
+		}
+		b.WriteString("\t\"github.com/forgeplex/appkit/callctx\"\n")
+	}
+	if hasV2BidiStream(doc) {
+		b.WriteString("\t\"github.com/forgeplex/appkit/apperr\"\n")
 	}
 	b.WriteString(")\n\n")
 
@@ -43,7 +52,26 @@ func renderServerV2(doc *contractDocV2) []byte {
 	if hasV2ServerStream(doc) {
 		renderV2SSEHandlers(&b, doc)
 	}
+	if hasV2BidiStream(doc) {
+		renderV2WebSocketHandlers(&b, doc)
+	}
 	return b.Bytes()
+}
+
+func renderV2WebSocketHandlers(b *bytes.Buffer, doc *contractDocV2) {
+	for _, m := range doc.Methods {
+		if m.Kind != "bidi_stream" {
+			continue
+		}
+		request, response := v2RequestType(m), v2ResponseType(m)
+		fmt.Fprintf(b, "// New%sWebSocketHandlerV2 builds the authenticated WebSocket adapter for %s. Mount it through a classified Registry route.\nfunc New%sWebSocketHandlerV2(cfg httpserver.WebSocketConfig, svc StreamingServiceV2) (http.Handler, error) {\n", m.Name, m.Path, m.Name)
+		fmt.Fprintf(b, "\tcfg.System, cfg.Method = %q, %q\n", doc.System, m.Name)
+		b.WriteString("\tidentity := cfg.IdentityResolver\n\tif identity == nil {\n\t\tidentity = func(ctx context.Context) (httpserver.WebSocketIdentity, error) {\n")
+		b.WriteString("\t\t\tif actor, ok := appkit.ActorFrom(ctx); ok && actor.UserID != \"\" { expiresAt, _ := appkit.IdentityExpiryFrom(ctx); return httpserver.WebSocketIdentity{Subject: actor.UserID, ExpiresAt: expiresAt}, nil }\n")
+		b.WriteString("\t\t\tif principal, ok := appkit.ServicePrincipalFrom(ctx); ok && principal.Subject != \"\" { return httpserver.WebSocketIdentity{Subject: principal.Subject, ExpiresAt: principal.ExpiresAt}, nil }\n")
+		b.WriteString("\t\t\treturn httpserver.WebSocketIdentity{}, apperr.Unauthenticated(\"authentication required\")\n\t\t}\n\t}\n")
+		fmt.Fprintf(b, "\treturn httpserver.NewWebSocketHandler[%s, %s](cfg, identity, func(ctx context.Context, peer contract.Stream[%s, %s]) error { return svc.%s(ctx, peer) })\n}\n\n", request, response, response, request, m.Name)
+	}
 }
 
 func v2UnaryUsesRefs(doc *contractDocV2) bool {
