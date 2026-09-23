@@ -591,6 +591,59 @@ appkit gen contract -in identityv1/contract.yaml -dir identityv1
 （DESIGN §5.3）。`idempotent: true` 的方法，生成 client 会对可用性故障做
 有界重试；`doc` 必填——契约是给别的团队读的。
 
+### Streaming Contract v2
+
+V1 永远表示 Unary。需要描述流时使用 `version: 2`，每个方法必须显式声明
+`kind: unary|server_stream|bidi_stream`。Streaming 接口单独生成为
+`StreamingServiceV2`，不会向 V1 `Service` 增加方法。V2 产物使用独立文件名，
+可与同包中的 V1 生成物并存：
+
+```yaml
+version: 2
+package: feedv2
+system: feed
+methods:
+  - name: Watch
+    path: /v2/watch
+    doc: 按顺序返回更新。
+    kind: server_stream
+    request:
+      - {name: topic, type: string, required: true}
+    response:
+      - {name: event_id, type: string}
+      - {name: payload, type: string}
+    cursor_field: event_id
+    terminal_event: feed.completed
+  - name: Chat
+    path: /v2/chat
+    doc: 双向传送消息。
+    kind: bidi_stream
+    request:
+      - {name: text, type: string, required: true}
+    response:
+      - {name: text, type: string}
+```
+
+`server_stream` 的 `request` 是一次性命令，`response` 是事件 DTO；若无 `request`
+字段，SSE 的 POST body 仍须发送 `{}`，而 Local opener 不带请求参数。`bidi_stream`
+的 `request/response` 分别是客户端与服务端消息。`cursor_field` 只能引用
+`response` 中的 string 字段，生成的 SSE adapter 会把它作为 opaque SSE `id`；
+`terminal_event` 是应用拥有的稳定终态标识，框架不解释它，但兼容检查会拒绝修改。
+Stream 方法不能声明 `idempotent`，框架不会自动重试流。
+
+```sh
+appkit gen contract -in feedv2/contract.yaml -dir feedv2
+appkit gen contract -check -in feedv2/contract.yaml -dir feedv2
+appkit contract-check -base feedv2/contract.yaml -candidate feedv2-next/contract.yaml
+```
+
+V2 会生成 `service_v2.gen.go`、`client_v2.gen.go`、`server_v2.gen.go` 和
+`openapi_v2.yaml`。V2 Unary 有独立的 `ServiceV2`、HTTP client/server 与
+`WrapServiceV2`；Server Stream 生成 Local opener 和 `New<Method>SSEHandlerV2`；
+Bidi 生成 transport-neutral 接口及 Local opener，WebSocket wire adapter 留给后续
+切片。OpenAPI 用 `x-appkit-call-shape` / `x-appkit-stream` 扩展表达流形态；不生成
+AsyncAPI。V1 五份生成文件与 OpenAPI 保持逐字节稳定，V1 schema 也拒绝 V2 流形态字段。
+
 ### Local 双向 Stream
 
 `contract.OpenLocal` 是独立于 Unary `contract.Call` 的双向流入口；它不继承

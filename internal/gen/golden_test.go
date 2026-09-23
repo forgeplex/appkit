@@ -13,16 +13,18 @@ var update = flag.Bool("update", false, "重写 genfixture 下的 golden 生成�
 
 // goldenFiles 是每组用例要逐字节比对的检入生成物（相对 internal/gen）。
 var goldenFiles = map[string][]string{
-	"events":   {"genfixture/events.gen.go"},
-	"errors":   {"genfixture/codes.gen.go"},
-	"contract": {"genfixture/service.gen.go", "genfixture/wrap.gen.go", "genfixture/client.gen.go", "genfixture/server.gen.go", "genfixture/openapi.yaml"},
+	"events":      {"genfixture/events.gen.go"},
+	"errors":      {"genfixture/codes.gen.go"},
+	"contract":    {"genfixture/service.gen.go", "genfixture/wrap.gen.go", "genfixture/client.gen.go", "genfixture/server.gen.go", "genfixture/openapi.yaml"},
+	"contract_v2": {"genfixture_v2/service_v2.gen.go", "genfixture_v2/client_v2.gen.go", "genfixture_v2/server_v2.gen.go", "genfixture_v2/openapi_v2.yaml"},
 }
 
 func TestGolden(t *testing.T) {
 	runs := map[string]func(dir string) error{
-		"events":   func(dir string) error { return Events("testdata/events.yaml", filepath.Join(dir, "events.gen.go")) },
-		"errors":   func(dir string) error { return Errors("testdata/codes.yaml", filepath.Join(dir, "codes.gen.go")) },
-		"contract": func(dir string) error { return Contract("testdata/contract.yaml", dir) },
+		"events":      func(dir string) error { return Events("testdata/events.yaml", filepath.Join(dir, "events.gen.go")) },
+		"errors":      func(dir string) error { return Errors("testdata/codes.yaml", filepath.Join(dir, "codes.gen.go")) },
+		"contract":    func(dir string) error { return Contract("testdata/contract.yaml", dir) },
+		"contract_v2": func(dir string) error { return Contract("testdata/contract_v2.yaml", dir) },
 	}
 	for name, run := range runs {
 		t.Run(name, func(t *testing.T) {

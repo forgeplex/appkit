@@ -87,7 +87,7 @@ func Contract(inPath, outDir string) error {
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return fmt.Errorf("创建输出目录: %w", err)
 	}
-	for _, name := range contractFilenames {
+	for _, name := range contractOutputFilenames(files) {
 		outPath := filepath.Join(outDir, name)
 		if err := os.WriteFile(outPath, files[name], 0o644); err != nil {
 			return fmt.Errorf("写出 %s: %w", outPath, err)
@@ -99,6 +99,19 @@ func Contract(inPath, outDir string) error {
 // contractFilenames gives both generation and drift diagnostics a stable order.
 var contractFilenames = []string{
 	"client.gen.go", "openapi.yaml", "server.gen.go", "service.gen.go", "wrap.gen.go",
+}
+
+// contractV2Filenames use distinct names so a V2 schema can be generated next
+// to an existing V1 package without replacing its stable Unary artifacts.
+var contractV2Filenames = []string{
+	"client_v2.gen.go", "openapi_v2.yaml", "server_v2.gen.go", "service_v2.gen.go",
+}
+
+func contractOutputFilenames(files map[string][]byte) []string {
+	if _, ok := files["service_v2.gen.go"]; ok {
+		return contractV2Filenames
+	}
+	return contractFilenames
 }
 
 // RenderContract reads and validates contract.yaml, returning every generated
@@ -121,6 +134,31 @@ func RenderContract(inPath string) (map[string][]byte, error) {
 // it need not name an existing file. This lets a workspace plan render the same
 // input snapshot whose digest it records, without reopening a mutable path.
 func RenderContractSource(sourceName string, data []byte) (map[string][]byte, error) {
+	version, err := contractSourceVersion(sourceName, data)
+	if err != nil {
+		return nil, err
+	}
+	if version == 2 {
+		doc, err := parseContractV2Source(sourceName, data)
+		if err != nil {
+			return nil, err
+		}
+		files := renderContractV2(doc)
+		for _, name := range contractV2Filenames {
+			if !strings.HasSuffix(name, ".go") {
+				continue
+			}
+			formatted, err := format.Source(files[name])
+			if err != nil {
+				return nil, fmt.Errorf("格式化生成代码失败（生成器 bug，目标 %s）: %w", name, err)
+			}
+			files[name] = formatted
+		}
+		return files, nil
+	}
+	if version != 1 {
+		return nil, fmt.Errorf("%s: 不支持的 version %d（当前支持 1、2）", sourceName, version)
+	}
 	doc, err := parseContractSource(sourceName, data)
 	if err != nil {
 		return nil, err
@@ -166,7 +204,20 @@ func RenderContractSource(sourceName string, data []byte) (map[string][]byte, er
 	return files, nil
 }
 
+func contractSourceVersion(sourceName string, data []byte) (int, error) {
+	var header struct {
+		Version int `yaml:"version"`
+	}
+	if err := yaml.Unmarshal(data, &header); err != nil {
+		return 0, fmt.Errorf("%s: 解析 yaml: %w", sourceName, err)
+	}
+	return header.Version, nil
+}
+
 func parseContractSource(inPath string, data []byte) (*contractDoc, error) {
+	if err := rejectV2MethodKeys(inPath, data); err != nil {
+		return nil, err
+	}
 	var doc contractDoc
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return nil, fmt.Errorf("%s: 解析 yaml: %w", inPath, err)
@@ -192,6 +243,37 @@ func parseContractSource(inPath string, data []byte) (*contractDoc, error) {
 		return nil, err
 	}
 	return &doc, nil
+}
+
+func rejectV2MethodKeys(sourceName string, data []byte) error {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("%s: 解析 yaml: %w", sourceName, err)
+	}
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = *root.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "methods" || root.Content[i+1].Kind != yaml.SequenceNode {
+			continue
+		}
+		for _, method := range root.Content[i+1].Content {
+			if method.Kind != yaml.MappingNode {
+				continue
+			}
+			for j := 0; j+1 < len(method.Content); j += 2 {
+				key := method.Content[j]
+				switch key.Value {
+				case "kind", "cursor_field", "terminal_event":
+					return fmt.Errorf("%s:%d: V1 Unary contract does not accept V2 method field %q; use version: 2", sourceName, key.Line, key.Value)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // checkTypes 校验 types 段并返回命名 DTO 集合（含各方法自动生成的

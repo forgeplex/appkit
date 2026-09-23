@@ -47,7 +47,7 @@ func CheckContract(inPath, outDir string) error {
 		return err
 	}
 	var drift []ContractDrift
-	for _, name := range contractFilenames {
+	for _, name := range contractOutputFilenames(files) {
 		outPath := filepath.Join(outDir, name)
 		info, err := os.Lstat(outPath)
 		if errors.Is(err, os.ErrNotExist) {
