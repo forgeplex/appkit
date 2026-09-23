@@ -2,6 +2,20 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.9.6（2026-09-24）
+
+v0.9.6 — disposable domain CI databases
+
+This patch aligns the reusable domain workflow with integration tests that require an explicitly disposable PostgreSQL target, while preserving the existing TCP endpoint used by pinned CI fixtures.
+
+- Run a PostgreSQL 18.6 container per job, pin the image digest, and bind its TCP port to runner loopback only.
+- Add a random host-mounted Unix socket for webhook tests that create roles and write an audit schema; preserve their explicit disposable opt-in and socket-path guard.
+- Preload and create pg_stat_statements for server-side statement evidence.
+- Stop and remove the container on every job outcome and remove only the validated temporary socket directory.
+- Add regression coverage for the shared workflow's database isolation contract.
+
+No public Go API or database migration changes are included.
+
 ## v0.9.5（2026-09-17）
 
 v0.9.5 — declarative database access manifests
