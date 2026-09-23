@@ -591,6 +591,65 @@ appkit gen contract -in identityv1/contract.yaml -dir identityv1
 （DESIGN §5.3）。`idempotent: true` 的方法，生成 client 会对可用性故障做
 有界重试；`doc` 必填——契约是给别的团队读的。
 
+### Local 双向 Stream
+
+`contract.OpenLocal` 是独立于 Unary `contract.Call` 的双向流入口；它不继承
+Unary 的 5 秒默认超时。调用方必须明确给出最大时长、Close 等待预算和每个方向
+的有界队列容量；`IdleTimeout: 0` 表示禁用 idle 检查，`QueueSize: 0` 表示发送端
+与接收端 rendezvous、没有缓冲。`Send`、`Recv`、`CloseSend` 的操作 Context 只取消当前操作等待，
+可在操作取消后重试；Open 使用的根 Context 或 `Close` 才结束整条流。
+
+```go
+import (
+    "context"
+    "errors"
+    "io"
+    "time"
+
+    "github.com/forgeplex/appkit/contract"
+)
+
+type Request struct{ Text string }
+type Reply struct{ Text string }
+
+func streamGreeting(ctx context.Context) (retErr error) {
+    stream, err := contract.OpenLocal(ctx, "greeter", "GreetStream",
+        contract.StreamConfig{
+            MaxDuration:  2 * time.Minute,
+            IdleTimeout:  30 * time.Second,
+            CloseTimeout: 3 * time.Second,
+            QueueSize:    16,
+        },
+        func(streamCtx context.Context, peer contract.Stream[Reply, Request]) error {
+            request, err := peer.Recv(streamCtx)
+            if err != nil {
+                return err
+            }
+            return peer.Send(streamCtx, Reply{Text: request.Text})
+        },
+    )
+    if err != nil { return err } // 同步错误表示尚未建立 Stream
+    defer func() { retErr = errors.Join(retErr, stream.Close()) }()
+
+    if err := stream.Send(ctx, Request{Text: "hello"}); err != nil { return err }
+    if err := stream.CloseSend(ctx); err != nil { return err }
+    for {
+        reply, err := stream.Recv(ctx)
+        if errors.Is(err, io.EOF) { break }
+        if err != nil { return err }
+        _ = reply // 应用终态仍应是 Reply 等 DTO，不与 EOF 混同
+    }
+    return nil
+}
+```
+
+建立后的生产错误会以稳定的 `*apperr.Error` 由 `Recv` 返回；正常结束是
+`io.EOF`，不能把 EOF 当成业务终态。每条流最多一个并发 `Send` 和一个并发
+`Recv`，两者可重叠；满队列会背压，不会丢弃事件。`contract/streamtest` 提供
+可复用的 Adapter conformance suite；本地实现由 `OpenLocal` 驱动，后续 Transport
+可以为同一 suite 提供 `OpenFunc` 和测试服务。该 suite 不自动让应用契约生成器
+支持 Streaming。按 ADR-0047 §8，Streaming 新 API 在被显式提升前保持实验性。
+
 `contract.Call` 的 timeout 是协作式的：deadline 会传给实现，已经启动的同步
 实现若忽略 ctx 仍可能迟到返回，框架不会强杀 goroutine。涉及写入时，超时后的
 结果应按成功或未知结果处理，并用幂等键、查询或对账确认。
