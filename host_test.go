@@ -3,9 +3,11 @@ package appkit
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -176,6 +178,65 @@ func managedServiceModule(s *recordingManagedService, policy ServicePolicy) Modu
 func newHostTestApp(modules []Module, opts ...Option) *App {
 	opts = append([]Option{HTTPAddr("127.0.0.1:0"), ShutdownTimeout(time.Second)}, opts...)
 	return newTestApp(modules, opts...)
+}
+
+func TestHeadlessAppStartNeedsNoSecurityOrHTTPListener(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	app := New(nil, HTTPAddr(listener.Addr().String()), Headless())
+	host, err := app.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Headless Start: %v", err)
+	}
+	if got, err := host.Readiness(context.Background()); err != nil || len(got) != 0 {
+		t.Fatalf("ready Headless Readiness = (%v, %v), want empty map", got, err)
+	}
+	if err := host.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Headless Shutdown: %v", err)
+	}
+	if got, err := host.Readiness(context.Background()); err != nil || len(got) == 0 {
+		t.Fatalf("stopped Headless Readiness = (%v, %v), want not-ready entry", got, err)
+	}
+}
+
+func TestHeadlessRejectsRoutesAndPprof(t *testing.T) {
+	module := ModuleFunc("route", func(reg *Registry) error {
+		reg.Mount("/business", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		return nil
+	})
+	for _, tc := range []struct {
+		name    string
+		modules []Module
+		options []Option
+		want    string
+	}{
+		{name: "route", modules: []Module{module}, want: `HTTP 路由 "/business"`},
+		{name: "pprof", options: []Option{Pprof()}, want: "pprof"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := append(tc.options, Headless())
+			app := New(tc.modules, opts...)
+			if _, err := app.Start(context.Background()); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Headless Start error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestDisableMigrationsFailsFastWhenMigrationsAreDeclared(t *testing.T) {
+	app := newTestApp([]Module{migratingModule()}, Headless(), DisableMigrations())
+	if err := app.Run(context.Background()); err == nil || !strings.Contains(err.Error(), `模块 "billing" 声明了迁移`) {
+		t.Fatalf("Run error = %v, want disabled migration capability error", err)
+	}
+
+	app = New([]Module{migratingModule()}, DisableMigrations())
+	if err := app.Migrate(context.Background()); err == nil || !strings.Contains(err.Error(), `模块 "billing" 声明了迁移`) {
+		t.Fatalf("Migrate error = %v, want disabled migration capability error", err)
+	}
 }
 
 func TestStartWaitShutdownManagesServiceLifecycle(t *testing.T) {

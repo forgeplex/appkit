@@ -300,6 +300,8 @@ type Module interface {
 func Provide[T any](reg *Registry, ctor func(*Registry) (T, error)) // 注册契约实现（惰性构造）
 func Resolve[T any](reg *Registry) (T, error)                       // 取依赖；启动期缺失 fail-fast、循环依赖报错
 func Security(mode SecurityMode) Option                              // HTTP 身份边界模式，Run 必须显式选择
+func Headless() Option                                               // 不启用业务 HTTP；声明路由或 pprof 时启动拒绝
+func DisableMigrations() Option                                       // 未启用迁移 capability 时拒绝有迁移的模块
 func (r *Registry) MountPublic(pattern string, h http.Handler)       // 明示公开路由
 func (r *Registry) MountAuthenticated(pattern string, h http.Handler)// 需用户主体
 func (r *Registry) MountPermission(pattern, code string, h http.Handler) // 需用户权限码
@@ -319,6 +321,22 @@ func (r *Registry) ManagedService(name string, policy ServicePolicy, factory Man
 实例。ManagedService 的 Host 关停顺序是全体反序 Drain、取消 Service Run Context、
 等待全体 Run 退出、全体反序 Close；普通 `Worker` 与 `ManagedSubscriber` 保持各自现有
 语义，不隐式升级为 ManagedService。
+
+新的 `bootstrap.Core` 把进程资源和工作负载入口与旧完整 Profile 分开：
+
+| 调用 | 含义 | OS Signal 所有权 |
+|---|---|---|
+| `Core.Start(ctx)` | Embedded；返回 Ready 后的 `RunningProfile` | 调用方，无框架 handler |
+| `Runner.Run(ctx)` | 进程 Runner；阻塞至 Host 结束 | Runner 注册一次并桥接到 Host |
+| `Core.Execute(ctx, fn)` | One-shot；Ready 后运行一次函数并关停 | 调用方 Context，无框架 handler |
+
+`ProfileOptions.Capabilities.BusinessHTTP`、`PostgreSQL`、`Bus`、`Migrations` 是显式开关；
+零值 Headless 不加载/校验业务 HTTP SecurityMode，也不创建数据库或 Bus。Probe-only 是
+独立 Listener，只复用 Host 健康注册表的 `/healthz`、`/readyz`；默认绑定 loopback，非
+loopback 必须同时提供网络边界确认与认证 middleware。Host `Readiness` 同时提供进程内
+查询能力。Core 初始化 Telemetry 后才创建可选基础设施，清理栈按逆序执行，因此
+Telemetry 最后关闭；每项清理失败后仍继续，并用 `errors.Join` 保留错误。`Core` 本身不
+安装 OS Signal Handler；只应由独立的进程级 `Runner` 注册一次，不能再叠加 `App.Run`。
 
 ### 5.2 组装（psp/cmd/psp/main.go）
 
@@ -607,7 +625,11 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | appkit/contracts 向后兼容 | apidiff / oasdiff 门禁 | ▲ CI 级 |
 | CI 本身不可绕过 | reusable workflow 从 appkit module provenance 解析并固定完整 commit SHA、第三方 Action 固定 commit SHA、默认 `contents: read`；main/release tag protection + required checks | 组织级（仓库 ruleset 必须另行配置，见 `docs/CI_SECURITY.md`） |
 | 启动装配改不坏 | `bootstrap.Main` 收走 main() 的固定装配，代码在 module cache（0444 只读）；用户仓库的 main 只声明模块清单 | ▲ 物理级：改不动，但可绕开自己写 main（骨架默认不绕） |
-| HTTP 安全模式不能遗漏 | `App.Run` 在进入迁移/Setup/监听前验证 `SecurityMode`；bootstrap 还要求 `security.mode`，并把 `disabled` 限于 `env=dev`；`App.Migrate` 显式豁免 | ▲ 运行时 + 装配级：零值不能 Run，但直接构造 App 的调用方可显式选 `SecurityDisabled`（测试需要这个逃生口） |
+| HTTP 安全模式不能遗漏 | 仅在启用业务 HTTP 时 `App.Run` 与 Bootstrap Profile 才校验 `SecurityMode`；bootstrap 还要求 `security.mode`，并把 `disabled` 限于 `env=dev`；Headless 无业务 HTTP，Probe-only 走独立的 loopback/认证策略；`App.Migrate` 显式豁免 | ▲ 运行时 + 装配级：业务 Listener 零值不能启动；调用方仍可显式选 `SecurityDisabled`（测试/开发逃生口），自建 Listener 不在该边界内 |
+| Headless 不静默丢弃 HTTP 行为 | `appkit.Headless()` 在 route/pprof 校验处拒绝已声明业务路由；Bootstrap 把关闭的 Bus/Migrations capability 覆盖性写入 App，并在声明 Consumer/Migration 时 fail-fast | ▲ 运行时守卫 + 测试级；只覆盖 Registry 声明面，模块自行开启的网络 Listener 仍须由调用方治理 |
+| Probe Listener 默认不暴露公网 | `ProbeOptions` 默认 `127.0.0.1:8081`；非 loopback 需显式确认网络边界并提供认证 middleware；处理器只匹配两个精确路径 | ▲ Bootstrap 装配级：不可信 middleware 的认证强度无法静态证明，网络策略仍须独立验证 |
+| OS Signal 不被多个层重复拥有 | `App.Run` 与 `bootstrap.Runner.Run` 是进程入口；`App.Start` / `Core.Start` / `Core.Execute` 不注册框架 Signal Handler | ▲ API 路径 + 子进程测试级；应用仍可自行安装 handler，必须避免与框架入口叠加 |
+| Core 资源按依赖逆序关闭 | `Core` LIFO cleanup stack：可选资源先关、Telemetry 最后 flush；一项失败不跳过后续 hook，错误通过 `errors.Join` 保留 | ▲ 运行时 + 测试级；只保证注册入 Core 栈的资源，外部资源要显式纳入生命周期 |
 | 严格模式没有未分类根路由 | Registry 记录 Public/Authenticated/Permission/InternalService，全部 Setup 后、listen 前校验模式矩阵；分类 API 同时包上用户/权限/服务 guard | ▲ 运行时守卫：受信组合根的 Middleware 仍可短路 `next` 或在边界内注入 principal，不是对任意 wiring 的沙箱 |
 | 网络身份输入不继承为可信 ctx | 严格模式的 `identityBoundary` 强制在可配 Middleware 最外层，清 Actor/ServicePrincipal/partition/tenant/caller 及四个 unsigned 头；`HTTPServer` Option 之后强制恢复根 handler | ▲ 运行时信任边界：中间件顺序和 Handler Option 不能把边界挪掉，但边界内的受信 Middleware 若重新信头仍可自伤 |
 | 服务身份验证 | `authn.ServiceVerifier` 验证固定类型的短期服务 JWT，静态 iss+kid+sub、单一 aud、exp/iat；非空委托默认拒绝；bootstrap 先验配置 | ▲ 运行时 + 装配级：策略/公钥配置属于受信组合根；不提供任意 wiring 沙箱 |
