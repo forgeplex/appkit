@@ -740,6 +740,9 @@ reg.MountAuthenticated("GET /v2/chat", handler)
 已验签的 Actor / ServicePrincipal 重建身份，可通过 `IdentityResolver` 适配自定义
 认证器。它不从 query、URL 参数或消息帧读取身份。跨 Origin 浏览器只允许显式
 配置的 Origin pattern；缺少 Origin 的非浏览器客户端仍必须经过认证路由。
+同源判断同时比较 scheme 与 host。若 TLS 在反向代理终止、appkit 收到的是明文
+HTTP，请显式配置浏览器外部 Origin 的完整 scheme（例如 `https://console.example.test`）；
+appkit 不信任任意 `X-Forwarded-Proto` 来推断外部 scheme。
 认证主体保留在连接根 Context 中用于连接安全与到期管理；进入 Streaming Contract
 实现时仍经过 `contract.OpenLocal` 的 Context Firewall，因此 Actor、ServicePrincipal
 和任意 Context value 不会越过契约边界，只有 trace、deadline/cancellation 与白名单

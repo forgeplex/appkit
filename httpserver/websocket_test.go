@@ -54,6 +54,25 @@ func startWebSocketServer(
 	identity httpserver.WebSocketIdentityResolver,
 	handler httpserver.WebSocketHandler[string, string],
 ) (*httptest.Server, *httpserver.WebSocketHub) {
+	return startWebSocketTestServer(t, cfg, identity, handler, false)
+}
+
+func startWebSocketTLSServer(
+	t *testing.T,
+	cfg httpserver.WebSocketConfig,
+	identity httpserver.WebSocketIdentityResolver,
+	handler httpserver.WebSocketHandler[string, string],
+) (*httptest.Server, *httpserver.WebSocketHub) {
+	return startWebSocketTestServer(t, cfg, identity, handler, true)
+}
+
+func startWebSocketTestServer(
+	t *testing.T,
+	cfg httpserver.WebSocketConfig,
+	identity httpserver.WebSocketIdentityResolver,
+	handler httpserver.WebSocketHandler[string, string],
+	tls bool,
+) (*httptest.Server, *httpserver.WebSocketHub) {
 	t.Helper()
 	h, err := httpserver.NewWebSocketHandler[string, string](cfg, identity, handler)
 	if err != nil {
@@ -67,7 +86,12 @@ func startWebSocketServer(
 	for i := len(middleware) - 1; i >= 0; i-- {
 		root = middleware[i](root)
 	}
-	server := httptest.NewServer(root)
+	var server *httptest.Server
+	if tls {
+		server = httptest.NewTLSServer(root)
+	} else {
+		server = httptest.NewServer(root)
+	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -256,6 +280,91 @@ func TestWebSocketUpgradeFailuresStayProblemJSON(t *testing.T) {
 		if response == nil || response.StatusCode != http.StatusUnauthorized || response.Header.Get("Content-Type") != "application/problem+json" {
 			t.Fatalf("response = %#v; error=%v", response, err)
 		}
+	})
+}
+
+func TestWebSocketOriginRequiresMatchingSchemeForSameHost(t *testing.T) {
+	identity := func(context.Context) (httpserver.WebSocketIdentity, error) {
+		return httpserver.WebSocketIdentity{Subject: "browser-user"}, nil
+	}
+	streamHandler := func(ctx context.Context, _ contract.Stream[string, string]) error {
+		<-ctx.Done()
+		return nil
+	}
+
+	t.Run("direct TLS rejects same-host HTTP origin", func(t *testing.T) {
+		hub := startWebSocketHub(t)
+		cfg := websocketTestConfig(hub)
+		cfg.OriginPatterns = []string{"https://127.0.0.1:*"}
+		server, _ := startWebSocketTLSServer(t, cfg, identity, streamHandler)
+		host := strings.TrimPrefix(server.URL, "https://")
+		req, err := http.NewRequest(http.MethodGet, server.URL+"/bidi", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Origin", "http://"+host)
+		resp, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden || resp.Header.Get("Content-Type") != "application/problem+json" {
+			t.Fatalf("response status/content-type = %d/%q, want 403 problem+json", resp.StatusCode, resp.Header.Get("Content-Type"))
+		}
+	})
+
+	t.Run("direct TLS accepts same-host HTTPS origin", func(t *testing.T) {
+		hub := startWebSocketHub(t)
+		server, _ := startWebSocketTLSServer(t, websocketTestConfig(hub), identity, streamHandler)
+		host := strings.TrimPrefix(server.URL, "https://")
+		conn, response, err := websocket.Dial(context.Background(), server.URL+"/bidi", &websocket.DialOptions{
+			HTTPClient:   server.Client(),
+			HTTPHeader:   http.Header{"Origin": []string{"https://" + host}},
+			Subprotocols: []string{"appkit.contract.bidi.v1"},
+		})
+		if err != nil {
+			t.Fatalf("same-origin TLS WebSocket Dial failed: %v (response=%v)", err, response)
+		}
+		_ = conn.CloseNow()
+	})
+
+	t.Run("TLS-terminating proxy requires explicit HTTPS allowlist", func(t *testing.T) {
+		t.Run("forged forwarded proto does not establish same-origin", func(t *testing.T) {
+			hub := startWebSocketHub(t)
+			server, _ := startWebSocketServer(t, websocketTestConfig(hub), identity, streamHandler)
+			host := strings.TrimPrefix(server.URL, "http://")
+			req, err := http.NewRequest(http.MethodGet, server.URL+"/bidi", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("Origin", "https://"+host)
+			req.Header.Set("X-Forwarded-Proto", "https")
+			resp, err := server.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden || resp.Header.Get("Content-Type") != "application/problem+json" {
+				t.Fatalf("response status/content-type = %d/%q, want 403 problem+json", resp.StatusCode, resp.Header.Get("Content-Type"))
+			}
+		})
+
+		t.Run("explicit full HTTPS origin pattern allows proxy request", func(t *testing.T) {
+			hub := startWebSocketHub(t)
+			cfg := websocketTestConfig(hub)
+			cfg.OriginPatterns = []string{"https://127.0.0.1:*"}
+			server, _ := startWebSocketServer(t, cfg, identity, streamHandler)
+			host := strings.TrimPrefix(server.URL, "http://")
+			conn, response, err := websocket.Dial(context.Background(), server.URL+"/bidi", &websocket.DialOptions{
+				HTTPClient:   server.Client(),
+				HTTPHeader:   http.Header{"Origin": []string{"https://" + host}},
+				Subprotocols: []string{"appkit.contract.bidi.v1"},
+			})
+			if err != nil {
+				t.Fatalf("explicitly allowlisted proxy WebSocket Dial failed: %v (response=%v)", err, response)
+			}
+			_ = conn.CloseNow()
+		})
 	})
 }
 

@@ -43,8 +43,8 @@ type WebSocketConfig struct {
 	HandshakeTimeout time.Duration
 	// WriteTimeout 限制每个 WebSocket frame 的写入时间。
 	WriteTimeout time.Duration
-	// OriginPatterns 仅用于放行跨 Origin 浏览器请求；同源始终允许，缺省拒绝
-	// 所有跨源请求。禁止使用 "*"。
+	// OriginPatterns 仅用于放行跨 Origin 浏览器请求；匹配请求 scheme 与 host
+	// 的同源请求始终允许，缺省拒绝所有跨源请求。禁止使用 "*"。
 	OriginPatterns []string
 	// Hub 跟踪 hijacked 连接，必须非 nil。
 	Hub *WebSocketHub
@@ -621,7 +621,11 @@ func validateWebSocketOrigin(r *http.Request, patterns []string) error {
 	if err != nil || (!strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https")) || u.Host == "" || u.User != nil || u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
 		return apperr.InvalidArgument("WebSocket Origin is invalid")
 	}
-	if strings.EqualFold(u.Host, r.Host) {
+	requestScheme := "http"
+	if r.TLS != nil {
+		requestScheme = "https"
+	}
+	if strings.EqualFold(u.Scheme, requestScheme) && strings.EqualFold(u.Host, r.Host) {
 		return nil
 	}
 	for _, pattern := range patterns {
