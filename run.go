@@ -17,8 +17,9 @@ import (
 	"github.com/forgeplex/appkit/health"
 )
 
-// Run 启动应用并阻塞到 ctx 取消、收到 SIGINT/SIGTERM 或 HTTP 服务异常退出，
-// 然后优雅关停。调用前必须通过 Security 显式选择 HTTP 安全模式。
+// Run 启动应用并阻塞到 ctx 取消、收到 SIGINT/SIGTERM、HTTP 服务异常退出，
+// 或关键受管任务异常退出，然后优雅关停。启用业务 HTTP 时必须通过 Security
+// 显式选择 HTTP 安全模式；Headless 应用不要求该模式。
 //
 // 启动顺序：Register（声明）→ Remote 绑定 → 依赖图解析（fail-fast）→ 迁移 →
 // Setup（装配）→ 消费者订阅 Bus → OnStart 按 stage 升序（含 HTTP Listener）→
@@ -51,8 +52,10 @@ func (a *App) runHost(host *RunningApp) error {
 	if err := a.register(enabled); err != nil {
 		return err
 	}
-	if err := validateSecurityMode(a.cfg.securityMode); err != nil {
-		return err
+	if a.cfg.httpEnabled {
+		if err := validateSecurityMode(a.cfg.securityMode); err != nil {
+			return err
+		}
 	}
 	cancelBus := a.registerBusLifecycle(ctx)
 	defer cancelBus()
@@ -73,7 +76,11 @@ func (a *App) runHost(host *RunningApp) error {
 		return err
 	}
 	// Setup 也允许挂路由，因此校验必须发生在 buildMux/listen 之前。
-	if err := a.reg.validateRouteSecurity(a.cfg.securityMode, a.cfg.pprof); err != nil {
+	if a.cfg.httpEnabled {
+		if err := a.reg.validateRouteSecurity(a.cfg.securityMode, a.cfg.pprof); err != nil {
+			return err
+		}
+	} else if err := a.validateHeadlessRoutes(); err != nil {
 		return err
 	}
 	if err := a.reg.validatePermBindings(); err != nil {
@@ -83,11 +90,14 @@ func (a *App) runHost(host *RunningApp) error {
 		return err
 	}
 
-	mux, err := a.buildMux()
-	if err != nil {
-		return err
+	var server *http.Server
+	if a.cfg.httpEnabled {
+		mux, err := a.buildMux()
+		if err != nil {
+			return err
+		}
+		server = a.buildServer(a.wrap(mux))
 	}
-	server := a.buildServer(a.wrap(mux))
 
 	host.setState(hostStarting)
 	maxStage, startErr := a.startHooks(ctx, server)
@@ -111,7 +121,11 @@ func (a *App) runHost(host *RunningApp) error {
 	}
 
 	a.reg.health.SetReady(true)
-	log.Info("appkit: 就绪", "addr", a.cfg.httpAddr)
+	if server != nil {
+		log.Info("appkit: 就绪", "addr", a.cfg.httpAddr)
+	} else {
+		log.Info("appkit: 就绪", "profile", "headless")
+	}
 	host.markReady()
 
 	var triggerErr error
@@ -211,6 +225,9 @@ func (a *App) Migrate(ctx context.Context) error {
 		a.cfg.logger.Info("appkit: 无迁移可应用", "target", a.cfg.target)
 		return nil
 	}
+	if a.cfg.disableMigrations {
+		return fmt.Errorf("appkit: Profile 未启用迁移 capability，但模块 %q 声明了迁移", a.reg.migrations[0].Module)
+	}
 	if a.cfg.migrator == nil {
 		return fmt.Errorf("appkit: Migrate 需要迁移执行器：注入 appkit.Migrator(pgmigrate.Runner(pool))")
 	}
@@ -230,6 +247,9 @@ func (a *App) migrate(ctx context.Context) error {
 	sets := a.reg.migrations
 	if len(sets) == 0 {
 		return nil
+	}
+	if a.cfg.disableMigrations {
+		return fmt.Errorf("appkit: Profile 未启用迁移 capability，但模块 %q 声明了迁移", sets[0].Module)
 	}
 	if a.cfg.skipMigrations {
 		a.cfg.logger.Info("appkit: 跳过迁移（SkipMigrations）", "sets", len(sets))
@@ -259,6 +279,17 @@ func (a *App) subscribeConsumers() error {
 	}
 	for _, c := range a.reg.consumers {
 		a.cfg.bus.Subscribe(c.Topic, c.Handler)
+	}
+	return nil
+}
+
+func (a *App) validateHeadlessRoutes() error {
+	if a.cfg.pprof {
+		return errors.New("appkit: Headless 不支持 pprof；请启用业务 HTTP 或独立的受控诊断 Listener")
+	}
+	if len(a.reg.mounts) != 0 {
+		route := a.reg.mounts[0]
+		return fmt.Errorf("appkit: Headless 不支持 HTTP 路由 %q（模块 %q）", route.pattern, route.module)
 	}
 	return nil
 }
@@ -337,18 +368,20 @@ func (a *App) wrap(h http.Handler) http.Handler {
 // stageNone 表示尚无任何启动钩子开始执行。
 const stageNone = math.MinInt
 
-// startHooks 按 (stage, 注册序) 执行启动钩子，并在 StageServer 插入 HTTP 监听。
+// startHooks 按 (stage, 注册序) 执行启动钩子；HTTP 启用时在 StageServer 插入监听。
 // 返回实际开始执行过的最高 stage（关停时更高 stage 的 OnStop 会被跳过）。
 func (a *App) startHooks(ctx context.Context, server *http.Server) (maxStage int, err error) {
 	maxStage = stageNone
 	hooks := make([]startHook, len(a.reg.starts))
 	copy(hooks, a.reg.starts)
-	hooks = append(hooks, startHook{
-		stage:  StageServer,
-		seq:    len(hooks),
-		module: "appkit",
-		fn:     func(context.Context) error { return a.listen(server) },
-	})
+	if server != nil {
+		hooks = append(hooks, startHook{
+			stage:  StageServer,
+			seq:    len(hooks),
+			module: "appkit",
+			fn:     func(context.Context) error { return a.listen(server) },
+		})
+	}
 	sort.SliceStable(hooks, func(i, j int) bool {
 		if hooks[i].stage != hooks[j].stage {
 			return hooks[i].stage < hooks[j].stage
@@ -402,9 +435,13 @@ func (a *App) shutdown(server *http.Server, maxStartedStage int, host *RunningAp
 	}
 
 	// Shutdown 立即关闭 Listener/新连接，同时与 ManagedService Drain 并行等待
-	// 在途 HTTP 请求；Drain 时 Service Run Context 仍保持有效。
-	serverDone := make(chan error, 1)
-	go func() { serverDone <- server.Shutdown(ctx) }()
+	// 在途 HTTP 请求；Drain 时 Service Run Context 仍保持有效。Headless 没有
+	// appkit HTTP server，仍执行服务与 OnStop 清理。
+	var serverDone chan error
+	if server != nil {
+		serverDone = make(chan error, 1)
+		go func() { serverDone <- server.Shutdown(ctx) }()
+	}
 
 	for i := len(host.services) - 1; i >= 0; i-- {
 		service := host.services[i]
@@ -434,20 +471,22 @@ func (a *App) shutdown(server *http.Server, maxStartedStage int, host *RunningAp
 		}
 	}
 
-	select {
-	case err := <-serverDone:
-		if err != nil {
-			errs = append(errs, fmt.Errorf("appkit: HTTP 关停: %w", err))
+	if server != nil {
+		select {
+		case err := <-serverDone:
+			if err != nil {
+				errs = append(errs, fmt.Errorf("appkit: HTTP 关停: %w", err))
+				if closeErr := server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+					errs = append(errs, fmt.Errorf("appkit: HTTP 强制关闭: %w", closeErr))
+				}
+			}
+		case <-ctx.Done():
 			if closeErr := server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
 				errs = append(errs, fmt.Errorf("appkit: HTTP 强制关闭: %w", closeErr))
 			}
-		}
-	case <-ctx.Done():
-		if closeErr := server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
-			errs = append(errs, fmt.Errorf("appkit: HTTP 强制关闭: %w", closeErr))
-		}
-		if err := <-serverDone; err != nil {
-			errs = append(errs, fmt.Errorf("appkit: HTTP 关停: %w", err))
+			if err := <-serverDone; err != nil {
+				errs = append(errs, fmt.Errorf("appkit: HTTP 关停: %w", err))
+			}
 		}
 	}
 

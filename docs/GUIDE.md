@@ -591,6 +591,65 @@ appkit gen contract -in identityv1/contract.yaml -dir identityv1
 （DESIGN §5.3）。`idempotent: true` 的方法，生成 client 会对可用性故障做
 有界重试；`doc` 必填——契约是给别的团队读的。
 
+### Local 双向 Stream
+
+`contract.OpenLocal` 是独立于 Unary `contract.Call` 的双向流入口；它不继承
+Unary 的 5 秒默认超时。调用方必须明确给出最大时长、Close 等待预算和每个方向
+的有界队列容量；`IdleTimeout: 0` 表示禁用 idle 检查，`QueueSize: 0` 表示发送端
+与接收端 rendezvous、没有缓冲。`Send`、`Recv`、`CloseSend` 的操作 Context 只取消当前操作等待，
+可在操作取消后重试；Open 使用的根 Context 或 `Close` 才结束整条流。
+
+```go
+import (
+    "context"
+    "errors"
+    "io"
+    "time"
+
+    "github.com/forgeplex/appkit/contract"
+)
+
+type Request struct{ Text string }
+type Reply struct{ Text string }
+
+func streamGreeting(ctx context.Context) (retErr error) {
+    stream, err := contract.OpenLocal(ctx, "greeter", "GreetStream",
+        contract.StreamConfig{
+            MaxDuration:  2 * time.Minute,
+            IdleTimeout:  30 * time.Second,
+            CloseTimeout: 3 * time.Second,
+            QueueSize:    16,
+        },
+        func(streamCtx context.Context, peer contract.Stream[Reply, Request]) error {
+            request, err := peer.Recv(streamCtx)
+            if err != nil {
+                return err
+            }
+            return peer.Send(streamCtx, Reply{Text: request.Text})
+        },
+    )
+    if err != nil { return err } // 同步错误表示尚未建立 Stream
+    defer func() { retErr = errors.Join(retErr, stream.Close()) }()
+
+    if err := stream.Send(ctx, Request{Text: "hello"}); err != nil { return err }
+    if err := stream.CloseSend(ctx); err != nil { return err }
+    for {
+        reply, err := stream.Recv(ctx)
+        if errors.Is(err, io.EOF) { break }
+        if err != nil { return err }
+        _ = reply // 应用终态仍应是 Reply 等 DTO，不与 EOF 混同
+    }
+    return nil
+}
+```
+
+建立后的生产错误会以稳定的 `*apperr.Error` 由 `Recv` 返回；正常结束是
+`io.EOF`，不能把 EOF 当成业务终态。每条流最多一个并发 `Send` 和一个并发
+`Recv`，两者可重叠；满队列会背压，不会丢弃事件。`contract/streamtest` 提供
+可复用的 Adapter conformance suite；本地实现由 `OpenLocal` 驱动，后续 Transport
+可以为同一 suite 提供 `OpenFunc` 和测试服务。该 suite 不自动让应用契约生成器
+支持 Streaming。按 ADR-0047 §8，Streaming 新 API 在被显式提升前保持实验性。
+
 `contract.Call` 的 timeout 是协作式的：deadline 会传给实现，已经启动的同步
 实现若忽略 ctx 仍可能迟到返回，框架不会强杀 goroutine。涉及写入时，超时后的
 结果应按成功或未知结果处理，并用幂等键、查询或对账确认。
@@ -750,8 +809,54 @@ Run Context 仍有效；只要 Start 被调用过，即使 Start 返回错误也
 
 简单任务继续用现有 `reg.Worker(name, run)`；仅当组件需要由 Host 统一管理资源、就绪、
 Drain 和 Close 时才使用 ManagedService。它不替代 `ManagedSubscriber` 的 Broker 发布/
-订阅语义。当前 Host 仍启动既有 HTTP Listener，因此仍须显式选择 HTTP SecurityMode；
-Headless 等无 HTTP Profile 属后续能力。
+订阅语义。
+
+### Bootstrap Core 与工作负载 Profile
+
+`bootstrap.NewCore` 提供新的可组合运行入口，不改变既有 `bootstrap.Main` / `Run` 的
+HTTP + PostgreSQL + Bus 完整 Profile。新 Profile 用独立的 `ProfileOptions` 与
+`Capabilities` 表达，不能通过放宽 `-minimal` 来启动生产 Headless：
+
+```go
+func runEmbedded(ctx context.Context) error {
+    core, err := bootstrap.NewCore(ctx, bootstrap.ProfileOptions{
+        Service: "relay",
+        Modules: func(bootstrap.ProfileDeps) ([]appkit.Module, error) {
+            return []appkit.Module{relay.Module()}, nil
+        },
+        // 零值表示无业务 HTTP、PostgreSQL、Bus 和迁移能力。
+    })
+    if err != nil {
+        return err
+    }
+    running, err := core.Start(ctx) // Embedded：调用方管理 Host；不接管 OS Signal
+    if err != nil {
+        return err
+    }
+    return running.Wait()
+}
+```
+
+入口边界：
+
+- `core.Start(ctx)` 启动后返回 `RunningProfile`，用于 Embedded；调用方通过
+  `Shutdown(ctx)` 主动关停，或取消启动时传入的 Context。它不注册 OS Signal。
+- 进程入口使用 `bootstrap.NewRunner(options).Run(ctx)`：负责一次性注册 SIGINT/SIGTERM
+  并桥接到 Host；Runner 内部调用 Core，不要再叠加 `App.Run` 或第二个框架 Signal Handler。
+- `core.Execute(ctx, fn)` 用于 One-shot：Host Ready 后执行一次 `fn`，无业务 HTTP / Probe
+  Listener，不注册 OS Signal，函数返回后即关停。
+- `Capabilities.BusinessHTTP` 只有设为 true 才装配业务 HTTP，也只有此时要求并校验
+  `security.mode`；HTTP 启用后仍须分类路由并满足既有身份边界。
+- `Probe: &bootstrap.ProbeOptions{}` 是独立 Probe-only Listener，默认绑定
+  `127.0.0.1:8081`，仅提供精确的 `/healthz` 与 `/readyz`。非 loopback 地址必须同时显式确认
+  网络边界并提供认证中间件。设置非 `all` 的 `Target` 时，内部 Probe 模块仍会随所选业务
+  Target 启动，不会因此启用未选中的业务模块。它不会关闭 Headless 应用的出站凭证或其他
+  Service 自身认证。
+- PostgreSQL、Bus、Migrations 均为显式 capability。未启用迁移却声明 migration、未启用
+  Bus 却声明 Consumer、未启用业务 HTTP 却声明 route/pprof 时，启动会 fail-fast。
+  正式 no-HTTP/no-DB/no-Bus 组合不属于 `-minimal`，也不应把无池误判为已启用数据面。
+- Core 先初始化日志/Telemetry，再创建可选基础设施；关停时逆序清理，Telemetry 最后 flush。
+  清理错误使用 `errors.Join` 保留，配置与数据库初始化错误不得回显 DSN/秘密。
 
 ## 7. 第六步：跑起来
 

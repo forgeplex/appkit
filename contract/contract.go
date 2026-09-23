@@ -1,6 +1,6 @@
 // Package contract 实现跨模块契约调用的边界语义。
 //
-// 无论对端是进程内实现还是远程 client，每次契约方法调用都必须经过 Call：
+// 对于 Unary 契约方法，无论对端是进程内实现还是远程 client，都必须经过 Call：
 // 由合约仓库生成的 wrapper/client 在方法体内调用它。Call 保证两种部署形态下
 // 语义一致（ServiceWeaver 教训的反向落地——不隐藏网络边界，而是让进程内调用
 // 也表现得像一次可失败的远程调用）：
@@ -16,9 +16,10 @@
 //     的调用方必须按成功或未知结果用幂等/查询收敛。
 //  4. 错误规范化：任何错误折叠为 *apperr.Error，错误身份 = 错误码。
 //
-// 每次调用还自动产出一条 span 与一条 appkit.contract.call.duration 观测
+// 每次 Unary 调用还自动产出一条 span 与一条 appkit.contract.call.duration 观测
 // （标签 system/method/outcome，失败时附错误码）——契约边界是模块间唯一的
 // 交互面，这里的延迟与错误率就是模块间的 SLI，不该等到出事才补埋点。
+// 双向流是独立调用形态，见 stream.go；它不改变下方 Call 的语义。
 package contract
 
 import (
