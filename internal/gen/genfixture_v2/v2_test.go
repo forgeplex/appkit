@@ -2,14 +2,21 @@ package fixturev2
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/contract"
 	"github.com/forgeplex/appkit/httpserver"
 )
@@ -183,5 +190,165 @@ func TestV2LocalBidiStream(t *testing.T) {
 	}
 	if _, err := stream.Recv(ctx); !errors.Is(err, io.EOF) {
 		t.Fatalf("terminal Recv() error = %v, want EOF", err)
+	}
+}
+
+func TestV2GeneratedWebSocketSecureBidi(t *testing.T) {
+	service := fixtureService{}
+	hub := httpserver.NewWebSocketHub()
+	if err := hub.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := httpserver.WebSocketConfig{
+		Stream:           fixtureConfig(),
+		MaxMessageBytes:  4096,
+		HandshakeTimeout: time.Second,
+		WriteTimeout:     time.Second,
+		Hub:              hub,
+	}
+	wsHandler, err := NewChatWebSocketHandlerV2(cfg, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := time.Now().Add(30 * time.Second)
+	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(contract.HeaderServiceAuthorization) != "Bearer test-service-credential" {
+			apperr.WriteProblem(w, apperr.Unauthenticated("service authentication required"))
+			return
+		}
+		ctx := appkit.WithServicePrincipal(r.Context(), appkit.ServicePrincipal{
+			Subject: "test-service", ExpiresAt: expiresAt,
+		})
+		wsHandler.ServeHTTP(w, r.WithContext(ctx))
+	})
+	base := httpserver.Base(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var handler http.Handler = root
+	for i := len(base) - 1; i >= 0; i-- {
+		handler = base[i](handler)
+	}
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = hub.Close(ctx)
+		server.Close()
+	})
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: roots},
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+		},
+	}
+	client := &http.Client{Transport: transport}
+	var credentialCalls atomic.Int32
+	secure := contract.SecureClientOptions{
+		Audience: "fixture-chat",
+		Credentials: contract.ServiceCredentialProviderFunc(func(_ context.Context, scope contract.ServiceScope) (contract.ServiceCredential, error) {
+			credentialCalls.Add(1)
+			if scope.Audience != "fixture-chat" {
+				return contract.ServiceCredential{}, apperr.PermissionDenied("unexpected audience")
+			}
+			return contract.ServiceCredential{Token: "test-service-credential", ExpiresAt: expiresAt}, nil
+		}),
+		HTTPClient: client,
+	}
+	address := strings.Replace(server.URL, "https://", "wss://", 1) + "/chat"
+	stream, err := DialChatWebSocketV2(context.Background(), address, cfg, secure)
+	if err != nil {
+		t.Fatalf("DialChatWebSocketV2: %v", err)
+	}
+	defer stream.Close()
+	if err := stream.Send(context.Background(), ChatRequestV2{Text: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CloseSend(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	response, err := stream.Recv(context.Background())
+	if err != nil || response.Text != "echo: hello" {
+		t.Fatalf("Recv() = %+v, %v", response, err)
+	}
+	if _, err := stream.Recv(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("terminal Recv() = %v, want EOF", err)
+	}
+	if got := credentialCalls.Load(); got != 1 {
+		t.Fatalf("credential provider called %d times, want once per handshake", got)
+	}
+}
+
+func TestV2GeneratedWebSocketCredentialExpiryStopsClient(t *testing.T) {
+	hub := httpserver.NewWebSocketHub()
+	if err := hub.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cfg := httpserver.WebSocketConfig{
+		Stream: contract.StreamConfig{
+			MaxDuration:  5 * time.Second,
+			IdleTimeout:  4 * time.Second,
+			CloseTimeout: time.Second,
+			QueueSize:    1,
+		},
+		MaxMessageBytes:  4096,
+		HandshakeTimeout: time.Second,
+		WriteTimeout:     time.Second,
+		Hub:              hub,
+	}
+	wsHandler, err := NewChatWebSocketHandlerV2(cfg, fixtureService{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get(contract.HeaderServiceAuthorization) != "Bearer short-lived-credential" {
+			apperr.WriteProblem(w, apperr.Unauthenticated("service authentication required"))
+			return
+		}
+		ctx := appkit.WithServicePrincipal(r.Context(), appkit.ServicePrincipal{Subject: "short-lived-service"})
+		wsHandler.ServeHTTP(w, r.WithContext(ctx))
+	})
+	base := httpserver.Base(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var handler http.Handler = root
+	for i := len(base) - 1; i >= 0; i-- {
+		handler = base[i](handler)
+	}
+	server := httptest.NewTLSServer(handler)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = hub.Close(ctx)
+		server.Close()
+	})
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: roots},
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+		},
+	}
+	var credentialCalls atomic.Int32
+	expiresAt := time.Now().Add(time.Second)
+	secure := contract.SecureClientOptions{
+		Audience: "fixture-chat",
+		Credentials: contract.ServiceCredentialProviderFunc(func(context.Context, contract.ServiceScope) (contract.ServiceCredential, error) {
+			credentialCalls.Add(1)
+			return contract.ServiceCredential{Token: "short-lived-credential", ExpiresAt: expiresAt}, nil
+		}),
+		HTTPClient: &http.Client{Transport: transport},
+	}
+	address := strings.Replace(server.URL, "https://", "wss://", 1) + "/chat"
+	stream, err := DialChatWebSocketV2(context.Background(), address, cfg, secure)
+	if err != nil {
+		t.Fatalf("DialChatWebSocketV2: %v", err)
+	}
+	defer stream.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := stream.Recv(ctx); !apperr.Is(err, apperr.CodeUnauthenticated) {
+		t.Fatalf("Recv after credential expiry = %v, want UNAUTHENTICATED", err)
+	}
+	if got := credentialCalls.Load(); got != 1 {
+		t.Fatalf("credential provider called %d times, want once without refresh", got)
 	}
 }

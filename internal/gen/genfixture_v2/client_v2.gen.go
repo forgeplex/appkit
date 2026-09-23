@@ -14,6 +14,7 @@ import (
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
+	"github.com/forgeplex/appkit/httpserver"
 )
 
 // wrappedServiceV2 applies contract.Call to V2 Unary implementations.
@@ -165,4 +166,10 @@ func OpenChatLocalV2(ctx context.Context, cfg contract.StreamConfig, svc Streami
 	return contract.OpenLocal[ChatRequestV2, ChatResponseV2](ctx, "greet", "Chat", cfg, func(ctx context.Context, peer contract.Stream[ChatResponseV2, ChatRequestV2]) error {
 		return svc.Chat(ctx, peer)
 	})
+}
+
+// DialChatWebSocketV2 opens the secure remote Bidi Stream for /v2/chat.
+func DialChatWebSocketV2(ctx context.Context, address string, cfg httpserver.WebSocketConfig, secure contract.SecureClientOptions) (contract.ClientStream[ChatRequestV2, ChatResponseV2], error) {
+	cfg.System, cfg.Method = "greet", "Chat"
+	return httpserver.DialSecureWebSocket[ChatRequestV2, ChatResponseV2](ctx, address, cfg, secure)
 }

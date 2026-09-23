@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
@@ -79,5 +80,26 @@ func NewTailSSEHandlerV2(cfg httpserver.SSEConfig, svc StreamingServiceV2) (http
 		}
 		cursorFn := func(event TailResponseV2) string { return event.Sequence }
 		return svc.Tail(ctx, cursor, sseSenderAdapterV2[TailResponseV2, struct{}]{peer: peer, cursor: cursorFn})
+	})
+}
+
+// NewChatWebSocketHandlerV2 builds the authenticated WebSocket adapter for /v2/chat. Mount it through a classified Registry route.
+func NewChatWebSocketHandlerV2(cfg httpserver.WebSocketConfig, svc StreamingServiceV2) (http.Handler, error) {
+	cfg.System, cfg.Method = "greet", "Chat"
+	identity := cfg.IdentityResolver
+	if identity == nil {
+		identity = func(ctx context.Context) (httpserver.WebSocketIdentity, error) {
+			if actor, ok := appkit.ActorFrom(ctx); ok && actor.UserID != "" {
+				expiresAt, _ := appkit.IdentityExpiryFrom(ctx)
+				return httpserver.WebSocketIdentity{Subject: actor.UserID, ExpiresAt: expiresAt}, nil
+			}
+			if principal, ok := appkit.ServicePrincipalFrom(ctx); ok && principal.Subject != "" {
+				return httpserver.WebSocketIdentity{Subject: principal.Subject, ExpiresAt: principal.ExpiresAt}, nil
+			}
+			return httpserver.WebSocketIdentity{}, apperr.Unauthenticated("authentication required")
+		}
+	}
+	return httpserver.NewWebSocketHandler[ChatRequestV2, ChatResponseV2](cfg, identity, func(ctx context.Context, peer contract.Stream[ChatResponseV2, ChatRequestV2]) error {
+		return svc.Chat(ctx, peer)
 	})
 }

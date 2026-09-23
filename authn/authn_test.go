@@ -22,9 +22,11 @@ type env struct {
 	priv ed25519.PrivateKey
 	h    http.Handler
 	// actor 捕获中间件注入的 Actor 与 callctx（探针 handler 读 ctx 转存）。
-	actor  appkit.Actor
-	hasCtx bool
-	meta   callctx.Meta
+	actor     appkit.Actor
+	hasCtx    bool
+	meta      callctx.Meta
+	expiry    time.Time
+	hasExpiry bool
 }
 
 func newEnv(t *testing.T) *env {
@@ -37,6 +39,7 @@ func newEnv(t *testing.T) *env {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		e.actor, e.hasCtx = appkit.ActorFrom(r.Context())
 		e.meta = callctx.From(r.Context())
+		e.expiry, e.hasExpiry = appkit.IdentityExpiryFrom(r.Context())
 		w.WriteHeader(http.StatusOK)
 	})
 	e.h = Middleware(pub, testIssuer)(next)
@@ -79,7 +82,7 @@ func stepUpTok(sub string) jwt.MapClaims {
 // serve 发起请求，返回 (状态码, 规范化错误码)。e.actor 转存注入结果。
 func (e *env) serve(t *testing.T, bearer string, stepUp string) (int, string) {
 	t.Helper()
-	e.actor, e.hasCtx, e.meta = appkit.Actor{}, false, callctx.Meta{}
+	e.actor, e.hasCtx, e.meta, e.expiry, e.hasExpiry = appkit.Actor{}, false, callctx.Meta{}, time.Time{}, false
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
@@ -109,6 +112,9 @@ func TestMiddlewareHappyPath(t *testing.T) {
 	}
 	if e.meta.TenantID != "tenant-1" {
 		t.Fatalf("tid 应同时焊进 callctx，实际 %q", e.meta.TenantID)
+	}
+	if !e.hasExpiry || !e.expiry.After(time.Now().Add(50*time.Minute)) {
+		t.Fatalf("verified JWT expiry was not preserved: %v (has=%v)", e.expiry, e.hasExpiry)
 	}
 }
 

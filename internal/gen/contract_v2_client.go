@@ -17,6 +17,9 @@ func renderClientV2(doc *contractDocV2) []byte {
 		b.WriteString("\t\"encoding/json\"\n\t\"io\"\n\t\"net/http\"\n\t\"strings\"\n\t\"time\"\n")
 	}
 	b.WriteString("\n\t\"github.com/forgeplex/appkit/contract\"\n")
+	if hasV2BidiStream(doc) {
+		b.WriteString("\t\"github.com/forgeplex/appkit/httpserver\"\n")
+	}
 	if hasV2Unary(doc) {
 		b.WriteString("\t\"github.com/forgeplex/appkit/apperr\"\n\t\"github.com/forgeplex/appkit/callctx\"\n")
 	}
@@ -33,7 +36,22 @@ func renderClientV2(doc *contractDocV2) []byte {
 	if hasV2Streaming(doc) {
 		renderV2LocalStreamingClient(&b, doc)
 	}
+	if hasV2BidiStream(doc) {
+		renderV2WebSocketClient(&b, doc)
+	}
 	return b.Bytes()
+}
+
+func renderV2WebSocketClient(b *bytes.Buffer, doc *contractDocV2) {
+	for _, m := range doc.Methods {
+		if m.Kind != "bidi_stream" {
+			continue
+		}
+		request, response := v2RequestType(m), v2ResponseType(m)
+		fmt.Fprintf(b, "// Dial%sWebSocketV2 opens the secure remote Bidi Stream for %s.\nfunc Dial%sWebSocketV2(ctx context.Context, address string, cfg httpserver.WebSocketConfig, secure contract.SecureClientOptions) (contract.ClientStream[%s, %s], error) {\n", m.Name, m.Path, m.Name, request, response)
+		fmt.Fprintf(b, "\tcfg.System, cfg.Method = %q, %q\n", doc.System, m.Name)
+		fmt.Fprintf(b, "\treturn httpserver.DialSecureWebSocket[%s, %s](ctx, address, cfg, secure)\n}\n\n", request, response)
+	}
 }
 
 func hasV2UnaryRequest(doc *contractDocV2) bool {

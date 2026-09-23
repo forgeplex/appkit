@@ -4,6 +4,7 @@
 package httpserver
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"log/slog"
@@ -159,6 +160,13 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 
 // Unwrap 供 http.ResponseController 透传 Flush/Hijack 等能力。
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// Hijack 显式透传 WebSocket 所需的 http.Hijacker。第三方升级器通常直接
+// 做接口断言；仅实现 Unwrap 并不能满足这些升级器（ResponseController 才会
+// 自动沿 Unwrap 链查找）。
+func (w *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	return http.NewResponseController(w.ResponseWriter).Hijack()
+}
 
 func (w *statusWriter) Flush() {
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {

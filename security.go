@@ -71,6 +71,8 @@ type ServicePrincipal struct {
 
 type servicePrincipalKey struct{}
 
+type identityExpiryKey struct{}
+
 type untrustedIdentityHeadersKey struct{}
 
 // UntrustedIdentityHeadersFrom 返回严格 HTTP 边界剥离的原始身份头副本。
@@ -94,6 +96,20 @@ func ServicePrincipalFrom(ctx context.Context) (ServicePrincipal, bool) {
 	p, ok := ctx.Value(servicePrincipalKey{}).(ServicePrincipal)
 	p.Audience = slices.Clone(p.Audience)
 	return p, ok && p.Subject != ""
+}
+
+// WithIdentityExpiry records an expiry from a successfully verified user
+// credential without widening Actor's public struct. Only trusted authentication
+// middleware should call it; network headers and request bodies are never sources.
+func WithIdentityExpiry(ctx context.Context, expiresAt time.Time) context.Context {
+	return context.WithValue(ctx, identityExpiryKey{}, expiresAt)
+}
+
+// IdentityExpiryFrom returns the expiry attached by trusted user authentication
+// middleware. Service credentials carry ExpiresAt on ServicePrincipal instead.
+func IdentityExpiryFrom(ctx context.Context) (time.Time, bool) {
+	expiresAt, ok := ctx.Value(identityExpiryKey{}).(time.Time)
+	return expiresAt, ok && !expiresAt.IsZero()
 }
 
 // MountPublic 挂载无需身份的公开路由。公开是显式安全决策，不是“忘了包
@@ -194,6 +210,7 @@ func identityBoundary(next http.Handler) http.Handler {
 		// 遮蔽可能由边界外代码带入的主体；后续验签器只能重新注入新值。
 		ctx = clearActor(ctx)
 		ctx = WithServicePrincipal(ctx, ServicePrincipal{})
+		ctx = WithIdentityExpiry(ctx, time.Time{})
 
 		clean := req.Clone(ctx)
 		for name := range clean.Header {

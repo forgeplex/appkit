@@ -640,9 +640,10 @@ appkit contract-check -base feedv2/contract.yaml -candidate feedv2-next/contract
 V2 会生成 `service_v2.gen.go`、`client_v2.gen.go`、`server_v2.gen.go` 和
 `openapi_v2.yaml`。V2 Unary 有独立的 `ServiceV2`、HTTP client/server 与
 `WrapServiceV2`；Server Stream 生成 Local opener 和 `New<Method>SSEHandlerV2`；
-Bidi 生成 transport-neutral 接口及 Local opener，WebSocket wire adapter 留给后续
-切片。OpenAPI 用 `x-appkit-call-shape` / `x-appkit-stream` 扩展表达流形态；不生成
-AsyncAPI。V1 五份生成文件与 OpenAPI 保持逐字节稳定，V1 schema 也拒绝 V2 流形态字段。
+Bidi 生成 transport-neutral 接口、Local opener、`New<Method>WebSocketHandlerV2`
+和 `Dial<Method>WebSocketV2`。OpenAPI 用 `x-appkit-call-shape` /
+`x-appkit-stream` 扩展表达流形态；不生成 AsyncAPI。V1 五份生成文件与 OpenAPI
+保持逐字节稳定，V1 schema 也拒绝 V2 流形态字段。
 
 ### Local 双向 Stream
 
@@ -706,6 +707,72 @@ func streamGreeting(ctx context.Context) (retErr error) {
 `contract.Call` 的 timeout 是协作式的：deadline 会传给实现，已经启动的同步
 实现若忽略 ctx 仍可能迟到返回，框架不会强杀 goroutine。涉及写入时，超时后的
 结果应按成功或未知结果处理，并用幂等键、查询或对账确认。
+
+### 远程双向 Stream：WSS
+
+V2 Bidi 的远程 Transport 使用 `httpserver` 子包；公开类型不会进入根包。
+服务器必须把 `WebSocketHub` 注册为 Host `ManagedService`，这样 Host 才能停止
+新连接、发送 GoingAway 并在关停预算耗尽时关闭 hijacked socket：
+
+```go
+hub := httpserver.NewWebSocketHub()
+if err := reg.ManagedService("websocket-hub", appkit.ServiceCritical,
+    func(*appkit.Registry) (appkit.ManagedService, error) { return hub, nil }); err != nil {
+    return err
+}
+
+handler, err := chatv2.NewChatWebSocketHandlerV2(httpserver.WebSocketConfig{
+    Stream: contract.StreamConfig{
+        MaxDuration: 10 * time.Minute, IdleTimeout: time.Minute,
+        CloseTimeout: 5 * time.Second, QueueSize: 16,
+    },
+    MaxMessageBytes: 1 << 20, HandshakeTimeout: 5 * time.Second,
+    WriteTimeout: 10 * time.Second,
+    OriginPatterns: []string{"https://console.example.test"},
+    Hub: hub,
+}, chatService)
+if err != nil { return err }
+reg.MountAuthenticated("GET /v2/chat", handler)
+```
+
+按具体授权模型选择 `MountAuthenticated`、`MountPermission` 或
+`MountInternalService`；认证和路由分类在 Upgrade 前执行。生成 Handler 默认从
+已验签的 Actor / ServicePrincipal 重建身份，可通过 `IdentityResolver` 适配自定义
+认证器。它不从 query、URL 参数或消息帧读取身份。跨 Origin 浏览器只允许显式
+配置的 Origin pattern；缺少 Origin 的非浏览器客户端仍必须经过认证路由。
+同源判断同时比较 scheme 与 host。若 TLS 在反向代理终止、appkit 收到的是明文
+HTTP，请显式配置浏览器外部 Origin 的完整 scheme（例如 `https://console.example.test`）；
+appkit 不信任任意 `X-Forwarded-Proto` 来推断外部 scheme。
+认证主体保留在连接根 Context 中用于连接安全与到期管理；进入 Streaming Contract
+实现时仍经过 `contract.OpenLocal` 的 Context Firewall，因此 Actor、ServicePrincipal
+和任意 Context value 不会越过契约边界，只有 trace、deadline/cancellation 与白名单
+`callctx.Meta` 会传递。不要把连接认证误当成跨模块身份委托。
+
+服务客户端只接受 WSS，并通过现有 secure credential provider 在握手时获取一次
+短期服务凭证：
+
+```go
+stream, err := chatv2.DialChatWebSocketV2(ctx, "wss://chat.example.test/v2/chat",
+    httpserver.WebSocketConfig{
+        Stream: contract.StreamConfig{
+            MaxDuration: 10 * time.Minute, IdleTimeout: time.Minute,
+            CloseTimeout: 5 * time.Second, QueueSize: 16,
+        },
+        MaxMessageBytes: 1 << 20, HandshakeTimeout: 5 * time.Second,
+        WriteTimeout: 10 * time.Second,
+    },
+    contract.SecureClientOptions{Audience: "chat-service", Credentials: credentialProvider},
+)
+if err != nil { return err }
+defer stream.Close()
+```
+
+凭证过期后不刷新；客户端或服务端已提供的 expiry 到期即停止应用帧收发并结束
+连接。协议使用 `appkit.contract.bidi.v1` 子协议和 JSON text frame：`data` 携带
+契约 DTO，客户端以 `half_close` 结束发送方向，服务端以 `end` 或仅含稳定错误码的
+`error` 终结；Upgrade 前错误仍是 `application/problem+json`。队列按 Stream 的帧数
+容量和单帧字节上限共同约束，满队列会阻塞适配器而不是丢帧。该 Transport 不提供
+自动重连、cursor/replay、Session 或业务终态；调用方仍负责这些领域语义。
 
 ### HTTP Server Streaming：POST + SSE
 
