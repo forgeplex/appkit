@@ -85,9 +85,10 @@ appkit/                          # module github.com/forgeplex/appkit
 ├── appkit.go                    # ★ 稳定核心：Module / Registry / App / Provide / Resolve
 │                                #   —— 只依赖 stdlib（http.Handler、fs.FS、context），
 │                                #   不暴露 gin/pgx 类型，防止框架兼容性被第三方库绑架
-├── run.go                       # App.Run：模块拓扑排序装配、-target 过滤、
-│                                #   signal.NotifyContext、正序启动/逆序优雅关停；
-│                                #   App.Migrate：只应用迁移即返回（initContainer 用）
+├── run.go                       # App.Run：模块装配、-target 过滤、进程 Signal、
+│                                #   正序启动/逆序优雅关停；App.Migrate 仅应用迁移
+├── host.go                      # App.Start / RunningApp：单次 Host、Wait/Shutdown，
+│                                #   ManagedService 生命周期与独立 Run Context
 ├── security.go                  # HTTP SecurityMode、四类 Mount 路由守卫、
 │                                #   identity boundary 与 ServicePrincipal 落点（见 §5.4）
 ├── worker.go                    # Registry.Worker：长驻后台任务的托管注册
@@ -310,7 +311,14 @@ func (r *Registry) Migrations(schema string, fsys fs.FS)
 func (r *Registry) Consumer(topic string, h outbox.Handler)
 func (r *Registry) Health(name string, c health.Checker)
 func (r *Registry) OnStart(stage int, fn func(context.Context) error) // OnStop 自动逆序
+func (r *Registry) ManagedService(name string, policy ServicePolicy, factory ManagedServiceFactory) error
 ```
+
+`App.Run` 是拥有进程信号的入口；`App.Start` 不拥有 OS Signal，返回 Ready 后的
+`RunningApp`，由调用方 `Wait`/`Shutdown`。`Run`、`Start`、`Migrate` 互斥消费同一 App
+实例。ManagedService 的 Host 关停顺序是全体反序 Drain、取消 Service Run Context、
+等待全体 Run 退出、全体反序 Close；普通 `Worker` 与 `ManagedSubscriber` 保持各自现有
+语义，不隐式升级为 ManagedService。
 
 ### 5.2 组装（psp/cmd/psp/main.go）
 
@@ -618,8 +626,9 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 没人跑迁移不可能 | 登记了迁移却既无 `Migrator` 又无 `SkipMigrations()` → 启动报错；`-migrate` 无 `database.url` 亦报错 | ★ 装配级 fail-fast |
 | 独立 sqlc 快照不与迁移脱节 | 脚手架分发独立 schema 工具，在随机临时库回放迁移并读取 catalog，生成 `db/schema.sql` 与来源锁；采用后普通测试检查摘要，带测试 DSN 时重放逐字比对 | ▲ 生成/CI 级：默认仍读取 migrations；仅离线哈希不证明数据库一致。快照仅支持一个 PostgreSQL SQL 项，不支持的结构失败；不是 SQL 沙箱或部署备份 |
 | schema 文档不与迁移脱节 | `appkit schema` 把 `db/migrations` 应用到一次性临时库（复用生产的迁移 runner）再读回 `pg_catalog`；在固定数据库环境、可复现迁移下生成确定性文档，不承诺跨 PostgreSQL/扩展/模板库或随机 SQL 的绝对纯函数。CI 一步 `-check` 比对，缺文件/被手改/删表后的残留都算漂移。渲染不了的特性（原生分区表、生成列、继承…）点名报错；RLS 如实渲染（策略被删/FORCE 被摘即漂移） | ▲ CI 级，**有个洞**：`db/SCHEMA.md` 与 `db/schema/` 都不存在时打条 `::notice` 后放行；从不启用的仓库永远不被检查，跑过一次 `make schema` 就永久转严。新增检查随 appkit release + sync 显式进入下游，不会由 main 突然扩散。 |
+| service-role 权限声明不靠手抄 SQL | `db/access.yaml` 经 `appkit db-access validate\|render\|check` 严格解析；登录角色及秘密只能外部管理，permission role 固定 NOLOGIN/NOSUPERUSER/NOBYPASSRLS/NOCREATEDB/NOCREATEROLE；标识符白名单、确定性 SQL 与拒绝覆盖已有文件把声明转成可审查的追加 migration；RLS policy 集合和 catalog 定义在 apply 时精确匹配 | ▲ 生成/静态检查 + RLS catalog apply 守卫：当前能证明 manifest 合法、生成物同源及声明时 policy 无缺失/额外/定义漂移，**尚不能证明数据库完整实际 ACL、继承/PUBLIC 有效权限或 RLS 谓词业务行为**；删掉旧 grant 不会自动推导 REVOKE，须在新 manifest 显式列入 forbidden/reconciliation，后续仍需 catalog verifier 与真实低权限行为测试 |
 | 表有说明（`COMMENT ON TABLE`） | 缺的表在 `db/SCHEMA.md` 表清单里标 ⚠ 缺说明并给出该补的那一句；`appkit schema -check` 在 CI 里逐表打 `::warning` 注解 | ▲ 软约束：不阻断 CI（刻意的，存量仓库不会突然红），且 `db/SCHEMA.md` 带 `linguist-generated` 在 PR diff 里默认折叠——⚠ 没人主动打开就看不见，::warning 注解是让它浮出水面的那一半 |
-| 长驻任务死了必被发现 | `Registry.Worker` 托管：异常退出上报主循环并触发关停（不再是"探针绿着、事件停摆"） | ★ API 设计级 |
+| 长驻任务死了必被发现 | `Registry.Worker` 托管：异常退出上报主循环并触发关停；需要资源生命周期的组件用 `ManagedService`（Critical/Optional、Ready、反序 Drain/Close） | ★ API 设计级 |
 | ctx 只能传白名单元数据 | `callctx.Meta` 是具名字段的 struct 而非 map，防火墙剥值后只放回它 | ★ 编译器级：塞不进去 |
 | 周期任务多副本不重跑 | `job.Every` 用 Postgres advisory lock（session 级，连接断开自动释放） | ▲ API 设计级：正确写法零成本，裸 ticker 拦不住 |
 | 指标基数不失控 | 标签值只能是代码常量或 `internal/metrics` 收敛过的枚举；SQL 动词过白名单，未识别塌缩为 `other` | ▲ API 设计级：业务传不进框架指标，但自建 meter 仍可自伤 |

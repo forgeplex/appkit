@@ -723,6 +723,36 @@ return app.Run(ctx)
 投递语义仍是至少一次：发布成功只表示 Broker 已持久确认，不表示消费者业务已经
 生效；消费端继续用 inbox 与业务唯一约束保证幂等生效。
 
+#### 嵌入式 Host 与 ManagedService
+
+当 AppKit 运行在另一个进程或宿主内，而不是由它直接拥有 main 生命周期时，可用
+`App.Start(ctx)`。它不注册 SIGINT/SIGTERM；`Start` 同步完成装配并等待所有受管服务
+Ready 后返回 `*RunningApp`。传入 Context 同时覆盖启动期与运行期，取消会发起优雅
+关停；调用方也可通过 `Shutdown(ctx)` 主动关停，`Wait()` 可安全重复或并发调用。
+`Shutdown` 的 Context 限制关停预算；预算耗尽后它返回超时，但 Host 仍继续尝试后续
+清理。`App` 是单次使用实例：`Run`、`Start`、`Migrate` 任一入口开始后都不能复用。
+
+```go
+host, err := app.Start(ctx) // ctx 取消会关停；Start 不接管 OS Signal
+if err != nil {
+    return err
+}
+return host.Wait() // 多个调用方可同时 Wait；显式关停可从其他协程调用 Shutdown
+```
+
+模块需要让 Host 同时拥有资源与服务循环时，在 Register 阶段声明
+`Registry.ManagedService(name, policy, factory)`。Factory 在依赖解析和 Setup 后执行，
+不应在构造时取得外部资源；资源在 `Start` 中创建，`Run` 执行循环，`Ready` 同时作为
+启动门和运行期 readiness 检查。默认 `ServiceCritical`：Ready 后 Run 意外返回会触发
+Host 关停；`ServiceOptional` 只记录退出错误，不自动重启，也不触发关停。关停顺序为
+反序 Drain 全部服务、取消 Run Context、等待全部 Run 退出、反序 Close。Drain 期间
+Run Context 仍有效；只要 Start 被调用过，即使 Start 返回错误也会 Close 一次。
+
+简单任务继续用现有 `reg.Worker(name, run)`；仅当组件需要由 Host 统一管理资源、就绪、
+Drain 和 Close 时才使用 ManagedService。它不替代 `ManagedSubscriber` 的 Broker 发布/
+订阅语义。当前 Host 仍启动既有 HTTP Listener，因此仍须显式选择 HTTP SecurityMode；
+Headless 等无 HTTP Profile 属后续能力。
+
 ## 7. 第六步：跑起来
 
 单个域仓库（identity 目录内）：
@@ -1312,8 +1342,9 @@ keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可
 
 **Q：模块还需要哪些生命周期钩子？**
 一般不需要。连接池、迁移、HTTP、relay、优雅关停都由框架或骨架接好；
-自定义后台任务用 `reg.Worker(name, run)` 一行（框架负责起协程、关停等待、
-异常上报）。`reg.OnStart` / `reg.OnStop` 留给真正需要自定义时序的场景。
+简单自定义后台任务用 `reg.Worker(name, run)` 一行（框架负责起协程、关停等待、
+异常上报）；需要成套管理资源和服务循环时注册 `ManagedService`。`reg.OnStart` /
+`reg.OnStop` 留给真正需要自定义时序的场景。
 
 **Q：我能改坏框架吗？**
 框架代码在 module cache 里（`0444` 只读），改不到。启动装配也已经收进
@@ -1321,6 +1352,116 @@ keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可
 （lint/CI 配置、sqlc 产物、基础迁移）留在你仓库里但带生成头，改了会被
 `appkit check` 拦下——包括"把规则改松"这一手。你写的代码在 `internal/`，
 和上面两类不共处一处。
+
+## 数据库 service-role 权限契约
+
+服务连接账号与对象 ACL 可选择由 `db/access.yaml` 声明，避免每个服务各写一套
+不可比较的 GRANT 脚本。该文件只描述角色名、membership、对象权限、RLS 要求与
+明确禁止项；**不得包含密码、DSN、Token 或其他秘密**。登录账号由 IaC/Secret
+Manager 创建，manifest 中必须标为 `managed: false`；AppKit 只管理 NOLOGIN 的
+permission role。
+`roles.permission.managed: true` 表示其安全属性由 manifest 权威管理；每次生成物都会
+把该 NOLOGIN role 收紧为声明状态，数据库中的临时手工漂移不会被保留。
+
+```yaml
+version: 1
+service: admin_api
+roles:
+  login:
+    name: psp_admin_api
+    managed: false
+    attributes: {login: true, inherit: true}
+  permission:
+    name: app_admin_api
+    managed: true
+    attributes: {login: false, inherit: true}
+memberships:
+  required: [app_admin_channel_test]
+  forbidden: [app_admin]
+grants:
+  schemas:
+    merchant: [USAGE]
+  tables:
+    merchant.admin_account: [SELECT, INSERT, UPDATE]
+  functions:
+    - schema: merchant
+      name: search_admin_account_keys
+      arguments: [text]
+      privileges: [EXECUTE]
+rls:
+  merchant.admin_account:
+    enabled: true
+    forced: true
+    exactPolicies: true
+    policies:
+      - name: admin_account_tenant_isolation
+        command: ALL
+        mode: PERMISSIVE
+        roles: [PUBLIC]
+        using: "true"
+        withCheck: "true"
+forbidden:
+  roleAttributes: [SUPERUSER, BYPASSRLS, CREATEDB, CREATEROLE]
+  privileges: [TRUNCATE, TRIGGER]
+  mutations: [ledger.ledger_entry]
+```
+
+工作流是先校验，再生成一个**新的**追加 migration；输出路径的父目录必须预先
+存在且输出目录本身不得是符号链接；祖先路径会先规范化为真实路径，命令不会创建
+目录或改变目录权限。Darwin/Linux 上生成器从根目录句柄逐级拒绝符号链接，并在最终
+目录句柄内完整写入和同步临时文件，再原子发布最终路径；其他平台的 `-out` 会
+fail-closed，仍可省略 `-out` 使用 stdout。因此并发读取不会看到半成品；输出
+文件已存在时拒绝覆盖。新文件权限不宽于 `0644`。已应用
+migration 仍服从 pgmigrate 的 checksum 不可变规则。生成 SQL 不自带事务控制，
+由 pgmigrate 的单文件事务统一提交或回滚：
+
+```sh
+appkit db-access validate -manifest db/access.yaml
+appkit db-access render -manifest db/access.yaml \
+  -out db/migrations/0003_service_access.sql
+appkit db-access check -manifest db/access.yaml \
+  -sql db/migrations/0003_service_access.sql
+```
+
+`render` 也可省略 `-out` 把纯 SQL 写到 stdout；诊断只写 stderr，可安全接 SQL
+管道。生成器会创建/收紧 permission role、
+建立 required membership、撤销明确 forbidden membership/表写权限并授予声明的
+schema/table/column/sequence/function 权限。`forbidden.mutations` 是独立的负向
+reconciliation scope：对象无需同时出现在 `grants.tables`，用于撤销遗留写 ACL；
+同表的 table 或 column `INSERT/UPDATE` 等写授权会在校验阶段被拒绝；
+生成 SQL 也会枚举 relation 的现有列并撤销历史列级 `INSERT/UPDATE` ACL；
+`forbidden.privileges` 会从 table grant、column grant 和 mutation 涉及的全部受管表撤销
+permission role 的直接表级 ACL；对 PostgreSQL 支持列级授权的 `SELECT`、`INSERT`、
+`UPDATE`、`REFERENCES`，生成器也会枚举现有列并撤销历史列级 ACL。不存在的
+forbidden membership 会安全跳过，以便不同环境
+收敛；存在时会撤权。`forbidden.roleAttributes` 必须完整声明 `SUPERUSER`、`BYPASSRLS`、
+`CREATEDB`、`CREATEROLE`，生成器据此创建或收紧 permission role；`NOLOGIN` 是 permission
+role 的固定边界。
+继承与 `PUBLIC` 的有效权限仍由后续
+catalog verifier 检查。RLS 条目必须使用 `exactPolicies: true` 声明该表完整的 policy
+集合，以及每个 policy 的 command、PERMISSIVE/RESTRICTIVE 模式、roles 和 catalog
+规范化后的 `USING`/`WITH CHECK` 表达式。生成 SQL 会在同一事务先对目标表取得排他锁，
+再精确比较 `pg_policy`；缺失、额外 policy 或任一定义漂移都会 fail-closed，避免多个
+PERMISSIVE policy 通过 `OR` 意外放宽访问，或 RESTRICTIVE policy 通过 `AND` 意外收紧。
+Policy DDL 仍由版本 migration 定义，包含 policy 的 migration 必须排在 access migration
+之前；表达式应使用 `pg_get_expr`/schema 文档显示的规范化文本。生成文件
+带 `DO NOT EDIT` 标记，不支持拆分或手工改写后绕开该原子顺序。当前
+所有被引用的 schema/table/sequence/function/type/policy 都是前置依赖，必须由编号更小
+的 migration 创建；顺序错误会使 access migration 整体失败并回滚。函数参数中的
+PostgreSQL 内置类型可使用短名，自定义类型必须写为 `schema.type`，避免依赖
+`search_path`。相同 column/function 身份不得重复声明，避免规范化结果依赖 YAML
+顺序。permission role 是集群级对象；生成物按 role 名获取跨 schema transaction
+advisory lock，再执行创建和全部属性/ACL 变更；重复创建竞态仍按 PostgreSQL 实际
+返回收敛 `duplicate_object` / `unique_violation`。
+`validate/render/check` 是静态与
+生成证据；`check -sql` 只比较指定生成物的字节漂移，不读取 pgmigrate 已应用清单，
+也不是数据库验收：尚未检查实际 catalog、继承链、`PUBLIC` 有效权限或
+真实 `SET ROLE` 行为。权限或 required membership 被移出正向声明时，须在新版本
+manifest 的对应 forbidden 列表中显式写出撤销对象；缩减 forbidden 列表仅表示放松
+负向约束，不会恢复权限。`forbidden.mutations` 的值静态校验为 `schema.object`，语义
+限定为 table/view relation；实际 relation 类型由 PostgreSQL apply fail-closed，并由后续
+catalog verifier 负责 managed scope 的 missing/unexpected
+精确比较。
 
 ## 独立 sqlc schema 快照
 

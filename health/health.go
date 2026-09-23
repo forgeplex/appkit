@@ -59,8 +59,8 @@ func (r *Registry) logger() *slog.Logger {
 	return slog.Default()
 }
 
-// SetReady 设置全局就绪状态。框架在全部 OnStart 完成后置 true，
-// 收到关停信号后立即置 false。
+// SetReady 设置全局就绪状态。框架在全部 OnStart 和 ManagedService Ready 完成后
+// 置 true，进入关停后立即置 false。
 func (r *Registry) SetReady(ready bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
