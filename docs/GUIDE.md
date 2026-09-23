@@ -790,7 +790,9 @@ func runEmbedded(ctx context.Context) error {
   `security.mode`；HTTP 启用后仍须分类路由并满足既有身份边界。
 - `Probe: &bootstrap.ProbeOptions{}` 是独立 Probe-only Listener，默认绑定
   `127.0.0.1:8081`，仅提供精确的 `/healthz` 与 `/readyz`。非 loopback 地址必须同时显式确认
-  网络边界并提供认证中间件。它不会关闭 Headless 应用的出站凭证或其他 Service 自身认证。
+  网络边界并提供认证中间件。设置非 `all` 的 `Target` 时，内部 Probe 模块仍会随所选业务
+  Target 启动，不会因此启用未选中的业务模块。它不会关闭 Headless 应用的出站凭证或其他
+  Service 自身认证。
 - PostgreSQL、Bus、Migrations 均为显式 capability。未启用迁移却声明 migration、未启用
   Bus 却声明 Consumer、未启用业务 HTTP 却声明 route/pprof 时，启动会 fail-fast。
   正式 no-HTTP/no-DB/no-Bus 组合不属于 `-minimal`，也不应把无池误判为已启用数据面。

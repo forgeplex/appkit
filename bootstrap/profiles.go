@@ -302,8 +302,12 @@ func (c *Core) Start(ctx context.Context) (*RunningProfile, error) {
 		}
 		modules = append(modules, probeModule{options: *c.options.Probe})
 	}
+	target := c.options.Target
+	if c.options.Probe != nil {
+		target = includeProbeTarget(target)
+	}
 
-	appOptions := []appkit.Option{appkit.Target(c.options.Target), appkit.Logger(c.deps.Log)}
+	appOptions := []appkit.Option{appkit.Target(target), appkit.Logger(c.deps.Log)}
 	if c.options.Capabilities.BusinessHTTP {
 		appOptions = append(appOptions,
 			appkit.HTTPAddr(c.deps.Base.Addr),
@@ -328,7 +332,7 @@ func (c *Core) Start(ctx context.Context) (*RunningProfile, error) {
 	}
 	// Profile capability guards are deliberately last: AppOptions cannot re-enable
 	// a disabled listener, Bus, or migration runner.
-	appOptions = append(appOptions, appkit.Target(c.options.Target), appkit.Logger(c.deps.Log))
+	appOptions = append(appOptions, appkit.Target(target), appkit.Logger(c.deps.Log))
 	if c.options.Capabilities.BusinessHTTP {
 		appOptions = append(appOptions, appkit.Security(c.securityMode))
 	} else {
@@ -583,6 +587,18 @@ func isNilEventBus(bus EventBus) bool {
 	default:
 		return false
 	}
+}
+
+func includeProbeTarget(target string) string {
+	if !isSplitTarget(target) {
+		return target
+	}
+	for _, name := range strings.Split(target, ",") {
+		if strings.TrimSpace(name) == probeModuleName {
+			return target
+		}
+	}
+	return target + "," + probeModuleName
 }
 
 func normalizeProbeOptions(options ProbeOptions) (ProbeOptions, error) {

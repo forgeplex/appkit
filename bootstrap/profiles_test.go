@@ -205,7 +205,21 @@ func TestProbeOnlyServesHealthAndReadiness(t *testing.T) {
 	}
 
 	options := profileTestOptions(t)
+	options.Target = "selected"
 	options.Probe = &ProbeOptions{Addr: addr}
+	selectedRegistered := false
+	options.Modules = func(ProfileDeps) ([]appkit.Module, error) {
+		return []appkit.Module{
+			profileTestModule{name: "selected", register: func(*appkit.Registry) error {
+				selectedRegistered = true
+				return nil
+			}},
+			profileTestModule{name: "not-selected", register: func(*appkit.Registry) error {
+				t.Error("business Target must keep unrelated modules disabled")
+				return errors.New("unexpected module registration")
+			}},
+		}, nil
+	}
 	core, err := NewCore(t.Context(), options)
 	if err != nil {
 		t.Fatalf("NewCore: %v", err)
@@ -213,6 +227,9 @@ func TestProbeOnlyServesHealthAndReadiness(t *testing.T) {
 	running, err := core.Start(t.Context())
 	if err != nil {
 		t.Fatalf("Start Probe-only: %v", err)
+	}
+	if !selectedRegistered {
+		t.Fatal("selected business module was not registered")
 	}
 	defer func() { _ = running.Shutdown(context.Background()) }()
 
