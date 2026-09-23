@@ -217,7 +217,9 @@ func (a *App) register(enabled []Module) error {
 
 func (a *App) registerModule(m Module) (err error) {
 	a.reg.current = m.Name()
+	a.reg.registeringModule = true
 	defer func() {
+		a.reg.registeringModule = false
 		if p := recover(); p != nil {
 			err = fmt.Errorf("appkit: 模块 %q 的 Register panic: %v", m.Name(), p)
 		}
