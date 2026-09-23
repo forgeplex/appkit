@@ -84,3 +84,30 @@ type ManagedSubscriber interface {
 	Drain(ctx context.Context) error
 	Close(ctx context.Context) error
 }
+
+// ManagedService 是由 Host 托管的长驻服务。Start 建立资源，Run 在 runCtx
+// 下持续工作，Ready 是启动门和运行期就绪检查，必须响应 ctx；Drain 停止接收
+// 新工作并等待在途工作。Host 反序 Drain 全部服务后才取消 Run Context，等待
+// 全部 Run 退出，再反序调用 Close。Start 一旦被调用，即使返回错误也会调用
+// 一次 Close 清理部分初始化资源。
+type ManagedService interface {
+	Start(ctx context.Context) error
+	Run(ctx context.Context) error
+	Ready(ctx context.Context) error
+	Drain(ctx context.Context) error
+	Close(ctx context.Context) error
+}
+
+// ServicePolicy 控制 ManagedService 在 Host Ready 后提前退出时的处理。
+type ServicePolicy uint8
+
+const (
+	// ServiceCritical（零值）表示提前退出会触发 Host 关停。
+	ServiceCritical ServicePolicy = iota
+	// ServiceOptional 表示记录提前退出，但不自动重启，也不触发 Host 关停。
+	ServiceOptional
+)
+
+// ManagedServiceFactory 在模块依赖完成解析和 Setup 后调用；可用 Resolve 取得
+// 已装配依赖，但不应在构造阶段启动外部资源。
+type ManagedServiceFactory func(*Registry) (ManagedService, error)

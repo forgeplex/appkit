@@ -16,8 +16,7 @@ type App struct {
 	cfg     appConfig
 	reg     *Registry
 	modules []Module
-	// serverErr 承接运行期 HTTP Serve 的异常退出，带缓冲避免写侧阻塞。
-	serverErr chan error
+	runtime *appRuntime
 }
 
 type appConfig struct {
@@ -140,7 +139,10 @@ func New(modules []Module, opts ...Option) *App {
 	if cfg.logger == nil {
 		cfg.logger = slog.Default()
 	}
-	return &App{cfg: cfg, reg: newRegistry(), modules: modules, serverErr: make(chan error, 1)}
+	return &App{
+		cfg: cfg, reg: newRegistry(), modules: modules,
+		runtime: &appRuntime{serverErr: make(chan error, 1)},
+	}
 }
 
 // enabledModules 按 target 过滤模块集，target 中的未知模块名报错。

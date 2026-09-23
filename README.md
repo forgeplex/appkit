@@ -14,7 +14,7 @@ forgeplex 的 Go 后端运行时框架：任何业务域拿来即用；用工具
 
 | 包 | 职责 |
 |---|---|
-| `appkit`（根） | 稳定核心：`Module` / `Registry` / `Provide` / `Resolve` / `App.Run`，只依赖标准库 |
+| `appkit`（根） | 运行时核心：`Module` / `Registry` / `Provide` / `Resolve` / `App.Run` / `App.Start`，只依赖标准库 |
 | `contract` | 跨模块契约调用边界：事务守卫、ctx 防火墙、超时、错误规范化 |
 | `config` | koanf 分层配置（file→env）+ 强类型校验，启动 fail-fast |
 | `apperr` | 统一错误形态：错误身份 = 错误码，RFC 9457 problem+json |

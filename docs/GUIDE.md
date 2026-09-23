@@ -723,6 +723,36 @@ return app.Run(ctx)
 投递语义仍是至少一次：发布成功只表示 Broker 已持久确认，不表示消费者业务已经
 生效；消费端继续用 inbox 与业务唯一约束保证幂等生效。
 
+#### 嵌入式 Host 与 ManagedService
+
+当 AppKit 运行在另一个进程或宿主内，而不是由它直接拥有 main 生命周期时，可用
+`App.Start(ctx)`。它不注册 SIGINT/SIGTERM；`Start` 同步完成装配并等待所有受管服务
+Ready 后返回 `*RunningApp`。传入 Context 同时覆盖启动期与运行期，取消会发起优雅
+关停；调用方也可通过 `Shutdown(ctx)` 主动关停，`Wait()` 可安全重复或并发调用。
+`Shutdown` 的 Context 限制关停预算；预算耗尽后它返回超时，但 Host 仍继续尝试后续
+清理。`App` 是单次使用实例：`Run`、`Start`、`Migrate` 任一入口开始后都不能复用。
+
+```go
+host, err := app.Start(ctx) // ctx 取消会关停；Start 不接管 OS Signal
+if err != nil {
+    return err
+}
+return host.Wait() // 多个调用方可同时 Wait；显式关停可从其他协程调用 Shutdown
+```
+
+模块需要让 Host 同时拥有资源与服务循环时，在 Register 阶段声明
+`Registry.ManagedService(name, policy, factory)`。Factory 在依赖解析和 Setup 后执行，
+不应在构造时取得外部资源；资源在 `Start` 中创建，`Run` 执行循环，`Ready` 同时作为
+启动门和运行期 readiness 检查。默认 `ServiceCritical`：Ready 后 Run 意外返回会触发
+Host 关停；`ServiceOptional` 只记录退出错误，不自动重启，也不触发关停。关停顺序为
+反序 Drain 全部服务、取消 Run Context、等待全部 Run 退出、反序 Close。Drain 期间
+Run Context 仍有效；只要 Start 被调用过，即使 Start 返回错误也会 Close 一次。
+
+简单任务继续用现有 `reg.Worker(name, run)`；仅当组件需要由 Host 统一管理资源、就绪、
+Drain 和 Close 时才使用 ManagedService。它不替代 `ManagedSubscriber` 的 Broker 发布/
+订阅语义。当前 Host 仍启动既有 HTTP Listener，因此仍须显式选择 HTTP SecurityMode；
+Headless 等无 HTTP Profile 属后续能力。
+
 ## 7. 第六步：跑起来
 
 单个域仓库（identity 目录内）：
@@ -1312,8 +1342,9 @@ keyset 恒定代价、翻到哪都稳。offset 只在小表的后台管理页可
 
 **Q：模块还需要哪些生命周期钩子？**
 一般不需要。连接池、迁移、HTTP、relay、优雅关停都由框架或骨架接好；
-自定义后台任务用 `reg.Worker(name, run)` 一行（框架负责起协程、关停等待、
-异常上报）。`reg.OnStart` / `reg.OnStop` 留给真正需要自定义时序的场景。
+简单自定义后台任务用 `reg.Worker(name, run)` 一行（框架负责起协程、关停等待、
+异常上报）；需要成套管理资源和服务循环时注册 `ManagedService`。`reg.OnStart` /
+`reg.OnStop` 留给真正需要自定义时序的场景。
 
 **Q：我能改坏框架吗？**
 框架代码在 module cache 里（`0444` 只读），改不到。启动装配也已经收进
