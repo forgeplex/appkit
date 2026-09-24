@@ -498,9 +498,11 @@ func TestWebSocketCancellationReachesServiceAndBoundedQueuePreservesOrder(t *tes
 		cfg := websocketTestConfig(hub)
 		started := make(chan struct{})
 		cancelled := make(chan struct{})
+		handlerDone := make(chan struct{})
 		server, _ := startWebSocketServer(t, cfg, func(context.Context) (httpserver.WebSocketIdentity, error) {
 			return httpserver.WebSocketIdentity{Subject: "test-user"}, nil
 		}, func(ctx context.Context, _ contract.Stream[string, string]) error {
+			defer close(handlerDone)
 			close(started)
 			<-ctx.Done()
 			close(cancelled)
@@ -519,6 +521,11 @@ func TestWebSocketCancellationReachesServiceAndBoundedQueuePreservesOrder(t *tes
 		case <-cancelled:
 		case <-time.After(2 * time.Second):
 			t.Fatal("WebSocket disconnect did not cancel service context")
+		}
+		select {
+		case <-handlerDone:
+		case <-time.After(time.Second):
+			t.Fatal("WebSocket disconnect cancelled the service but its handler did not exit")
 		}
 	})
 
@@ -652,8 +659,10 @@ func TestWebSocketSecureClientCloseCancelsRemoteHandlerWithoutWaitingForIt(t *te
 	started := make(chan struct{})
 	cancelled := make(chan struct{})
 	release := make(chan struct{})
+	handlerDone := make(chan struct{})
 	stream, err := openSecureWebSocketStream(t, context.Background(), websocketTestConfig(httpserver.NewWebSocketHub()).Stream,
 		func(ctx context.Context, _ contract.Stream[string, string]) error {
+			defer close(handlerDone)
 			close(started)
 			<-ctx.Done()
 			close(cancelled)
@@ -686,6 +695,11 @@ func TestWebSocketSecureClientCloseCancelsRemoteHandlerWithoutWaitingForIt(t *te
 		t.Fatal("client Close did not cancel the remote handler context")
 	}
 	close(release)
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("released remote handler did not exit after client Close")
+	}
 }
 
 func TestWebSocketSecureClientRejectsTransactionBoundary(t *testing.T) {
@@ -753,6 +767,7 @@ func openSecureWebSocketStream(
 func TestWebSocketHubIsDrainedByHostManagedService(t *testing.T) {
 	hub := httpserver.NewWebSocketHub()
 	cfg := websocketTestConfig(hub)
+	handlerDone := make(chan struct{})
 	wsHandler, err := httpserver.NewWebSocketHandler[string, string](cfg,
 		func(ctx context.Context) (httpserver.WebSocketIdentity, error) {
 			if _, ok := appkit.ServicePrincipalFrom(ctx); !ok {
@@ -761,6 +776,7 @@ func TestWebSocketHubIsDrainedByHostManagedService(t *testing.T) {
 			return httpserver.WebSocketIdentity{Subject: "host-test"}, nil
 		},
 		func(ctx context.Context, peer contract.Stream[string, string]) error {
+			defer close(handlerDone)
 			_, err := peer.Recv(ctx)
 			return err
 		})
@@ -842,5 +858,10 @@ func TestWebSocketHubIsDrainedByHostManagedService(t *testing.T) {
 	}
 	if err := host.Wait(); err != nil {
 		t.Fatalf("Host.Wait: %v", err)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("Host.Wait completed before the WebSocket handler exited")
 	}
 }
