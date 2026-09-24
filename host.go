@@ -10,6 +10,7 @@ import (
 
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/health"
+	"github.com/forgeplex/appkit/internal/hoststate"
 )
 
 type appUseState struct {
@@ -86,6 +87,7 @@ type managedServiceRuntime struct {
 	done           chan struct{}
 	mu             sync.Mutex
 	runErr         error
+	lifecycle      *hoststate.Service
 }
 
 // Start 在依赖装配、迁移、Setup、启动钩子和 Service Ready 后返回。
@@ -122,6 +124,13 @@ func (a *App) start(ctx context.Context, entrypoint string) (*RunningApp, error)
 
 func (h *RunningApp) run() {
 	err := h.app.runHost(h)
+	// Errors before ManagedService startup can return without entering shutdown
+	// (for example, dependency resolution). Those instances were never started.
+	for _, service := range h.services {
+		if !service.startAttempted.Load() {
+			service.lifecycle.Transition(hoststate.StateNotStarted)
+		}
+	}
 	h.cancelRun()
 	h.cancelServices()
 	if err != nil {
@@ -191,9 +200,16 @@ func (h *RunningApp) recordServiceExit(err error) {
 }
 
 func (h *RunningApp) addService(reg serviceReg, service ManagedService) *managedServiceRuntime {
-	runtime := &managedServiceRuntime{reg: reg, service: service}
+	runtime := &managedServiceRuntime{
+		reg: reg, service: service,
+		lifecycle: hoststate.NewService(reg.module, reg.name),
+	}
 	h.services = append(h.services, runtime)
 	return runtime
+}
+
+func (s *managedServiceRuntime) setLifecycleState(state hoststate.State) {
+	s.lifecycle.Transition(state)
 }
 
 func (s *managedServiceRuntime) setRunResult(err error) {
@@ -258,8 +274,10 @@ func (h *RunningApp) startManagedServices(startCtx context.Context) error {
 			return err
 		default:
 		}
+		runtime.setLifecycleState(hoststate.StateStarting)
 		runtime.startAttempted.Store(true)
 		if err := callManagedService("Start", func() error { return runtime.service.Start(startCtx) }); err != nil {
+			runtime.setLifecycleState(hoststate.StateFailed)
 			return fmt.Errorf("appkit: 模块 %q ManagedService %q Start 失败: %w", runtime.reg.module, runtime.reg.name, err)
 		}
 		select {
@@ -271,9 +289,11 @@ func (h *RunningApp) startManagedServices(startCtx context.Context) error {
 		runtime.runLive = make(chan struct{})
 		runtime.runStarted = true
 		go func(s *managedServiceRuntime) {
+			s.setLifecycleState(hoststate.StateRunning)
 			close(s.runLive)
 			err := callManagedService("Run", func() error { return s.service.Run(h.serviceCtx) })
 			if !h.draining.Load() {
+				s.setLifecycleState(hoststate.StateFailed)
 				s.unexpected.Store(true)
 				if err == nil {
 					err = errors.New("Run 在 Host 进入 Draining 前返回")
@@ -293,13 +313,16 @@ func (h *RunningApp) startManagedServices(startCtx context.Context) error {
 		select {
 		case <-runtime.runLive:
 		case <-runtime.done:
+			runtime.setLifecycleState(hoststate.StateFailed)
 			return fmt.Errorf("appkit: 模块 %q ManagedService %q Run 在启动前退出: %w", runtime.reg.module, runtime.reg.name, unexpectedServiceExit(runtime))
 		case <-startCtx.Done():
+			runtime.setLifecycleState(hoststate.StateFailed)
 			return startCtx.Err()
 		}
 		if err := waitManagedServiceReady(startCtx, runtime, h.serviceErr); err != nil {
 			return fmt.Errorf("appkit: 模块 %q ManagedService %q 未就绪: %w", runtime.reg.module, runtime.reg.name, err)
 		}
+		runtime.setLifecycleState(hoststate.StateReady)
 	}
 	return nil
 }
@@ -321,6 +344,7 @@ func waitManagedServiceReady(ctx context.Context, runtime *managedServiceRuntime
 	select {
 	case err := <-ready:
 		if err != nil {
+			runtime.setLifecycleState(hoststate.StateFailed)
 			return err
 		}
 		select {

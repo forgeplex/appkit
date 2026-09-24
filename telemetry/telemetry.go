@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/internal/metrics"
 )
 
 // envEndpoint 是 OTLP HTTP exporter 的开关：存在即装 SDK，端点解析交给 exporter 本身
@@ -91,6 +92,7 @@ func Init(ctx context.Context, cfg Config) (*Telemetry, error) {
 
 	otel.SetTracerProvider(t.traces)
 	otel.SetMeterProvider(t.metrics)
+	metrics.Initialize()
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{}, propagation.Baggage{},
 	))

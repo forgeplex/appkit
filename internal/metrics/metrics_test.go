@@ -13,6 +13,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+
+	"github.com/forgeplex/appkit/internal/hoststate"
 )
 
 // TestOperationBoundsCardinality 是本包最重要的单测：SQL 动词是唯一由
@@ -306,6 +308,95 @@ func TestStreamTransportMetricsNormalizeAttributes(t *testing.T) {
 	}); got != 1 {
 		t.Errorf("forced closes = %d, want 1", got)
 	}
+}
+
+func TestManagedServiceStateGaugeAggregatesCurrentInstances(t *testing.T) {
+	module := "metrics-host-" + nextStreamMetricMethod("state")
+	const serviceName = "relay"
+	first := hoststate.NewService(module, serviceName)
+	second := hoststate.NewService(module, serviceName)
+	Initialize()
+
+	createdAttrs := map[string]string{
+		AttrHostServiceModule: module,
+		AttrHostServiceName:   serviceName,
+		AttrHostServiceState:  string(hoststate.StateCreated),
+	}
+	created := find(t, collect(t), "appkit.host.managed_service.state")
+	if created.Unit != "{service}" {
+		t.Fatalf("ManagedService gauge unit = %q, want {service}", created.Unit)
+	}
+	if got := gaugeValueFor(t, created, createdAttrs); got != 2 {
+		t.Fatalf("created gauge = %d, want 2 aggregated instances", got)
+	}
+
+	first.Transition(hoststate.StateReady)
+	second.Transition(hoststate.StateFailed)
+	ms := collect(t)
+	gauge := find(t, ms, "appkit.host.managed_service.state")
+	if got := gaugeValueFor(t, gauge, map[string]string{
+		AttrHostServiceModule: module,
+		AttrHostServiceName:   serviceName,
+		AttrHostServiceState:  string(hoststate.StateReady),
+	}); got != 1 {
+		t.Errorf("ready gauge = %d, want 1", got)
+	}
+	if got := gaugeValueFor(t, gauge, map[string]string{
+		AttrHostServiceModule: module,
+		AttrHostServiceName:   serviceName,
+		AttrHostServiceState:  string(hoststate.StateFailed),
+	}); got != 1 {
+		t.Errorf("failed gauge = %d, want 1", got)
+	}
+	for _, attrs := range attrsOf(t, gauge) {
+		if attrs[AttrHostServiceModule] != module {
+			continue
+		}
+		if len(attrs) != 3 {
+			t.Errorf("ManagedService gauge attributes must be exactly module/service/state: %v", attrs)
+		}
+	}
+	for _, state := range []hoststate.State{
+		hoststate.StateCreated, hoststate.StateStarting, hoststate.StateRunning,
+		hoststate.StateReady, hoststate.StateFailed, hoststate.StateDraining,
+		hoststate.StateStopping, hoststate.StateStopped, hoststate.StateNotStarted,
+	} {
+		if got := managedServiceState(state); got != string(state) {
+			t.Errorf("lifecycle state label %q normalized to %q", state, got)
+		}
+	}
+	if got := managedServiceState(hoststate.State("unbounded-value")); got != OutcomeOther {
+		t.Errorf("unknown lifecycle state = %q, want bounded %q", got, OutcomeOther)
+	}
+}
+
+func gaugeValueFor(t *testing.T, m metricdata.Metrics, want map[string]string) int64 {
+	t.Helper()
+	gauge, ok := m.Data.(metricdata.Gauge[int64])
+	if !ok {
+		t.Fatalf("指标 %q 不是 int64 gauge: %T", m.Name, m.Data)
+	}
+	for _, dp := range gauge.DataPoints {
+		got := map[string]string{}
+		for _, attr := range dp.Attributes.ToSlice() {
+			got[string(attr.Key)] = attr.Value.AsString()
+		}
+		if len(got) != len(want) {
+			continue
+		}
+		match := true
+		for key, value := range want {
+			if got[key] != value {
+				match = false
+				break
+			}
+		}
+		if match {
+			return dp.Value
+		}
+	}
+	t.Fatalf("指标 %q 没有属性集 %v 的数据点", m.Name, want)
+	return 0
 }
 
 func sumValueFor(t *testing.T, m metricdata.Metrics, want map[string]string) int64 {

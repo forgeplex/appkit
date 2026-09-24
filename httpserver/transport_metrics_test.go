@@ -167,6 +167,12 @@ func TestWebSocketTransportMetricsRecordBidirectionalFramesAndBytes(t *testing.T
 	if endFrame.Type != metrics.FrameEnd {
 		t.Fatalf("terminal frame = %+v, want end", endFrame)
 	}
+	// The server records the successful end-frame write immediately after
+	// conn.Write returns. Receiving the following close handshake proves that
+	// write path finished before observing the asynchronous metric.
+	if _, _, err := conn.Read(readCtx); websocket.CloseStatus(err) != websocket.StatusNormalClosure {
+		t.Fatalf("WebSocket close handshake error = %v, want normal closure", err)
+	}
 
 	clientToServer := map[string]string{
 		metrics.AttrSystem: system, metrics.AttrMethod: method,
