@@ -46,6 +46,7 @@ make check                      # fmt + vet + build + test（DB 集成测试缺�
 make test-db TEST_DATABASE_URL=postgres://...   # -race 且含 DB 集成测试
 make test-lint                  # lint/ 是嵌套 module，不在 ./... 里，必须单独跑
 make test-rules                 # 改 ruleset/templates 后：真跑两个检查器验规则（需网络）
+make ci TEST_DATABASE_URL=postgres://... # CI 聚合入口：race 全仓测试 + lint + rules，需一次性 DB
 go run ./cmd/appkit new domain t -dir /tmp/t   # 改脚手架后：生成物可编译且自过 check
 ```
 

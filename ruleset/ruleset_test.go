@@ -235,11 +235,11 @@ func TestRender_Golden(t *testing.T) {
 // appkit 仓库自带的 workflow 文件也必须是合法 YAML（与 ci.yml.tmpl 引用点保持一致）。
 func TestWorkflows_合法YAML(t *testing.T) {
 	tests := []struct {
-		path string
-		want string // 文件内须出现的片段
+		path  string
+		wants []string // 文件内须出现的片段
 	}{
-		{"../.github/workflows/domain-ci.yml", "workflow_call"},
-		{"../.github/workflows/ci.yml", "cd lint"},
+		{"../.github/workflows/domain-ci.yml", []string{"workflow_call"}},
+		{"../.github/workflows/ci.yml", []string{"run: make ci", "go-version-file: go.mod"}},
 	}
 	for _, tt := range tests {
 		t.Run(filepath.Base(tt.path), func(t *testing.T) {
@@ -254,8 +254,10 @@ func TestWorkflows_合法YAML(t *testing.T) {
 			if _, ok := doc["jobs"]; !ok {
 				t.Errorf("%s 缺少 jobs", tt.path)
 			}
-			if !strings.Contains(string(body), tt.want) {
-				t.Errorf("%s 缺少片段 %q", tt.path, tt.want)
+			for _, want := range tt.wants {
+				if !strings.Contains(string(body), want) {
+					t.Errorf("%s 缺少片段 %q", tt.path, want)
+				}
 			}
 		})
 	}
