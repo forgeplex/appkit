@@ -8,7 +8,8 @@
 //
 // 埋点覆盖 RED 三件套（Rate / Errors / Duration，直方图一并给出）的五条路径：
 // 契约调用、Local Stream、outbox 投递、周期任务、数据库查询；SSE/WSS 另记录传输帧、
-// 应用载荷字节、协议错误与 WebSocket 强制关闭。HTTP 入站不在此列——otelhttp 已经
+// 应用载荷字节、协议错误与 WebSocket 强制关闭。Host ManagedService 另提供按稳定
+// module/service 名与固定状态枚举聚合的当前实例数。HTTP 入站不在此列——otelhttp 已经
 // 产出 http.server.request.duration（含 http.route），再埋一遍就是双重计数。
 //
 // 未配置 OTLP 端点时全局 MeterProvider 是 noop，各 Record 调用近乎零成本，
@@ -28,6 +29,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
+
+	"github.com/forgeplex/appkit/internal/hoststate"
 )
 
 // scope 是本框架全部指标的 instrumentation scope。
@@ -36,17 +39,20 @@ const scope = "github.com/forgeplex/appkit"
 // 标签键。与 OTel 语义约定不冲突的一律加 appkit. 前缀，避免与
 // 用户或其它库的同名标签混淆。
 const (
-	AttrSystem    = "appkit.contract.system"
-	AttrMethod    = "appkit.contract.method"
-	AttrTopic     = "appkit.outbox.topic"
-	AttrSchema    = "appkit.outbox.schema"
-	AttrJob       = "appkit.job.name"
-	AttrOperation = "db.operation"
-	AttrOutcome   = "appkit.outcome"
-	AttrErrorCode = "appkit.error.code"
-	AttrTransport = "appkit.contract.stream.transport"
-	AttrDirection = "appkit.contract.stream.direction"
-	AttrFrameType = "appkit.contract.stream.frame.type"
+	AttrSystem            = "appkit.contract.system"
+	AttrMethod            = "appkit.contract.method"
+	AttrTopic             = "appkit.outbox.topic"
+	AttrSchema            = "appkit.outbox.schema"
+	AttrJob               = "appkit.job.name"
+	AttrOperation         = "db.operation"
+	AttrOutcome           = "appkit.outcome"
+	AttrErrorCode         = "appkit.error.code"
+	AttrTransport         = "appkit.contract.stream.transport"
+	AttrDirection         = "appkit.contract.stream.direction"
+	AttrFrameType         = "appkit.contract.stream.frame.type"
+	AttrHostServiceModule = "appkit.host.managed_service.module"
+	AttrHostServiceName   = "appkit.host.managed_service.name"
+	AttrHostServiceState  = "appkit.host.managed_service.state"
 )
 
 // outcome 的取值全集。
@@ -101,13 +107,15 @@ type instruments struct {
 	streamBytesRecv    metric.Int64Counter
 	streamProtocolErr  metric.Int64Counter
 	streamForcedClose  metric.Int64Counter
+	hostServiceState   metric.Int64ObservableGauge
+	hostStateCallback  metric.Registration
 }
 
-// inst 懒初始化：全局 MeterProvider 由 telemetry.Init 装配，而 Init 在
-// 包级变量初始化之后才跑。首次埋点必然发生在服务就绪之后，此时 provider 已就位。
+// inst 懒初始化：telemetry.Init 在装配全局 MeterProvider 后会显式预热；
+// 未使用该初始化入口的调用方则在首次埋点时绑定当时的全局 provider。
 var inst = sync.OnceValue(func() *instruments {
 	m := otel.Meter(scope)
-	return &instruments{
+	result := &instruments{
 		contract: histogram(m, "appkit.contract.call.duration",
 			"跨模块契约调用耗时（进程内与远程同口径）"),
 		outbox: histogram(m, "appkit.outbox.delivery.duration",
@@ -144,7 +152,50 @@ var inst = sync.OnceValue(func() *instruments {
 		streamForcedClose: counter(m, "appkit.contract.stream.drain.forced_close",
 			"由 Host 管理的 WebSocket Hub 强制关闭的连接数量"),
 	}
+	result.hostServiceState, result.hostStateCallback = observeManagedServiceState(m)
+	return result
 })
+
+// Initialize eagerly binds instruments to the current global MeterProvider.
+// telemetry.Init calls this immediately after installing its provider.
+func Initialize() { _ = inst() }
+
+func observeManagedServiceState(m metric.Meter) (metric.Int64ObservableGauge, metric.Registration) {
+	gauge, err := m.Int64ObservableGauge("appkit.host.managed_service.state",
+		metric.WithDescription("当前处于各 ManagedService 生命周期状态的实例数"),
+		metric.WithUnit("{service}"))
+	if err != nil {
+		otel.Handle(err)
+		gauge, _ = noop.Meter{}.Int64ObservableGauge("appkit.host.managed_service.state")
+		return gauge, nil
+	}
+	registration, err := m.RegisterCallback(func(ctx context.Context, observer metric.Observer) error {
+		for _, count := range hoststate.Snapshot() {
+			observer.ObserveInt64(gauge, count.Count, metric.WithAttributes(
+				attribute.String(AttrHostServiceModule, count.Module),
+				attribute.String(AttrHostServiceName, count.Service),
+				attribute.String(AttrHostServiceState, managedServiceState(count.State)),
+			))
+		}
+		return nil
+	}, gauge)
+	if err != nil {
+		otel.Handle(err)
+		return gauge, nil
+	}
+	return gauge, registration
+}
+
+func managedServiceState(state hoststate.State) string {
+	switch state {
+	case hoststate.StateCreated, hoststate.StateStarting, hoststate.StateRunning,
+		hoststate.StateReady, hoststate.StateFailed, hoststate.StateDraining,
+		hoststate.StateStopping, hoststate.StateStopped, hoststate.StateNotStarted:
+		return string(state)
+	default:
+		return OutcomeOther
+	}
+}
 
 func histogram(m metric.Meter, name, desc string) metric.Float64Histogram {
 	h, err := m.Float64Histogram(name,

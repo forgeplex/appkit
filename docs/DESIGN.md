@@ -336,6 +336,15 @@ func (r *Registry) ManagedService(name string, policy ServicePolicy, factory Man
 等待全体 Run 退出、全体反序 Close；普通 `Worker` 与 `ManagedSubscriber` 保持各自现有
 语义，不隐式升级为 ManagedService。
 
+`appkit.host.managed_service.state` 是 ObservableGauge，表示当前进程中每个已解析
+ManagedService 实例的生命周期状态数量，按稳定的 module/service 名与固定 state 枚举
+聚合，不含 Host/实例 ID。`created` 表示 factory 已解析，`starting` 表示调用 Start，
+`running` 表示 Run 已启动，`ready` 表示 Ready 检查通过；启动或运行期失败进入 `failed`
+且该状态在清理后仍保留；正常关停依次经过 `draining`（调用 Drain）、`stopping`
+（Drain 全部结束、开始取消 Run Context）和 `stopped`（Close 成功）。Host 尚未调用某实例的
+Start 就发生回滚时，其状态为 `not_started`。该 gauge 是生命周期状态计数，不是活跃连接数、readiness
+判定或健康检查；它只观察 Host 已有的生命周期转换，不参与启动、错误传播和关停决策。
+
 Contribution 使用独立于普通、具名与 Remote binding 的 `(reflect.Type, name)` 集合
 命名空间。同类型同名在 Register 阶段失败，不同类型可同名；启动解析先完成普通
 binding，再按类型身份和 name 稳定 eager 构造每项一次，并记录来源 Module。
@@ -852,7 +861,7 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
    - `callctx`（穿越契约 ctx 防火墙的元数据白名单，事件 meta 也可快照/还原；
      HTTP 根入站另受身份信任边界约束）
    - `job`（advisory lock 跨副本互斥的周期任务）
-   - `internal/metrics`（五条路径的 RED 指标 + Local Stream 生命周期/消息/backpressure 指标 + SSE/WSS 传输帧/字节、WSS 协议错误/强制关闭 + outbox 积压 gauge，标签集框架内钉死）
+   - `internal/metrics`（五条路径的 RED 指标 + Local Stream 生命周期/消息/backpressure 指标 + SSE/WSS 传输帧/字节、WSS 协议错误/强制关闭 + outbox 积压 gauge + ManagedService 状态 gauge，标签集框架内钉死）
    - `apptest.Conform`（契约一致性套件：同一批用例过每个绑定，比对错误码/返回值/
      边界语义）+ `contract.Call` 在进 fn 前拦掉已死的 ctx——**§5.3 的四件套至此
      既是承诺也是可运行的断言**

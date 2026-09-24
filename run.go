@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/forgeplex/appkit/health"
+	"github.com/forgeplex/appkit/internal/hoststate"
 )
 
 // Run 启动应用并阻塞到 ctx 取消、收到 SIGINT/SIGTERM、HTTP 服务异常退出，
@@ -446,18 +447,29 @@ func (a *App) shutdown(server *http.Server, maxStartedStage int, host *RunningAp
 	for i := len(host.services) - 1; i >= 0; i-- {
 		service := host.services[i]
 		if !service.runStarted {
+			if !service.startAttempted.Load() {
+				service.setLifecycleState(hoststate.StateNotStarted)
+			}
 			continue
 		}
+		service.setLifecycleState(hoststate.StateDraining)
 		if err := runManagedServicePhase(ctx, service, "Drain", service.service.Drain); err != nil {
+			service.setLifecycleState(hoststate.StateFailed)
 			errs = append(errs, err)
 		}
 	}
 	host.setState(hostStopping)
+	for _, service := range host.services {
+		if service.startAttempted.Load() {
+			service.setLifecycleState(hoststate.StateStopping)
+		}
+	}
 	host.cancelServices()
 	for i := len(host.services) - 1; i >= 0; i-- {
 		service := host.services[i]
 		if service.runStarted {
 			if err := waitManagedServiceRun(ctx, service); err != nil {
+				service.setLifecycleState(hoststate.StateFailed)
 				errs = append(errs, err)
 			}
 		}
@@ -466,7 +478,10 @@ func (a *App) shutdown(server *http.Server, maxStartedStage int, host *RunningAp
 		service := host.services[i]
 		if service.startAttempted.Load() {
 			if err := runManagedServicePhase(ctx, service, "Close", service.service.Close); err != nil {
+				service.setLifecycleState(hoststate.StateFailed)
 				errs = append(errs, err)
+			} else {
+				service.setLifecycleState(hoststate.StateStopped)
 			}
 		}
 	}
