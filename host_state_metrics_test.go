@@ -209,6 +209,39 @@ func TestManagedServiceStateAggregatesAcrossApps(t *testing.T) {
 	}
 }
 
+func TestManagedServiceRunFailureDuringDrainRemainsFailedAfterClose(t *testing.T) {
+	module, serviceName := nextHostStateTestIdentity()
+	service := newRecordingManagedService()
+	service.runReturn = make(chan error, 1)
+	drainRelease := make(chan struct{})
+	service.drainGate = drainRelease
+	app := newHostStateTestApp(module, serviceName, service, nil)
+	host, err := app.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	runFailure := errors.New("ManagedService Run failed during Drain")
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- host.Shutdown(context.Background()) }()
+	awaitSignal(t, service.drainStarted, "Drain")
+	service.runReturn <- runFailure
+	awaitSignal(t, service.runExited, "Run exit")
+	close(drainRelease)
+	if err := <-shutdown; !errors.Is(err, runFailure) {
+		t.Fatalf("Shutdown error = %v, want Run failure %v", err, runFailure)
+	}
+	if got := service.closeCalls.Load(); got != 1 {
+		t.Fatalf("Close calls = %d, want 1 successful cleanup", got)
+	}
+	if got := hostStateCount(module, serviceName, hoststate.StateFailed); got != 1 {
+		t.Fatalf("failed state after successful Close = %d, want 1", got)
+	}
+	if got := hostStateCount(module, serviceName, hoststate.StateStopped); got != 0 {
+		t.Fatalf("stopped state after failed Run = %d, want 0", got)
+	}
+}
+
 func TestManagedServiceFailedAndNotStartedStatesSurviveRollback(t *testing.T) {
 	module, serviceName := nextHostStateTestIdentity()
 	startFailure := errors.New("managed service start failed")

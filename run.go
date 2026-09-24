@@ -469,6 +469,7 @@ func (a *App) shutdown(server *http.Server, maxStartedStage int, host *RunningAp
 		service := host.services[i]
 		if service.runStarted {
 			if err := waitManagedServiceRun(ctx, service); err != nil {
+				// Keep the Run failure visible even if the later Close succeeds.
 				service.setLifecycleState(hoststate.StateFailed)
 				errs = append(errs, err)
 			}
