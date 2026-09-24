@@ -13,6 +13,7 @@ import (
 
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/callctx"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 // HeaderServiceAuthorization carries a service credential, never a user token.
@@ -226,13 +227,17 @@ func (t *serviceTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	for name := range cloned.Header {
 		switch strings.ToLower(name) {
 		case "authorization", "proxy-authorization", "cookie", "x-service-authorization", "x-step-up",
-			"x-partition", "x-tenant-id", "x-caller", "x-merchant-id", "x-request-id":
+			"x-partition", "x-tenant-id", "x-caller", "x-merchant-id", "x-request-id",
+			"traceparent", "tracestate", "baggage":
 			delete(cloned.Header, name)
 		}
 	}
 	if meta.RequestID != "" {
 		cloned.Header.Set(callctx.HeaderRequestID, meta.RequestID)
 	}
+	// Propagate only W3C trace context from the firewalled span. Baggage and
+	// arbitrary request context values are deliberately not part of this boundary.
+	propagation.TraceContext{}.Inject(ctx, propagation.HeaderCarrier(cloned.Header))
 	cloned.Header.Set(HeaderServiceAuthorization, "Bearer "+credential.Token)
 	handedOff = true // The standard transport now owns closing the request body.
 	return t.base.RoundTrip(cloned)

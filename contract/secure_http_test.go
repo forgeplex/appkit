@@ -20,6 +20,7 @@ import (
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func freshProvider() contract.ServiceCredentialProviderFunc {
@@ -104,6 +105,14 @@ func TestSecureHTTPRejectsUnsafeConfiguration(t *testing.T) {
 func TestSecureHTTPFreshCredentialsFirewallAndRequestIsolation(t *testing.T) {
 	type secretKey struct{}
 	meta := callctx.Meta{RequestID: "request-1", Partition: "partition-1", TenantID: "tenant-1", Caller: "previous-hop"}
+	var traceID trace.TraceID
+	traceID[0] = 1
+	var spanID trace.SpanID
+	spanID[0] = 2
+	parentSpan := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: traceID, SpanID: spanID, TraceFlags: trace.FlagsSampled,
+	})
+	wantTraceparent := "00-" + traceID.String() + "-" + spanID.String() + "-01"
 	var calls atomic.Int64
 	var hits atomic.Int64
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -118,6 +127,15 @@ func TestSecureHTTPFreshCredentialsFirewallAndRequestIsolation(t *testing.T) {
 		}
 		if r.Header.Get(callctx.HeaderRequestID) != meta.RequestID {
 			t.Error("request id was not propagated from context")
+		}
+		if got := r.Header.Get("traceparent"); got != wantTraceparent {
+			t.Errorf("traceparent = %q, want %q", got, wantTraceparent)
+		}
+		if got := r.Header.Get("tracestate"); got != "" {
+			t.Errorf("untrusted tracestate was forwarded: %q", got)
+		}
+		if got := r.Header.Get("baggage"); got != "" {
+			t.Errorf("arbitrary baggage was forwarded: %q", got)
 		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
@@ -134,6 +152,7 @@ func TestSecureHTTPFreshCredentialsFirewallAndRequestIsolation(t *testing.T) {
 	}
 	defer hc.CloseIdleConnections()
 	ctx := callctx.With(context.WithValue(context.Background(), secretKey{}, "user-token"), meta)
+	ctx = trace.ContextWithSpanContext(ctx, parentSpan)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -142,7 +161,8 @@ func TestSecureHTTPFreshCredentialsFirewallAndRequestIsolation(t *testing.T) {
 	req.Header = http.Header{"authorization": {"Bearer user-secret"}, "Authorization": {"Bearer other-secret"},
 		"Cookie": {"session=secret"}, "X-Step-Up": {"user-step-up-proof"}, "Proxy-Authorization": {"secret"}, "X-Service-Authorization": {"stale-token"},
 		"X-Partition": {"forged-partition"}, "X-Tenant-Id": {"forged-tenant"}, "X-Merchant-Id": {"forged-merchant"},
-		"X-Caller": {"forged-caller"}, "X-Request-Id": {"forged-request"}}
+		"X-Caller": {"forged-caller"}, "X-Request-Id": {"forged-request"},
+		"Traceparent": {"forged-traceparent"}, "Tracestate": {"forged=tracestate"}, "Baggage": {"user=secret"}}
 	before := req.Header.Clone()
 	for range 2 {
 		resp, err := hc.Do(req)

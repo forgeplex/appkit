@@ -17,9 +17,13 @@ import (
 
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
+	"github.com/forgeplex/appkit/contract/streamtest"
 	"github.com/forgeplex/appkit/httpserver"
 	"github.com/forgeplex/appkit/tx"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 var _ appkit.ManagedService = (*httpserver.WebSocketHub)(nil)
@@ -563,6 +567,24 @@ func TestWebSocketCancellationReachesServiceAndBoundedQueuePreservesOrder(t *tes
 	})
 }
 
+func TestWebSocketSecureClientConformance(t *testing.T) {
+	previousPropagator := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTextMapPropagator(previousPropagator) })
+	streamtest.Verify(t,
+		func(ctx context.Context, cfg contract.StreamConfig, handler contract.StreamHandler[string, string]) (contract.ClientStream[string, string], error) {
+			return openSecureWebSocketStream(t, ctx, cfg, handler)
+		},
+		contract.StreamConfig{
+			MaxDuration:  2 * time.Second,
+			CloseTimeout: time.Second,
+			QueueSize:    2,
+		},
+		[]string{"first", "second", "third"},
+		func(value string) string { return value },
+	)
+}
+
 func TestWebSocketSecureClientOperationCancellationIsRetryable(t *testing.T) {
 	release := make(chan struct{})
 	ready := make(chan struct{})
@@ -626,6 +648,46 @@ func TestWebSocketSecureClientRemoteErrorIsStableAndSanitized(t *testing.T) {
 	}
 }
 
+func TestWebSocketSecureClientCloseCancelsRemoteHandlerWithoutWaitingForIt(t *testing.T) {
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	release := make(chan struct{})
+	stream, err := openSecureWebSocketStream(t, context.Background(), websocketTestConfig(httpserver.NewWebSocketHub()).Stream,
+		func(ctx context.Context, _ contract.Stream[string, string]) error {
+			close(started)
+			<-ctx.Done()
+			close(cancelled)
+			<-release // The remote application ignores cancellation until the test releases it.
+			return nil
+		})
+	if err != nil {
+		close(release)
+		t.Fatalf("openSecureWebSocketStream: %v", err)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	defer stream.Close()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("remote handler did not start")
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("client Close: %v", err)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("client Close did not cancel the remote handler context")
+	}
+	close(release)
+}
+
 func TestWebSocketSecureClientRejectsTransactionBoundary(t *testing.T) {
 	ctx := tx.With(context.Background(), "test-transaction")
 	_, err := httpserver.DialSecureWebSocket[string, string](ctx, "wss://example.test/bidi", httpserver.WebSocketConfig{}, contract.SecureClientOptions{})
@@ -644,14 +706,29 @@ func openSecureWebSocketStream(
 	hub := startWebSocketHub(t)
 	webSocketConfig := websocketTestConfig(hub)
 	webSocketConfig.Stream = cfg
+	scopes := make(chan contract.ServiceScope, 1)
+	wrappedHandler := func(ctx context.Context, peer contract.Stream[string, string]) error {
+		meta := callctx.From(ctx)
+		if meta.Caller != "conformance-client" {
+			t.Errorf("server caller metadata = %q, want authenticated service subject", meta.Caller)
+		}
+		return handler(ctx, peer)
+	}
 	wsHandler, err := httpserver.NewWebSocketHandler[string, string](webSocketConfig,
 		func(context.Context) (httpserver.WebSocketIdentity, error) {
 			return httpserver.WebSocketIdentity{Subject: "conformance-client"}, nil
-		}, httpserver.WebSocketHandler[string, string](handler))
+		}, httpserver.WebSocketHandler[string, string](wrappedHandler))
 	if err != nil {
 		return nil, err
 	}
-	server := httptest.NewTLSServer(wsHandler)
+	trustedServiceContext := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := <-scopes // The fixture models the verifier rebuilding trusted identity from the signed service credential.
+		meta := callctx.From(r.Context())
+		meta.Partition, meta.TenantID, meta.Caller = scope.Partition, scope.TenantID, "conformance-client"
+		wsHandler.ServeHTTP(w, r.WithContext(callctx.With(r.Context(), meta)))
+	})
+	serverHandler := httpserver.RequestID()(httpserver.OTel()(trustedServiceContext))
+	server := httptest.NewTLSServer(serverHandler)
 	t.Cleanup(func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -661,7 +738,12 @@ func openSecureWebSocketStream(
 	address := "wss" + strings.TrimPrefix(server.URL, "https") + "/bidi"
 	return httpserver.DialSecureWebSocket[string, string](ctx, address, webSocketConfig, contract.SecureClientOptions{
 		Audience: "websocket-conformance",
-		Credentials: contract.ServiceCredentialProviderFunc(func(context.Context, contract.ServiceScope) (contract.ServiceCredential, error) {
+		Credentials: contract.ServiceCredentialProviderFunc(func(ctx context.Context, scope contract.ServiceScope) (contract.ServiceCredential, error) {
+			meta := callctx.From(ctx)
+			if scope.Partition != meta.Partition || scope.TenantID != meta.TenantID {
+				t.Errorf("credential scope = %+v, want partition/tenant from callctx %+v", scope, meta)
+			}
+			scopes <- scope
 			return contract.ServiceCredential{Token: "conformance-token", ExpiresAt: time.Now().Add(time.Hour)}, nil
 		}),
 		HTTPClient: server.Client(),
