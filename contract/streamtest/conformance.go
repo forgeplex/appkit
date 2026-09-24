@@ -308,7 +308,9 @@ func Verify[Send, Receive any](
 		cfg := base
 		cfg.CloseTimeout = time.Second
 		cancelled := make(chan struct{})
+		handlerDone := make(chan struct{})
 		s, err := open(context.Background(), cfg, func(ctx context.Context, _ contract.Stream[Receive, Send]) error {
+			defer close(handlerDone)
 			<-ctx.Done()
 			close(cancelled)
 			return ctx.Err()
@@ -324,12 +326,15 @@ func Verify[Send, Receive any](
 		case <-time.After(time.Second):
 			t.Fatal("Close did not cancel the root stream context")
 		}
+		waitForHandlerExit(t, handlerDone, "Close")
 		if err1 := s.Close(); err1 != nil {
 			t.Fatalf("repeated Close = %v, want nil", err1)
 		}
 		rootCtx, cancelRoot := context.WithCancel(context.Background())
 		rootCancelled := make(chan struct{})
+		rootHandlerDone := make(chan struct{})
 		rootStream, err := open(rootCtx, cfg, func(ctx context.Context, _ contract.Stream[Receive, Send]) error {
+			defer close(rootHandlerDone)
 			<-ctx.Done()
 			close(rootCancelled)
 			return ctx.Err()
@@ -346,6 +351,7 @@ func Verify[Send, Receive any](
 		if err := rootStream.Close(); err != nil {
 			t.Fatalf("Close after root cancellation: %v", err)
 		}
+		waitForHandlerExit(t, rootHandlerDone, "root cancellation")
 
 	})
 
@@ -353,7 +359,9 @@ func Verify[Send, Receive any](
 		cfg := base
 		cfg.MaxDuration = 35 * time.Millisecond
 		cfg.IdleTimeout = 0
+		handlerDone := make(chan struct{})
 		s, err := open(context.Background(), cfg, func(ctx context.Context, _ contract.Stream[Receive, Send]) error {
+			defer close(handlerDone)
 			<-ctx.Done()
 			return ctx.Err()
 		})
@@ -365,12 +373,15 @@ func Verify[Send, Receive any](
 		if !apperr.Is(err, apperr.CodeUnavailable) || !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("max-duration terminal = %v, want deadline UNAVAILABLE", err)
 		}
+		waitForHandlerExit(t, handlerDone, "maximum-duration timeout")
 	})
 
 	t.Run("idle_timeout", func(t *testing.T) {
 		cfg := base
 		cfg.IdleTimeout = 35 * time.Millisecond
+		handlerDone := make(chan struct{})
 		s, err := open(context.Background(), cfg, func(ctx context.Context, _ contract.Stream[Receive, Send]) error {
+			defer close(handlerDone)
 			<-ctx.Done()
 			return ctx.Err()
 		})
@@ -382,7 +393,17 @@ func Verify[Send, Receive any](
 		if !apperr.Is(err, apperr.CodeUnavailable) || errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("idle terminal = %v, want idle UNAVAILABLE", err)
 		}
+		waitForHandlerExit(t, handlerDone, "idle timeout")
 	})
+}
+
+func waitForHandlerExit(t *testing.T, done <-chan struct{}, operation string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s returned before its stream handler exited", operation)
+	}
 }
 
 func mustOpen[Send, Receive any](
