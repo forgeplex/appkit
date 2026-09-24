@@ -2,6 +2,18 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.9.8（2026-09-25）
+
+v0.9.8 — reproducible framework checks in CI
+
+This corrective release makes AppKit's framework checks a required CI aggregate and pins local Go and gofmt behavior to the version declared by go.mod. This prevents a newer host formatter from rejecting code that passes with the repository's declared toolchain.
+
+- Add `make ci`, requiring a disposable PostgreSQL URL and running the framework check with race detection, nested lint-module checks, and the ruleset end-to-end test.
+- Configure GitHub Actions to use the Go version from go.mod and invoke the same `make ci` entry point.
+- Add regression coverage for the CI wiring and toolchain pin.
+
+No public API, runtime behavior, or database migrations changed.
+
 ## v0.9.7（2026-09-24）
 
 v0.9.7 — bounded streaming and observability
