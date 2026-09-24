@@ -115,6 +115,9 @@ func validateWebSocketConfig(cfg WebSocketConfig) error {
 	case cfg.Hub == nil:
 		return apperr.InvalidArgument("httpserver WebSocket: Hub is required for Host drain tracking")
 	}
+	if err := cfg.Hub.validateMessageLimit(cfg.MaxMessageBytes); err != nil {
+		return err
+	}
 	for _, origin := range cfg.OriginPatterns {
 		if strings.TrimSpace(origin) != origin {
 			return apperr.InvalidArgument("httpserver WebSocket: OriginPatterns entries must not contain surrounding whitespace")
@@ -143,16 +146,19 @@ func validateWebSocketConfig(cfg WebSocketConfig) error {
 // 接口的结构化实现）。在模块 Register 中通过 Registry.ManagedService 注册。
 // Start 打开连接入口，Drain 停止新升级并按预算发送 GoingAway/强制关停。
 type WebSocketHub struct {
-	mu          sync.Mutex
-	started     bool
-	accepting   bool
-	closed      bool
-	pending     map[*webSocketReservation]struct{}
-	connections map[*managedWebSocket]struct{}
-	changed     chan struct{}
+	mu               sync.Mutex
+	started          bool
+	accepting        bool
+	closed           bool
+	limitsConfigured bool
+	limits           WebSocketHubLimits
+	pending          map[*webSocketReservation]struct{}
+	connections      map[*managedWebSocket]struct{}
+	changed          chan struct{}
 }
 
-// NewWebSocketHub 创建尚未 Start 的 WebSocket 连接注册表。
+// NewWebSocketHub 创建尚未 Start、且未配置连接/速率预算的 WebSocket Hub。
+// 为保持现有调用签名，该 Hub 仍可构造，但 Start 不会使其进入可接纳状态。
 func NewWebSocketHub() *WebSocketHub {
 	return &WebSocketHub{
 		pending:     make(map[*webSocketReservation]struct{}),
@@ -172,6 +178,9 @@ func (h *WebSocketHub) Start(ctx context.Context) error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.limitsConfigured {
+		return apperr.InvalidArgument("httpserver WebSocket hub: explicit finite limits are required")
+	}
 	if h.closed || h.started {
 		return apperr.Conflict("httpserver WebSocket hub cannot be started more than once")
 	}
@@ -199,6 +208,9 @@ func (h *WebSocketHub) Ready(ctx context.Context) error {
 	defer h.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return apperr.Unavailable(err)
+	}
+	if !h.limitsConfigured {
+		return apperr.Unavailable(nil)
 	}
 	if !h.started || !h.accepting || h.closed {
 		return apperr.Unavailable(errors.New("websocket hub is not accepting connections"))
@@ -256,8 +268,14 @@ func (h *WebSocketHub) Close(ctx context.Context) error {
 func (h *WebSocketHub) reserve() (*webSocketReservation, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.limitsConfigured {
+		return nil, apperr.Unavailable(nil)
+	}
 	if !h.started || !h.accepting || h.closed {
 		return nil, apperr.Unavailable(errors.New("websocket hub is draining"))
+	}
+	if len(h.pending) >= h.limits.MaxConnections || len(h.connections) >= h.limits.MaxConnections-len(h.pending) {
+		return nil, apperr.Unavailable(nil)
 	}
 	if h.pending == nil {
 		h.pending = make(map[*webSocketReservation]struct{})
@@ -395,22 +413,25 @@ func (r *webSocketReservation) force() {
 }
 
 type managedWebSocket struct {
-	hub       *WebSocketHub
-	conn      *websocket.Conn
-	raw       net.Conn
-	system    string
-	method    string
-	cancelIO  context.CancelFunc
-	stopApp   func() error
-	stopMu    sync.Mutex
-	draining  atomic.Bool
-	expired   atomic.Bool
-	forced    atomic.Bool
-	peerClose atomic.Bool
-	termMu    sync.Mutex
-	termCode  string
-	termClose websocket.StatusCode
-	drainOnce sync.Once
+	hub            *WebSocketHub
+	conn           *websocket.Conn
+	raw            net.Conn
+	rateCtx        context.Context
+	rates          *webSocketConnectionRateLimiter
+	cancelRateWait context.CancelFunc
+	system         string
+	method         string
+	cancelIO       context.CancelFunc
+	stopApp        func() error
+	stopMu         sync.Mutex
+	draining       atomic.Bool
+	expired        atomic.Bool
+	forced         atomic.Bool
+	peerClose      atomic.Bool
+	termMu         sync.Mutex
+	termCode       string
+	termClose      websocket.StatusCode
+	drainOnce      sync.Once
 }
 
 func (c *managedWebSocket) setStopApp(fn func() error) {
@@ -432,9 +453,16 @@ func (c *managedWebSocket) closeApp() {
 	}
 }
 
+func (c *managedWebSocket) stopRateWait() {
+	if c.cancelRateWait != nil {
+		c.cancelRateWait()
+	}
+}
+
 func (c *managedWebSocket) beginDrain() {
 	c.drainOnce.Do(func() {
 		c.draining.Store(true)
+		c.stopRateWait()
 		go c.closeApp()
 		go func() { _ = c.conn.Close(websocket.StatusGoingAway, "") }()
 	})
@@ -445,6 +473,7 @@ func (c *managedWebSocket) forceClose() {
 		metrics.StreamDrainForcedClose(context.Background(), c.system, c.method, metrics.TransportWebSocket)
 	}
 	c.cancelIO()
+	c.stopRateWait()
 	go c.closeApp()
 	_ = c.raw.Close()
 }
@@ -554,16 +583,21 @@ func serveWebSocket[Send, Receive any](
 	}
 	conn.SetReadLimit(cfg.MaxMessageBytes + maxFrameOverhead)
 	ioCtx, cancelIO := context.WithCancel(connectionBaseCtx)
+	rateCtx, cancelRateWait := context.WithTimeout(ioCtx, cfg.Stream.MaxDuration)
 	record := &managedWebSocket{
 		conn: conn, raw: raw, system: cfg.System, method: cfg.Method,
-		cancelIO: cancelIO, termClose: websocket.StatusInternalError,
+		cancelIO: cancelIO, cancelRateWait: cancelRateWait, rateCtx: rateCtx,
+		rates:     newWebSocketConnectionRateLimiter(cfg.Hub.limits),
+		termClose: websocket.StatusInternalError,
 	}
 	if !reservation.attach(record) {
+		cancelRateWait()
 		cancelIO()
 		_ = raw.Close()
 		return
 	}
 	defer func() {
+		cancelRateWait()
 		cancelIO()
 		_ = raw.Close()
 		cfg.Hub.remove(record)
@@ -777,7 +811,12 @@ func readWebSocketRequests(
 	stream contract.ClientStream[json.RawMessage, json.RawMessage],
 	record *managedWebSocket,
 	cfg WebSocketConfig,
-) error {
+) (result error) {
+	defer func() {
+		if record.draining.Load() || record.expired.Load() || record.forced.Load() || record.peerClose.Load() || result != nil {
+			record.stopRateWait()
+		}
+	}()
 	halfClosed := false
 	for {
 		typ, raw, err := conn.Read(ctx)
@@ -835,6 +874,15 @@ func readWebSocketRequests(
 				record.setTerminal(apperr.CodeInvalidArgument, websocket.StatusProtocolError)
 				_ = stream.Close()
 				return err
+			}
+			if err := record.rates.waitInbound(record.rateCtx, cfg.Stream.IdleTimeout, int64(len(frame.Data))); err != nil {
+				if record.draining.Load() || record.expired.Load() || record.forced.Load() || record.peerClose.Load() {
+					return err
+				}
+				waitErr := webSocketRateWaitError(err)
+				record.setTerminal(waitErr.Code(), websocket.StatusInternalError)
+				_ = stream.Close()
+				return waitErr
 			}
 			if err := stream.Send(ctx, frame.Data); err != nil {
 				if errors.Is(err, io.EOF) {
@@ -899,6 +947,23 @@ func writeWebSocketResponses(
 		if record.draining.Load() || record.expired.Load() {
 			continue
 		}
+		if err := record.rates.waitOutbound(record.rateCtx, cfg.Stream.IdleTimeout, int64(len(value))); err != nil {
+			if record.forced.Load() || record.peerClose.Load() || record.draining.Load() {
+				return
+			}
+			code, closeCode := record.terminal()
+			if record.expired.Load() {
+				code, closeCode = apperr.CodeUnauthenticated, websocket.StatusPolicyViolation
+			} else if code == "" {
+				waitErr := webSocketRateWaitError(err)
+				code, closeCode = waitErr.Code(), websocket.StatusInternalError
+				record.setTerminal(code, closeCode)
+				_ = stream.Close()
+			}
+			writeTerminalFrame(ctx, conn, wsFrame{Type: "error", Code: safeWireCode(code)}, cfg, metrics.DirectionServerToClient)
+			_ = conn.Close(closeCode, "")
+			return
+		}
 		if err := writeWSFrame(ctx, conn, wsFrame{Type: "data", Data: value}, cfg, metrics.DirectionServerToClient); err != nil {
 			record.setTerminal(apperr.From(err).Code(), websocket.StatusInternalError)
 			_ = conn.CloseNow()
@@ -917,6 +982,7 @@ func watchServerWebSocketExpiry(
 	if delay <= 0 {
 		record.expired.Store(true)
 		record.setTerminal(apperr.CodeUnauthenticated, websocket.StatusPolicyViolation)
+		record.stopRateWait()
 		_ = stream.Close()
 		return
 	}
@@ -927,6 +993,7 @@ func watchServerWebSocketExpiry(
 	case <-timer.C:
 		record.expired.Store(true)
 		record.setTerminal(apperr.CodeUnauthenticated, websocket.StatusPolicyViolation)
+		record.stopRateWait()
 		_ = stream.Close()
 	}
 }

@@ -209,7 +209,8 @@ psp-contracts/
   HTTP client/server，Server Stream 生成 POST + SSE server adapter，Bidi 生成 WSS
   client/server adapter，并复用 `contract.OpenLocal` 的生命周期与有界队列。WebSocket
   Upgrade 前遵守分类路由和认证边界，Upgrade 后不刷新凭证；Host 通过受管 Hub 跟踪
-  hijacked socket。AsyncAPI 不作为首期事实源或输出。
+  hijacked socket。Hub/每连接的连接数、应用 data 帧与 payload 速率必须显式有界；
+  速率耗尽时使用可取消背压，不静默丢帧。AsyncAPI 不作为首期事实源或输出。
 - `contract-check` 对相同 schema version 做保守比较；V2 方法形态、消息字段、
   requiredness、cursor 映射和 terminal event 变化均参与兼容判定。V1 与 V2 之间
   不做隐式迁移；新增方法不能静默扩宽已有生成 interface。
@@ -649,6 +650,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 规则 | 落点 | 强度 |
 |---|---|---|
 | Stream 不继承 Unary 调用期限与值边界 | `contract.OpenLocal` 显式校验事务、应用 `Firewall`、根最大时长/idle policy 与有界双向队列；`contract/streamtest` 锁定 Local 行为；SSE 与 WSS adapter 分别锁定 framing、per-frame deadline、背压、取消、终态、凭证过期及 Host drain | ▲ 运行时 + 本地/HTTP 集成测试；含 Local、SSE 与 WSS 传输测试，不代表 required CI、下游运行、发布或业务验收 |
+| WebSocket 连接准入与应用消息速率有有限边界 | `NewWebSocketHubWithLimits` 要求显式 `MaxConnections` 与双向帧/字节速率及 burst；Hub 在 Upgrade 前原子计算 pending+active；每连接只对应用 `data` 帧 paced backpressure；旧无界 Hub 无法 Start/接纳 Upgrade | ▲ Hub/连接运行时守卫 + 并发/速率/取消本地测试；仅单 Hub 与单连接预算，不是跨副本全局配额 |
 | 同契约的多个实例不误回退到无名绑定 | `ProvideContractNamed` / `ResolveNamed` 精确匹配 `(Go 类型, 实例名)`，共享启动期重复/缺失/循环检查 | ▲ 运行时装配级；名字不是租户隔离或消费方 binding manifest |
 | 多实现扩展集合不污染 binding 命名空间 | `Contribute` 使用独立 `(reflect.Type, name)` map；target 过滤后仅对已注册条目 eager 构造一次，保留 Module 并稳定排序；`ResolveContributions` 只读缓存快照 | ▲ Register/启动解析守卫 + 本地测试；不提供授权或租户隔离语义 |
 | Agent 不用旧生成结果覆盖已修改的目标 | plan 绑定输入及全部输出的选定文件快照，`apply` 在协作锁内复核；schema 另绑定迁移/产出目录成员 | ▲ 工具运行时级；非整个仓库摘要，外部编辑器不受锁约束 |

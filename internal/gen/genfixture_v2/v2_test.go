@@ -23,6 +23,30 @@ import (
 
 type fixtureService struct{}
 
+func newFixtureWebSocketHub(t *testing.T) *httpserver.WebSocketHub {
+	t.Helper()
+	limits := httpserver.WebSocketHubLimits{
+		MaxConnections: 4,
+		Inbound: httpserver.WebSocketRateLimits{
+			FramesPerSecond: 1000,
+			FrameBurst:      10,
+			BytesPerSecond:  1 << 20,
+			ByteBurst:       8192,
+		},
+		Outbound: httpserver.WebSocketRateLimits{
+			FramesPerSecond: 1000,
+			FrameBurst:      10,
+			BytesPerSecond:  1 << 20,
+			ByteBurst:       8192,
+		},
+	}
+	hub, err := httpserver.NewWebSocketHubWithLimits(limits)
+	if err != nil {
+		t.Fatalf("NewWebSocketHubWithLimits: %v", err)
+	}
+	return hub
+}
+
 func (fixtureService) Ping(_ context.Context, req PingRequestV2) (PingResponseV2, error) {
 	return PingResponseV2{Message: "hello " + req.Name}, nil
 }
@@ -195,7 +219,7 @@ func TestV2LocalBidiStream(t *testing.T) {
 
 func TestV2GeneratedWebSocketSecureBidi(t *testing.T) {
 	service := fixtureService{}
-	hub := httpserver.NewWebSocketHub()
+	hub := newFixtureWebSocketHub(t)
 	if err := hub.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +303,7 @@ func TestV2GeneratedWebSocketSecureBidi(t *testing.T) {
 }
 
 func TestV2GeneratedWebSocketCredentialExpiryStopsClient(t *testing.T) {
-	hub := httpserver.NewWebSocketHub()
+	hub := newFixtureWebSocketHub(t)
 	if err := hub.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}

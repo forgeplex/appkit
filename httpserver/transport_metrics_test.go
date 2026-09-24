@@ -33,6 +33,30 @@ func init() {
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(transportMetricsReader)))
 }
 
+func newTransportTestWebSocketHub(t *testing.T) *WebSocketHub {
+	t.Helper()
+	limits := WebSocketHubLimits{
+		MaxConnections: 8,
+		Inbound: WebSocketRateLimits{
+			FramesPerSecond: 100,
+			FrameBurst:      10,
+			BytesPerSecond:  1 << 20,
+			ByteBurst:       1 << 20,
+		},
+		Outbound: WebSocketRateLimits{
+			FramesPerSecond: 100,
+			FrameBurst:      10,
+			BytesPerSecond:  1 << 20,
+			ByteBurst:       1 << 20,
+		},
+	}
+	hub, err := NewWebSocketHubWithLimits(limits)
+	if err != nil {
+		t.Fatalf("NewWebSocketHubWithLimits: %v", err)
+	}
+	return hub
+}
+
 func TestSSETransportMetricsRecordFramesAndPartialBytes(t *testing.T) {
 	const system = "transport-metrics-sse"
 	method := nextTransportMetricMethod("frames-and-bytes")
@@ -98,7 +122,7 @@ func TestSSETransportMetricsRecordFramesAndPartialBytes(t *testing.T) {
 func TestWebSocketTransportMetricsRecordBidirectionalFramesAndBytes(t *testing.T) {
 	const system = "transport-metrics-websocket"
 	method := nextTransportMetricMethod("round-trip")
-	hub := NewWebSocketHub()
+	hub := newTransportTestWebSocketHub(t)
 	if err := hub.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +232,7 @@ func TestWebSocketTransportMetricsRecordBidirectionalFramesAndBytes(t *testing.T
 func TestWebSocketProtocolErrorAndDrainForcedCloseMetrics(t *testing.T) {
 	const system = "transport-metrics-websocket-errors"
 	method := nextTransportMetricMethod("protocol-error")
-	hub := NewWebSocketHub()
+	hub := newTransportTestWebSocketHub(t)
 	if err := hub.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +326,7 @@ func TestWebSocketProtocolErrorAndDrainForcedCloseMetrics(t *testing.T) {
 func TestWebSocketClientAdapterRecordsTransportMetrics(t *testing.T) {
 	const system = "transport-metrics-websocket-client"
 	method := nextTransportMetricMethod("secure-client")
-	hub := NewWebSocketHub()
+	hub := newTransportTestWebSocketHub(t)
 	if err := hub.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
