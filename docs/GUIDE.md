@@ -700,9 +700,11 @@ func streamGreeting(ctx context.Context) (retErr error) {
 建立后的生产错误会以稳定的 `*apperr.Error` 由 `Recv` 返回；正常结束是
 `io.EOF`，不能把 EOF 当成业务终态。每条流最多一个并发 `Send` 和一个并发
 `Recv`，两者可重叠；满队列会背压，不会丢弃事件。`contract/streamtest` 提供
-可复用的 Adapter conformance suite；本地实现由 `OpenLocal` 驱动，后续 Transport
-可以为同一 suite 提供 `OpenFunc` 和测试服务。该 suite 不自动让应用契约生成器
-支持 Streaming。按 ADR-0047 §8，Streaming 新 API 在被显式提升前保持实验性。
+可复用的 Adapter conformance suite；本地实现由 `OpenLocal` 驱动，secure WSS
+Remote Client 也用同一 suite 验证跨传输语义。精确队列阻塞、进程内 error cause
+链和远端 handler 的关闭预算由各 Transport 的专项测试验证。该 suite 不自动让
+应用契约生成器支持 Streaming。按 ADR-0047 §8，Streaming 新 API 在被显式提升前
+保持实验性。
 
 `contract.Call` 的 timeout 是协作式的：deadline 会传给实现，已经启动的同步
 实现若忽略 ctx 仍可能迟到返回，框架不会强杀 goroutine。涉及写入时，超时后的
