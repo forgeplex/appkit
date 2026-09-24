@@ -2,6 +2,20 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.9.7（2026-09-24）
+
+v0.9.7 — bounded streaming and observability
+
+This patch adds bounded WebSocket admission and per-connection rate controls, alongside stream and managed-service observability.
+
+- Add local-stream lifecycle/message/backpressure metrics, SSE/WebSocket transport frame and byte metrics, and ManagedService state gauges.
+- Bound WebSocket Hub pending+active connections and per-connection inbound/outbound application frame and payload-byte rates, with paced backpressure.
+- Strengthen remote-stream conformance and cancellation/handler-leak coverage.
+
+Migration note: `NewWebSocketHub()` remains constructible for source compatibility, but an unconfigured Hub cannot start or accept upgrades. Configure finite connection and inbound/outbound rate and burst limits with `NewWebSocketHubWithLimits(...)`.
+
+No database migrations are included.
+
 ## v0.9.6（2026-09-24）
 
 v0.9.6 — disposable domain CI databases
