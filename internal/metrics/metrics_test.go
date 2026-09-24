@@ -258,6 +258,56 @@ func TestStreamMetricsHaveBoundedAttributes(t *testing.T) {
 	}
 }
 
+func TestStreamTransportMetricsNormalizeAttributes(t *testing.T) {
+	ctx := context.Background()
+	const system = "metrics-stream-transport-probe"
+	method := nextStreamMetricMethod("Transport")
+
+	StreamTransportFrameSent(ctx, system, method, TransportSSE, DirectionServerToClient, FrameHeartbeat)
+	StreamTransportFrameReceived(ctx, system, method, "session-123", "user-direction", "run-specific-frame")
+	StreamTransportBytesSent(ctx, system, method, "dynamic-transport", DirectionServerToClient, 17)
+	StreamTransportBytesReceived(ctx, system, method, TransportWebSocket, "user-direction", 23)
+	StreamProtocolError(ctx, system, method, TransportWebSocket, DirectionClientToServer, errors.New("private payload detail"))
+	StreamDrainForcedClose(ctx, system, method, TransportWebSocket)
+
+	ms := collect(t)
+	if got := sumValueFor(t, find(t, ms, "appkit.contract.stream.transport.frame.sent"), map[string]string{
+		AttrSystem: system, AttrMethod: method, AttrTransport: TransportSSE,
+		AttrDirection: DirectionServerToClient, AttrFrameType: FrameHeartbeat,
+	}); got != 1 {
+		t.Errorf("SSE heartbeat frames sent = %d, want 1", got)
+	}
+	if got := sumValueFor(t, find(t, ms, "appkit.contract.stream.transport.frame.received"), map[string]string{
+		AttrSystem: system, AttrMethod: method, AttrTransport: OutcomeOther,
+		AttrDirection: OutcomeOther, AttrFrameType: OutcomeOther,
+	}); got != 1 {
+		t.Errorf("untrusted received frame attributes did not collapse: got %d", got)
+	}
+	if got := sumValueFor(t, find(t, ms, "appkit.contract.stream.transport.bytes.sent"), map[string]string{
+		AttrSystem: system, AttrMethod: method, AttrTransport: OutcomeOther,
+		AttrDirection: DirectionServerToClient,
+	}); got != 17 {
+		t.Errorf("normalized bytes sent = %d, want 17", got)
+	}
+	if got := sumValueFor(t, find(t, ms, "appkit.contract.stream.transport.bytes.received"), map[string]string{
+		AttrSystem: system, AttrMethod: method, AttrTransport: TransportWebSocket,
+		AttrDirection: OutcomeOther,
+	}); got != 23 {
+		t.Errorf("normalized bytes received = %d, want 23", got)
+	}
+	if got := sumValueFor(t, find(t, ms, "appkit.contract.stream.protocol.error"), map[string]string{
+		AttrSystem: system, AttrMethod: method, AttrTransport: TransportWebSocket,
+		AttrDirection: DirectionClientToServer, AttrErrorCode: OutcomeOther,
+	}); got != 1 {
+		t.Errorf("unknown protocol error code = %d, want 1", got)
+	}
+	if got := sumValueFor(t, find(t, ms, "appkit.contract.stream.drain.forced_close"), map[string]string{
+		AttrSystem: system, AttrMethod: method, AttrTransport: TransportWebSocket,
+	}); got != 1 {
+		t.Errorf("forced closes = %d, want 1", got)
+	}
+}
+
 func sumValueFor(t *testing.T, m metricdata.Metrics, want map[string]string) int64 {
 	t.Helper()
 	sum, ok := m.Data.(metricdata.Sum[int64])

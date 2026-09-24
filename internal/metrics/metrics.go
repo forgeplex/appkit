@@ -7,8 +7,9 @@
 // 枚举（outcome、SQL 动词），没有第三种。
 //
 // 埋点覆盖 RED 三件套（Rate / Errors / Duration，直方图一并给出）的五条路径：
-// 契约调用、Local Stream、outbox 投递、周期任务、数据库查询。HTTP 入站不在此列——
-// otelhttp 已经产出 http.server.request.duration（含 http.route），再埋一遍就是双重计数。
+// 契约调用、Local Stream、outbox 投递、周期任务、数据库查询；SSE/WSS 另记录传输帧、
+// 应用载荷字节、协议错误与 WebSocket 强制关闭。HTTP 入站不在此列——otelhttp 已经
+// 产出 http.server.request.duration（含 http.route），再埋一遍就是双重计数。
 //
 // 未配置 OTLP 端点时全局 MeterProvider 是 noop，各 Record 调用近乎零成本，
 // 因此埋点无开关。
@@ -45,6 +46,7 @@ const (
 	AttrErrorCode = "appkit.error.code"
 	AttrTransport = "appkit.contract.stream.transport"
 	AttrDirection = "appkit.contract.stream.direction"
+	AttrFrameType = "appkit.contract.stream.frame.type"
 )
 
 // outcome 的取值全集。
@@ -57,8 +59,19 @@ const (
 	OutcomeOther    = "other"
 
 	TransportLocal          = "local"
+	TransportSSE            = "sse"
+	TransportWebSocket      = "websocket"
 	DirectionClientToServer = "client_to_server"
 	DirectionServerToClient = "server_to_client"
+)
+
+const (
+	FrameEvent     = "event"
+	FrameHeartbeat = "heartbeat"
+	FrameError     = "error"
+	FrameData      = "data"
+	FrameHalfClose = "half_close"
+	FrameEnd       = "end"
 )
 
 // durationBuckets 是秒为单位的桶边界（OTel 对 duration 类指标的推荐值）。
@@ -82,6 +95,12 @@ type instruments struct {
 	streamDuration     metric.Float64Histogram
 	streamFirstMessage metric.Float64Histogram
 	streamBackpressure metric.Float64Histogram
+	streamFramesSent   metric.Int64Counter
+	streamFramesRecv   metric.Int64Counter
+	streamBytesSent    metric.Int64Counter
+	streamBytesRecv    metric.Int64Counter
+	streamProtocolErr  metric.Int64Counter
+	streamForcedClose  metric.Int64Counter
 }
 
 // inst 懒初始化：全局 MeterProvider 由 telemetry.Init 装配，而 Init 在
@@ -112,6 +131,18 @@ var inst = sync.OnceValue(func() *instruments {
 			"本地契约流每个接收方向从建立到首条消息的时长"),
 		streamBackpressure: histogram(m, "appkit.contract.stream.send.backpressure.wait",
 			"本地契约流发送遇到满队列时的等待时长"),
+		streamFramesSent: counter(m, "appkit.contract.stream.transport.frame.sent",
+			"流传输层成功写出的应用帧数量"),
+		streamFramesRecv: counter(m, "appkit.contract.stream.transport.frame.received",
+			"流传输层成功读取的应用帧数量"),
+		streamBytesSent: byteCounter(m, "appkit.contract.stream.transport.bytes.sent",
+			"流传输层成功交给底层写入器的应用载荷字节数"),
+		streamBytesRecv: byteCounter(m, "appkit.contract.stream.transport.bytes.received",
+			"流传输层成功读取的应用载荷字节数"),
+		streamProtocolErr: counter(m, "appkit.contract.stream.protocol.error",
+			"流传输层拒绝的无效应用协议帧数量"),
+		streamForcedClose: counter(m, "appkit.contract.stream.drain.forced_close",
+			"由 Host 管理的 WebSocket Hub 强制关闭的连接数量"),
 	}
 })
 
@@ -130,6 +161,15 @@ func histogram(m metric.Meter, name, desc string) metric.Float64Histogram {
 
 func counter(m metric.Meter, name, desc string) metric.Int64Counter {
 	c, err := m.Int64Counter(name, metric.WithDescription(desc))
+	if err != nil {
+		otel.Handle(err)
+		c, _ = noop.Meter{}.Int64Counter(name)
+	}
+	return c
+}
+
+func byteCounter(m metric.Meter, name, desc string) metric.Int64Counter {
+	c, err := m.Int64Counter(name, metric.WithDescription(desc), metric.WithUnit("By"))
 	if err != nil {
 		otel.Handle(err)
 		c, _ = noop.Meter{}.Int64Counter(name)
@@ -261,6 +301,54 @@ func StreamBackpressureWait(ctx context.Context, system, method, direction strin
 		metric.WithAttributes(streamDirectionAttrs(system, method, direction)...))
 }
 
+// StreamTransportFrameSent records one successfully written application frame.
+// frameType and transport are normalized to fixed transport-specific enums.
+func StreamTransportFrameSent(ctx context.Context, system, method, transport, direction, frameType string) {
+	inst().streamFramesSent.Add(ctx, 1, metric.WithAttributes(
+		streamFrameAttrs(system, method, transport, direction, frameType)...))
+}
+
+// StreamTransportFrameReceived records one successfully read application frame.
+func StreamTransportFrameReceived(ctx context.Context, system, method, transport, direction, frameType string) {
+	inst().streamFramesRecv.Add(ctx, 1, metric.WithAttributes(
+		streamFrameAttrs(system, method, transport, direction, frameType)...))
+}
+
+// StreamTransportBytesSent records bytes accepted by the transport writer. A
+// partial write is recorded by its actual positive byte count.
+func StreamTransportBytesSent(ctx context.Context, system, method, transport, direction string, n int64) {
+	if n <= 0 {
+		return
+	}
+	inst().streamBytesSent.Add(ctx, n, metric.WithAttributes(
+		streamTransportDirectionAttrs(system, method, transport, direction)...))
+}
+
+// StreamTransportBytesReceived records the payload bytes returned by a
+// successful transport read.
+func StreamTransportBytesReceived(ctx context.Context, system, method, transport, direction string, n int64) {
+	if n <= 0 {
+		return
+	}
+	inst().streamBytesRecv.Add(ctx, n, metric.WithAttributes(
+		streamTransportDirectionAttrs(system, method, transport, direction)...))
+}
+
+// StreamProtocolError records a rejected inbound application frame. Error codes
+// are restricted to the framework whitelist; unknown values collapse to other.
+func StreamProtocolError(ctx context.Context, system, method, transport, direction string, err error) {
+	attrs := streamTransportDirectionAttrs(system, method, transport, direction)
+	attrs = append(attrs, attribute.String(AttrErrorCode, streamErrorCode(err)))
+	inst().streamProtocolErr.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// StreamDrainForcedClose records the first forced close of one managed stream
+// connection. Callers are responsible for deduplicating per connection.
+func StreamDrainForcedClose(ctx context.Context, system, method, transport string) {
+	inst().streamForcedClose.Add(ctx, 1,
+		metric.WithAttributes(streamTransportAttrs(system, method, transport)...))
+}
+
 func streamAttrs(system, method string) []attribute.KeyValue {
 	return []attribute.KeyValue{
 		attribute.String(AttrSystem, system),
@@ -275,6 +363,47 @@ func streamDirectionAttrs(system, method, direction string) []attribute.KeyValue
 	}
 	attrs := streamAttrs(system, method)
 	return append(attrs, attribute.String(AttrDirection, direction))
+}
+
+func streamTransportAttrs(system, method, transport string) []attribute.KeyValue {
+	if transport != TransportSSE && transport != TransportWebSocket {
+		transport = OutcomeOther
+	}
+	return []attribute.KeyValue{
+		attribute.String(AttrSystem, system),
+		attribute.String(AttrMethod, method),
+		attribute.String(AttrTransport, transport),
+	}
+}
+
+func streamTransportDirectionAttrs(system, method, transport, direction string) []attribute.KeyValue {
+	if direction != DirectionClientToServer && direction != DirectionServerToClient {
+		direction = OutcomeOther
+	}
+	attrs := streamTransportAttrs(system, method, transport)
+	return append(attrs, attribute.String(AttrDirection, direction))
+}
+
+func streamFrameAttrs(system, method, transport, direction, frameType string) []attribute.KeyValue {
+	attrs := streamTransportDirectionAttrs(system, method, transport, direction)
+	attrs = append(attrs, attribute.String(AttrFrameType, streamFrameType(transport, frameType)))
+	return attrs
+}
+
+func streamFrameType(transport, frameType string) string {
+	switch transport {
+	case TransportSSE:
+		switch frameType {
+		case FrameEvent, FrameHeartbeat, FrameError:
+			return frameType
+		}
+	case TransportWebSocket:
+		switch frameType {
+		case FrameData, FrameHalfClose, FrameEnd, FrameError:
+			return frameType
+		}
+	}
+	return OutcomeOther
 }
 
 func streamOutcome(err error) string {
