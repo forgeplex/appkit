@@ -271,18 +271,26 @@ func TestMaterializedRulesOnSubpackagedDomain(t *testing.T) {
 	})
 }
 
-// TestRulesE2EWiredIntoCI 守住上面那个测试真的会被执行。
+// TestFrameworkChecksWiredIntoCI 守住框架自检在 CI 中通过 Makefile 聚合入口执行。
 //
-// 它是 opt-in 的，而「配置物化了却从没被执行」正是它要防的那类事故——所以这里
-// 反过来钉住 appkit 自己的 CI 必须调 make test-rules，Makefile 必须设开关。
-// 不这么钉，这个测试很容易变成又一份写下来就没人跑的规则。
-func TestRulesE2EWiredIntoCI(t *testing.T) {
+// 规则集 E2E 是 opt-in 的，「配置物化了却从没被执行」正是它要防的事故；
+// 同时锁定 gofmt 使用 go.mod 对应工具链，避免不同 Go 版本输出不同格式。
+func TestFrameworkChecksWiredIntoCI(t *testing.T) {
 	tests := []struct {
 		path  string
 		wants []string
 	}{
-		{"../../.github/workflows/ci.yml", []string{"make test-rules"}},
-		{"../../Makefile", []string{"test-rules:", rulesE2EEnv + "=1"}},
+		{"../../.github/workflows/ci.yml", []string{"run: make ci"}},
+		{"../../Makefile", []string{
+			"GO_VERSION ?= $(shell sed -n 's/^go //p' go.mod)",
+			"GO_TOOLCHAIN ?= go$(GO_VERSION)",
+			"GOFMT ?= $(shell GOTOOLCHAIN=$(GO_TOOLCHAIN) $(GO) env GOROOT)/bin/gofmt",
+			"out=$$($(GOFMT) -l .)",
+			"$(MAKE) check GO_TEST_FLAGS=-race",
+			"$(MAKE) test-lint",
+			"$(MAKE) test-rules",
+			"test-rules:", rulesE2EEnv + "=1",
+		}},
 	}
 	for _, tt := range tests {
 		body, err := os.ReadFile(tt.path)

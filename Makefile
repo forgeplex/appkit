@@ -2,8 +2,14 @@
 # 域仓库的 Makefile 由脚手架生成，与本文件无关。
 
 GO ?= go
+# go 和 gofmt 均按 go.mod 的精确版本运行，避免较新宿主工具造成格式漂移。
+GO_VERSION ?= $(shell sed -n 's/^go //p' go.mod)
+GO_TOOLCHAIN ?= go$(GO_VERSION)
+GO_CMD = GOTOOLCHAIN=$(GO_TOOLCHAIN) $(GO)
+GOFMT ?= $(shell GOTOOLCHAIN=$(GO_TOOLCHAIN) $(GO) env GOROOT)/bin/gofmt
+GO_TEST_FLAGS ?=
 
-.PHONY: check fmt vet build test test-db test-db-local test-downstream-local test-acceptance test-lint test-rules changelog tag all
+.PHONY: check ci fmt vet build test test-db test-db-local test-downstream-local test-acceptance test-lint test-rules changelog tag all
 
 # 完成的定义（AGENTS.md）：这条全绿，且动了公开 API 时 apidiff 相对最新 tag 零 incompatible。
 check: fmt vet build test
@@ -12,24 +18,24 @@ check: fmt vet build test
 # 覆盖整棵树（含嵌套的 lint/ module）——gofmt 纯语法，不关心 module 边界。
 # 就地格式化用 gofmt -w .（或编辑器保存时自动跑）。
 fmt:
-	@out=$$(gofmt -l .); \
+	@out=$$($(GOFMT) -l .); \
 	if [ -n "$$out" ]; then echo "以下文件未格式化："; echo "$$out"; exit 1; fi
 
 vet:
-	$(GO) vet ./...
+	$(GO_CMD) vet ./...
 
 build:
-	$(GO) build ./...
+	$(GO_CMD) build ./...
 
 # 不带 TEST_DATABASE_URL 时数据库集成测试自动 skip。
 test:
-	$(GO) test -count=1 ./...
+	$(GO_CMD) test $(GO_TEST_FLAGS) -count=1 ./...
 
 # 含数据库集成测试。用法：
 #   make test-db TEST_DATABASE_URL=postgres://user:pass@127.0.0.1:5432/db?sslmode=disable
 test-db:
 	@test -n "$(TEST_DATABASE_URL)" || { echo "需要 TEST_DATABASE_URL"; exit 1; }
-	TEST_DATABASE_URL='$(TEST_DATABASE_URL)' $(GO) test -race -count=1 ./...
+	TEST_DATABASE_URL='$(TEST_DATABASE_URL)' $(GO_CMD) test -race -count=1 ./...
 
 # 隔离的临时 PostgreSQL 集群；不读取现有 TEST_DATABASE_URL，也不启动系统服务。
 # 需要完整的本地 server 安装：APPKIT_POSTGRES_BIN=/path/to/bin make test-db-local
@@ -43,11 +49,12 @@ test-downstream-local:
 
 # 四个真实 Go module 的跨项目复用/兼容升级验收（包括子进程 race）。
 test-acceptance:
-	$(GO) test -race -count=1 -v ./internal/acceptance
+	$(GO_CMD) test -race -count=1 -v ./internal/acceptance
 
 # lint/ 是独立嵌套 module（自带 go.mod），不在 ./... 覆盖范围内。
 test-lint:
-	cd lint && $(GO) test ./...
+	cd lint && $(GO_CMD) build ./...
+	cd lint && $(GO_CMD) test -count=1 ./...
 
 # 规则集端到端：生成一个「每个组件都有子包」的域仓库，用钉版本的
 # golangci-lint 与 go-arch-lint 真跑一遍，再植入已知违规确认它们会红。
@@ -55,7 +62,15 @@ test-lint:
 # 「模板文本没变」，防不住「规则从写下来那天就是错的」。
 # 慢（要拉两个检查器）且需要网络，故 opt-in；CI 每次都跑。
 test-rules:
-	APPKIT_RULES_E2E=1 $(GO) test -count=1 -v -run TestMaterializedRules ./internal/scaffold/
+	APPKIT_RULES_E2E=1 $(GO_CMD) test -count=1 -v -run TestMaterializedRules ./internal/scaffold/
+
+# GitHub AppKit CI 的唯一框架检查入口。TEST_DATABASE_URL 必须指向一次性 PostgreSQL；
+# check 的全仓测试以 race 运行，且会执行需要数据库的集成测试。
+ci:
+	@test -n "$(TEST_DATABASE_URL)" || { echo "make ci 需要 TEST_DATABASE_URL（必须是一次性数据库）"; exit 1; }
+	$(MAKE) check GO_TEST_FLAGS=-race
+	$(MAKE) test-lint
+	$(MAKE) test-rules
 
 # 发版三件套第 1 步：打 tag。主 tag 是 annotated，正文即事实源；
 # lint/ 是嵌套 module，Go 要求 lint/vX.Y.Z 前缀 tag 才能被 @version 解析
