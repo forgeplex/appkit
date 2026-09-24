@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -49,6 +51,11 @@ func TestOperationBoundsCardinality(t *testing.T) {
 // 全局 MeterProvider 只能设一次（otel 的 global 装载语义），因此整个测试
 // 二进制共用一个 ManualReader；读数是累积的，各用例用自己的标签值区分。
 var testReader = sdkmetric.NewManualReader()
+var streamMetricTestSequence atomic.Uint64
+
+func nextStreamMetricMethod(prefix string) string {
+	return prefix + "_" + strconv.FormatUint(streamMetricTestSequence.Add(1), 10)
+}
 
 func TestMain(m *testing.M) {
 	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(testReader)))
@@ -136,7 +143,7 @@ func hasAttrs(got []map[string]string, want map[string]string) bool {
 	return false
 }
 
-// TestRecordedAttributes 钉住四条路径的标签集。标签集就是基数契约：
+// TestRecordedAttributes 钉住非 Stream 指标路径的标签集。标签集就是基数契约：
 // 多一个自由维度就是一次事故，这里的断言用的是全等而非包含。
 func TestRecordedAttributes(t *testing.T) {
 	ctx := context.Background()
@@ -192,11 +199,99 @@ func TestRecordedAttributes(t *testing.T) {
 	}
 }
 
+func TestStreamMetricsHaveBoundedAttributes(t *testing.T) {
+	ctx := context.Background()
+	const system = "metrics-stream-probe"
+	method := nextStreamMetricMethod("Lifecycle")
+	start := time.Now().Add(-25 * time.Millisecond)
+
+	StreamOpened(ctx, system, method)
+	StreamMessageSent(ctx, system, method, DirectionClientToServer)
+	StreamMessageSent(ctx, system, method, "untrusted-dynamic-direction")
+	StreamMessageReceived(ctx, system, method, DirectionServerToClient)
+	StreamFirstMessage(ctx, system, method, DirectionServerToClient, 15*time.Millisecond)
+	StreamBackpressureWait(ctx, system, method, DirectionClientToServer, 5*time.Millisecond)
+	StreamClosed(ctx, system, method, errors.New("private payload-like error"), time.Since(start), false)
+
+	ms := collect(t)
+	base := map[string]string{
+		AttrSystem: system, AttrMethod: method, AttrTransport: TransportLocal,
+	}
+	if got := sumValueFor(t, find(t, ms, "appkit.contract.stream.active"), base); got != 0 {
+		t.Errorf("active after close = %d, want 0", got)
+	}
+	if got := sumValueFor(t, find(t, ms, "appkit.contract.stream.opened"), base); got != 1 {
+		t.Errorf("opened = %d, want 1", got)
+	}
+	closedAttrs := map[string]string{
+		AttrSystem: system, AttrMethod: method, AttrTransport: TransportLocal,
+		AttrOutcome: OutcomeError, AttrErrorCode: OutcomeOther,
+	}
+	if got := sumValueFor(t, find(t, ms, "appkit.contract.stream.closed"), closedAttrs); got != 1 {
+		t.Errorf("closed(error) = %d, want 1", got)
+	}
+	if !hasAttrs(attrsOf(t, find(t, ms, "appkit.contract.stream.duration")), closedAttrs) {
+		t.Error("duration must use the same bounded terminal attributes")
+	}
+	if !hasAttrs(attrsOf(t, find(t, ms, "appkit.contract.stream.message.sent")), map[string]string{
+		AttrSystem: system, AttrMethod: method, AttrTransport: TransportLocal,
+		AttrDirection: DirectionClientToServer,
+	}) || !hasAttrs(attrsOf(t, find(t, ms, "appkit.contract.stream.message.sent")), map[string]string{
+		AttrSystem: system, AttrMethod: method, AttrTransport: TransportLocal,
+		AttrDirection: OutcomeOther,
+	}) {
+		t.Error("message direction labels must be finite and unknown values must collapse")
+	}
+	if !hasAttrs(attrsOf(t, find(t, ms, "appkit.contract.stream.message.received")), map[string]string{
+		AttrSystem: system, AttrMethod: method, AttrTransport: TransportLocal,
+		AttrDirection: DirectionServerToClient,
+	}) {
+		t.Error("received-message attributes do not match the low-cardinality contract")
+	}
+	for _, name := range []string{
+		"appkit.contract.stream.time_to_first_message",
+		"appkit.contract.stream.send.backpressure.wait",
+	} {
+		if len(attrsOf(t, find(t, ms, name))) == 0 {
+			t.Errorf("%s has no data points", name)
+		}
+	}
+}
+
+func sumValueFor(t *testing.T, m metricdata.Metrics, want map[string]string) int64 {
+	t.Helper()
+	sum, ok := m.Data.(metricdata.Sum[int64])
+	if !ok {
+		t.Fatalf("指标 %q 不是 int64 sum: %T", m.Name, m.Data)
+	}
+	for _, dp := range sum.DataPoints {
+		got := map[string]string{}
+		for _, attr := range dp.Attributes.ToSlice() {
+			got[string(attr.Key)] = attr.Value.AsString()
+		}
+		if len(got) != len(want) {
+			continue
+		}
+		match := true
+		for key, value := range want {
+			if got[key] != value {
+				match = false
+				break
+			}
+		}
+		if match {
+			return dp.Value
+		}
+	}
+	t.Fatalf("指标 %q 没有属性集 %v 的数据点", m.Name, want)
+	return 0
+}
+
 // TestDurationBucketsFitSeconds 验证桶边界是给秒设计的：SDK 默认那套
 // （0..10000）用在秒上会让几乎所有观测挤进第一个桶，p99 直接失真。
 func TestDurationBucketsFitSeconds(t *testing.T) {
 	// 一次 50ms 的调用应落进 0.05~0.075 那一档，而不是"小于第一个边界"。
-	const method = "BucketProbe"
+	method := nextStreamMetricMethod("BucketProbe")
 	ContractCall(context.Background(), "ledger", method, "", time.Now().Add(-50*time.Millisecond))
 
 	h, ok := find(t, collect(t), "appkit.contract.call.duration").Data.(metricdata.Histogram[float64])

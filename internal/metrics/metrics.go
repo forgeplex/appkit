@@ -6,10 +6,9 @@
 // 要么是代码里的常量（系统名、方法名、topic、任务名），要么是本包收敛过的
 // 枚举（outcome、SQL 动词），没有第三种。
 //
-// 埋点覆盖 RED 三件套（Rate / Errors / Duration，直方图一并给出）的四条路径：
-// 契约调用、outbox 投递、周期任务、数据库查询。HTTP 入站不在此列——
-// otelhttp 已经产出 http.server.request.duration（含 http.route），
-// 再埋一遍就是双重计数。
+// 埋点覆盖 RED 三件套（Rate / Errors / Duration，直方图一并给出）的五条路径：
+// 契约调用、Local Stream、outbox 投递、周期任务、数据库查询。HTTP 入站不在此列——
+// otelhttp 已经产出 http.server.request.duration（含 http.route），再埋一遍就是双重计数。
 //
 // 未配置 OTLP 端点时全局 MeterProvider 是 noop，各 Record 调用近乎零成本，
 // 因此埋点无开关。
@@ -18,6 +17,8 @@ package metrics
 import (
 	"cmp"
 	"context"
+	"errors"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -42,13 +43,22 @@ const (
 	AttrOperation = "db.operation"
 	AttrOutcome   = "appkit.outcome"
 	AttrErrorCode = "appkit.error.code"
+	AttrTransport = "appkit.contract.stream.transport"
+	AttrDirection = "appkit.contract.stream.direction"
 )
 
-// outcome 的取值全集。四条路径共用同一套，仪表盘只需写一遍。
+// outcome 的取值全集。
 const (
-	OutcomeOK      = "ok"
-	OutcomeError   = "error"
-	OutcomeSkipped = "skipped"
+	OutcomeOK       = "ok"
+	OutcomeError    = "error"
+	OutcomeSkipped  = "skipped"
+	OutcomeCanceled = "canceled"
+	OutcomeTimeout  = "timeout"
+	OutcomeOther    = "other"
+
+	TransportLocal          = "local"
+	DirectionClientToServer = "client_to_server"
+	DirectionServerToClient = "server_to_client"
 )
 
 // durationBuckets 是秒为单位的桶边界（OTel 对 duration 类指标的推荐值）。
@@ -58,11 +68,20 @@ var durationBuckets = []float64{
 }
 
 type instruments struct {
-	contract metric.Float64Histogram
-	outbox   metric.Float64Histogram
-	dead     metric.Int64Counter
-	job      metric.Float64Histogram
-	db       metric.Float64Histogram
+	contract           metric.Float64Histogram
+	outbox             metric.Float64Histogram
+	dead               metric.Int64Counter
+	job                metric.Float64Histogram
+	db                 metric.Float64Histogram
+	streamActive       metric.Int64UpDownCounter
+	streamOpened       metric.Int64Counter
+	streamClosed       metric.Int64Counter
+	streamCanceled     metric.Int64Counter
+	streamMessagesSent metric.Int64Counter
+	streamMessagesRecv metric.Int64Counter
+	streamDuration     metric.Float64Histogram
+	streamFirstMessage metric.Float64Histogram
+	streamBackpressure metric.Float64Histogram
 }
 
 // inst 懒初始化：全局 MeterProvider 由 telemetry.Init 装配，而 Init 在
@@ -77,6 +96,22 @@ var inst = sync.OnceValue(func() *instruments {
 		dead: counter(m, "appkit.outbox.dead", "投递重试达上限、转入死信的事件数"),
 		job:  histogram(m, "appkit.job.run.duration", "周期任务单轮执行耗时"),
 		db:   histogram(m, "appkit.db.query.duration", "数据库查询耗时"),
+		streamActive: upDownCounter(m, "appkit.contract.stream.active",
+			"当前活动的本地契约流数量", "{stream}"),
+		streamOpened: counter(m, "appkit.contract.stream.opened", "成功建立的本地契约流数量"),
+		streamClosed: counter(m, "appkit.contract.stream.closed", "已结束的本地契约流数量"),
+		streamCanceled: counter(m, "appkit.contract.stream.canceled",
+			"因取消而结束的本地契约流数量"),
+		streamMessagesSent: counter(m, "appkit.contract.stream.message.sent",
+			"本地契约流成功发送的消息数量"),
+		streamMessagesRecv: counter(m, "appkit.contract.stream.message.received",
+			"本地契约流成功接收的消息数量"),
+		streamDuration: histogram(m, "appkit.contract.stream.duration",
+			"本地契约流从建立到终态的时长"),
+		streamFirstMessage: histogram(m, "appkit.contract.stream.time_to_first_message",
+			"本地契约流每个接收方向从建立到首条消息的时长"),
+		streamBackpressure: histogram(m, "appkit.contract.stream.send.backpressure.wait",
+			"本地契约流发送遇到满队列时的等待时长"),
 	}
 })
 
@@ -98,6 +133,16 @@ func counter(m metric.Meter, name, desc string) metric.Int64Counter {
 	if err != nil {
 		otel.Handle(err)
 		c, _ = noop.Meter{}.Int64Counter(name)
+	}
+	return c
+}
+
+func upDownCounter(m metric.Meter, name, desc, unit string) metric.Int64UpDownCounter {
+	c, err := m.Int64UpDownCounter(name,
+		metric.WithDescription(desc), metric.WithUnit(unit))
+	if err != nil {
+		otel.Handle(err)
+		c, _ = noop.Meter{}.Int64UpDownCounter(name)
 	}
 	return c
 }
@@ -165,6 +210,97 @@ func ContractCall(ctx context.Context, system, method, code string, start time.T
 		attrs = append(attrs, attribute.String(AttrErrorCode, code))
 	}
 	inst().contract.Record(ctx, since(start), metric.WithAttributes(attrs...))
+}
+
+// StreamOpened 记录一次成功建立的 Local Contract Stream。
+func StreamOpened(ctx context.Context, system, method string) {
+	attrs := streamAttrs(system, method)
+	inst().streamOpened.Add(ctx, 1, metric.WithAttributes(attrs...))
+	inst().streamActive.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// StreamClosed 记录唯一终态。错误码只保留框架已知的有限集合，其余值折叠为 other。
+func StreamClosed(ctx context.Context, system, method string, err error, duration time.Duration, timedOut bool) {
+	outcome := streamOutcome(err)
+	if timedOut {
+		outcome = OutcomeTimeout
+	}
+	attrs := append(streamAttrs(system, method), attribute.String(AttrOutcome, outcome))
+	if err != nil && !errors.Is(err, io.EOF) {
+		attrs = append(attrs, attribute.String(AttrErrorCode, streamErrorCode(err)))
+	}
+	inst().streamActive.Add(ctx, -1, metric.WithAttributes(streamAttrs(system, method)...))
+	inst().streamClosed.Add(ctx, 1, metric.WithAttributes(attrs...))
+	inst().streamDuration.Record(ctx, duration.Seconds(), metric.WithAttributes(attrs...))
+	if outcome == OutcomeCanceled {
+		inst().streamCanceled.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+// StreamMessageSent 记录成功进入有界队列的消息，不读取或序列化消息内容。
+func StreamMessageSent(ctx context.Context, system, method, direction string) {
+	inst().streamMessagesSent.Add(ctx, 1,
+		metric.WithAttributes(streamDirectionAttrs(system, method, direction)...))
+}
+
+// StreamMessageReceived 记录成功从有界队列取出的消息。
+func StreamMessageReceived(ctx context.Context, system, method, direction string) {
+	inst().streamMessagesRecv.Add(ctx, 1,
+		metric.WithAttributes(streamDirectionAttrs(system, method, direction)...))
+}
+
+// StreamFirstMessage 记录某一接收方向首条成功消息的延迟；同一方向只由调用方记录一次。
+func StreamFirstMessage(ctx context.Context, system, method, direction string, duration time.Duration) {
+	inst().streamFirstMessage.Record(ctx, duration.Seconds(),
+		metric.WithAttributes(streamDirectionAttrs(system, method, direction)...))
+}
+
+// StreamBackpressureWait 记录发送开始时队列已满后的等待时长。
+func StreamBackpressureWait(ctx context.Context, system, method, direction string, duration time.Duration) {
+	inst().streamBackpressure.Record(ctx, duration.Seconds(),
+		metric.WithAttributes(streamDirectionAttrs(system, method, direction)...))
+}
+
+func streamAttrs(system, method string) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.String(AttrSystem, system),
+		attribute.String(AttrMethod, method),
+		attribute.String(AttrTransport, TransportLocal),
+	}
+}
+
+func streamDirectionAttrs(system, method, direction string) []attribute.KeyValue {
+	if direction != DirectionClientToServer && direction != DirectionServerToClient {
+		direction = OutcomeOther
+	}
+	attrs := streamAttrs(system, method)
+	return append(attrs, attribute.String(AttrDirection, direction))
+}
+
+func streamOutcome(err error) string {
+	switch {
+	case err == nil, errors.Is(err, io.EOF):
+		return OutcomeOK
+	case errors.Is(err, context.Canceled):
+		return OutcomeCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return OutcomeTimeout
+	default:
+		return OutcomeError
+	}
+}
+
+func streamErrorCode(err error) string {
+	var coded interface{ Code() string }
+	if errors.As(err, &coded) {
+		switch coded.Code() {
+		case "INTERNAL", "INVALID_ARGUMENT", "NOT_FOUND", "CONFLICT", "UNAUTHENTICATED",
+			"PERMISSION_DENIED", "UNAVAILABLE", "TX_BOUNDARY", "IDEMPOTENCY_CONFLICT",
+			"IDEMPOTENCY_RESULT_UNAVAILABLE", "MIGRATION_DRIFT", "STEP_UP_REQUIRED":
+			return coded.Code()
+		}
+	}
+	return OutcomeOther
 }
 
 func outcomeOfCode(code string) string {
