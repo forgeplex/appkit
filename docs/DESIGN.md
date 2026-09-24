@@ -789,8 +789,8 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
   上报主循环并触发关停。自己起 goroutine 的三种典型写错（关停不等、关停预算耗尽不放手、
   崩了没人管）都收在这一处。周期任务再套 `job.Every(pool, job.Task{...})` 拿跨副本互斥。
 - **可观测性自动就位，业务不写埋点**：契约调用、Local Stream、outbox 投递与死信、周期任务、数据库查询
-  五条路径由框架产出 RED 指标（HTTP 入站由 otelhttp 出，不重复埋）；Local Stream 另记活动数、首消息延迟、消息数、终态和满队列等待；outbox 积压深度与
-  最老待投递年龄以 gauge 观测（告警看年龄而不是条数）。标签集在 `internal/metrics` 钉死，
+  五条路径由框架产出 RED 指标（HTTP 入站由 otelhttp 出，不重复埋）；Local Stream 另记活动数、首消息延迟、消息数、终态和满队列等待；SSE/WSS 另记传输帧数与应用载荷字节，WSS 记录协议错误和 Hub drain 强制关闭；outbox 积压深度与
+  最老待投递年龄以 gauge 观测（告警看年龄而不是条数）。传输字节按 SSE ResponseWriter 实际接受量或 WebSocket JSON envelope payload 计算，不含 HTTP/RFC6455 framing、TLS、控制帧或代理封装；协议错误只表示被拒绝的应用帧，强制关闭按 Hub 管理连接去重。标签集在 `internal/metrics` 钉死，
   业务无法追加维度——指标事故几乎都源于"顺手加一个标签"。
 - **跨边界元数据走 `callctx` 白名单**：契约 ctx 防火墙剥掉一切值，
   只有 request/partition/tenant/caller 四个具名字段被放回；事件 meta 也由 outbox/relay
@@ -852,7 +852,7 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
    - `callctx`（穿越契约 ctx 防火墙的元数据白名单，事件 meta 也可快照/还原；
      HTTP 根入站另受身份信任边界约束）
    - `job`（advisory lock 跨副本互斥的周期任务）
-   - `internal/metrics`（五条路径的 RED 指标 + Local Stream 生命周期/消息/backpressure 指标 + outbox 积压 gauge，标签集框架内钉死）
+   - `internal/metrics`（五条路径的 RED 指标 + Local Stream 生命周期/消息/backpressure 指标 + SSE/WSS 传输帧/字节、WSS 协议错误/强制关闭 + outbox 积压 gauge，标签集框架内钉死）
    - `apptest.Conform`（契约一致性套件：同一批用例过每个绑定，比对错误码/返回值/
      边界语义）+ `contract.Call` 在进 fn 前拦掉已死的 ctx——**§5.3 的四件套至此
      既是承诺也是可运行的断言**
