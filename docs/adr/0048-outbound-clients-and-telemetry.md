@@ -61,7 +61,9 @@ AppKit 是共享 Go 框架：新增公开 API 必须纯加法；根包/tx 不能
 - Bootstrap 从其现有 YAML 配置加载 private runtime telemetry schema，并将解析/验证后的配置传给新增的 Telemetry 初始化入口；**业务代码无需调用 `telemetry.Init`、`otel.SetTracerProvider` 或创建 exporter**。
 - 配置按 signal 独立控制框架已支持的 traces 与 metrics exporter；每个 signal 可有显式启用开关、OTLP/HTTP endpoint 和必要的 timeout/sampling。service name/environment 继续由 Bootstrap 的服务名与运行环境产生，不允许 YAML 覆写身份来源。
 - 默认不启用远端 trace/metric 导出；instrumentation 留在 AppKit 自动执行，未启用 exporter 时使用 noop provider。日志保持 stdout，由已有 `log.level` / `log.format` 配置控制；本 ADR 不新增远程日志 exporter。
-- YAML 是显式配置源；现有配置 loader 的应用级环境变量继续覆盖 YAML。已有标准 `OTEL_EXPORTER_OTLP_ENDPOINT` 环境变量作为兼容路径保留，具体覆盖/回退优先级须在实现 issue 中用行为测试冻结。endpoint 可写普通配置；认证 header/token、私钥和证书私密材料只从环境变量或 secret provider 读取，不能落入普通 YAML 或错误日志。
+- 新 YAML 配置块按 signal 显式选择启停；当该配置块存在时，trace/metric 的 `enabled` 由 YAML 决定，标准 OTLP endpoint 环境变量只能提供或覆盖地址，不能把 YAML 禁用的 signal 重新打开。地址优先级为 signal 专属环境变量（`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`）> 通用环境变量（`OTEL_EXPORTER_OTLP_ENDPOINT`）> 对应 signal 的 YAML endpoint；空环境变量按标准语义视为未设置。配置块存在且 signal 已启用但最终没有可用 endpoint 时，启动校验失败并说明配置路径，不静默回退到 localhost。
+- 为不改变未迁移服务的现有行为，完全没有 AppKit telemetry 配置块时保留旧兼容路径：非空 `OTEL_EXPORTER_OTLP_ENDPOINT` 仍同时启用 trace/metric OTLP；没有该变量时保持 noop。该兼容路径不作为新服务的推荐配置方式，后续是否移除由独立迁移决策处理。
+- endpoint 可写普通配置；认证 header/token、私钥和证书私密材料只从环境变量或 secret provider 读取，不能落入普通 YAML 或错误日志。标准 OTLP 环境变量的名称和空值规则遵循 [OpenTelemetry SDK environment variable specification](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/) 与 [OTLP exporter configuration](https://opentelemetry.io/docs/specs/otel/protocol/exporter/)。
 - exporter 构造失败必须 fail-fast 并给出脱敏配置路径/原因；shutdown 在其他资源结束后 flush，并受关停预算约束。
 
 ### 4. 自动观测、安全与数据边界
@@ -86,7 +88,7 @@ AppKit 是共享 Go 框架：新增公开 API 必须纯加法；根包/tx 不能
 | WSS | 双向 | Send/Recv/CloseSend，复用现有 secure dialer | 半关闭、EOF、错误、凭证过期、限额、关停 |
 | Local Stream | 双向进程内 | 既有 `ClientStream` | 背压、并发限制、取消、Close 和 handler 退出 |
 
-实现 issue 的验收至少包括：YAML enable/disable 与独立端点验证；环境变量覆盖优先级；fake OTLP collector 收到预期 signal；业务模块不调用 OTel 初始化仍能自动观测；安全标签/日志拒绝敏感字段；HTTP/SSE/WSS 客户端的安全、取消和错误测试；相应 adapter 的 conformance；`make check`、`make test-lint`、必要的 `make test-rules` 及相对最新 tag 的零 incompatible apidiff。
+实现 issue 的验收至少包括：YAML 按 signal enable/disable 与独立端点验证；环境优先级（signal 专属 endpoint > 通用 endpoint > YAML endpoint）、空环境值视为未设置、`enabled: false` 不被 endpoint 环境变量重新打开、启用但无 endpoint 时 fail-fast，以及无 AppKit telemetry 块时旧 `OTEL_EXPORTER_OTLP_ENDPOINT` 兼容行为；fake OTLP collector 收到预期 signal；业务模块不调用 OTel 初始化仍能自动观测；安全标签/日志拒绝敏感字段；HTTP/SSE/WSS 客户端的安全、取消和错误测试；相应 adapter 的 conformance；`make check`、`make test-lint`、必要的 `make test-rules` 及相对最新 tag 的零 incompatible apidiff。
 
 ## 后续切片
 
