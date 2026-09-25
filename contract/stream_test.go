@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
 	"github.com/forgeplex/appkit/contract/streamtest"
 	"go.opentelemetry.io/otel"
@@ -233,6 +234,152 @@ func TestLocalStreamRejectsConcurrentSendAndRecv(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("active Recv did not complete")
 	}
+}
+
+func TestLocalStreamContextFirewallPreservesWhitelist(t *testing.T) {
+	type privateKey struct{}
+	meta := callctx.Meta{RequestID: "local-stream", Partition: "region-a", TenantID: "tenant-a", Caller: "gateway"}
+	deadline := time.Now().Add(time.Minute)
+	outer, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	outer = callctx.With(context.WithValue(outer, privateKey{}, "private"), meta)
+	var traceID trace.TraceID
+	traceID[0] = 1
+	var parentSpanID trace.SpanID
+	parentSpanID[0] = 1
+	parent := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID: traceID, SpanID: parentSpanID, TraceFlags: trace.FlagsSampled,
+	})
+	outer = trace.ContextWithSpanContext(outer, parent)
+	type observation struct {
+		meta        callctx.Meta
+		private     any
+		span        trace.SpanContext
+		deadline    time.Time
+		hasDeadline bool
+	}
+	seen := make(chan observation, 1)
+	s, err := openLocalStream(outer, contract.StreamConfig{MaxDuration: 2 * time.Minute, CloseTimeout: time.Second},
+		func(ctx context.Context, _ contract.Stream[streamResponse, streamRequest]) error {
+			gotDeadline, hasDeadline := ctx.Deadline()
+			seen <- observation{callctx.From(ctx), ctx.Value(privateKey{}), trace.SpanFromContext(ctx).SpanContext(), gotDeadline, hasDeadline}
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("OpenLocal: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	select {
+	case got := <-seen:
+		if got.meta != meta || got.private != nil || !got.span.IsValid() || got.span.TraceID() != parent.TraceID() || !got.hasDeadline || !got.deadline.Equal(deadline) {
+			t.Fatalf("local stream context = %+v, want only the whitelist and parent trace/deadline", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stream handler did not start")
+	}
+}
+
+func TestLocalStreamBackpressureIsOperationScoped(t *testing.T) {
+	gate := make(chan struct{})
+	cfg := contract.StreamConfig{MaxDuration: 2 * time.Second, CloseTimeout: time.Second, QueueSize: 1}
+	s, err := openLocalStream(context.Background(), cfg, func(ctx context.Context, peer contract.Stream[streamResponse, streamRequest]) error {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		for {
+			request, err := peer.Recv(ctx)
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := peer.Send(ctx, streamResponse{Sequence: request.Sequence}); err != nil {
+				return err
+			}
+		}
+	})
+	if err != nil {
+		t.Fatalf("OpenLocal: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Send(context.Background(), streamRequest{Sequence: 1}); err != nil {
+		t.Fatalf("first Send: %v", err)
+	}
+	opCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	err = s.Send(opCtx, streamRequest{Sequence: 2})
+	cancel()
+	if !apperr.Is(err, apperr.CodeUnavailable) {
+		t.Fatalf("full-queue Send error = %v, want operation UNAVAILABLE", err)
+	}
+	close(gate)
+	if err := s.Send(context.Background(), streamRequest{Sequence: 2}); err != nil {
+		t.Fatalf("retry Send after operation cancellation: %v", err)
+	}
+	if err := s.CloseSend(context.Background()); err != nil {
+		t.Fatalf("CloseSend: %v", err)
+	}
+	for _, want := range []int{1, 2} {
+		got, err := s.Recv(context.Background())
+		if err != nil || got.Sequence != want {
+			t.Fatalf("Recv = (%+v, %v), want sequence %d", got, err, want)
+		}
+	}
+	if _, err := s.Recv(context.Background()); !errors.Is(err, io.EOF) {
+		t.Fatalf("terminal Recv = %v, want io.EOF", err)
+	}
+}
+
+func TestLocalStreamCloseTimeoutAndUnknownCause(t *testing.T) {
+	t.Run("non-cooperative handler exceeds close budget", func(t *testing.T) {
+		release := make(chan struct{})
+		workerDone := make(chan struct{})
+		t.Cleanup(func() {
+			select {
+			case <-release:
+			default:
+				close(release)
+			}
+		})
+		cfg := contract.StreamConfig{MaxDuration: time.Second, CloseTimeout: 15 * time.Millisecond}
+		s, err := openLocalStream(context.Background(), cfg, func(context.Context, contract.Stream[streamResponse, streamRequest]) error {
+			<-release // Deliberately ignores cancellation; release it before the test exits.
+			close(workerDone)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("OpenLocal: %v", err)
+		}
+		closeErr := s.Close()
+		if !apperr.Is(closeErr, apperr.CodeUnavailable) || !errors.Is(closeErr, context.DeadlineExceeded) {
+			t.Fatalf("Close error = %v, want inspectable UNAVAILABLE", closeErr)
+		}
+		if second := s.Close(); second != closeErr {
+			t.Fatalf("Close result changed: first=%p second=%p", closeErr, second)
+		}
+		close(release)
+		select {
+		case <-workerDone:
+		case <-time.After(time.Second):
+			t.Fatal("released non-cooperative handler did not exit")
+		}
+	})
+
+	t.Run("unknown handler cause remains inspectable locally", func(t *testing.T) {
+		cause := errors.New("private handler detail")
+		s, err := openLocalStream(context.Background(), contract.StreamConfig{MaxDuration: time.Second, CloseTimeout: time.Second},
+			func(context.Context, contract.Stream[streamResponse, streamRequest]) error { return cause })
+		if err != nil {
+			t.Fatalf("OpenLocal: %v", err)
+		}
+		defer func() { _ = s.Close() }()
+		_, err = s.Recv(context.Background())
+		if !apperr.Is(err, apperr.CodeInternal) || !errors.Is(err, cause) {
+			t.Fatalf("local terminal error = %v, want INTERNAL with inspectable cause", err)
+		}
+	})
 }
 
 func TestOpenLocalSynchronousFailures(t *testing.T) {

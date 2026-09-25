@@ -209,7 +209,8 @@ psp-contracts/
   HTTP client/server，Server Stream 生成 POST + SSE server adapter，Bidi 生成 WSS
   client/server adapter，并复用 `contract.OpenLocal` 的生命周期与有界队列。WebSocket
   Upgrade 前遵守分类路由和认证边界，Upgrade 后不刷新凭证；Host 通过受管 Hub 跟踪
-  hijacked socket。AsyncAPI 不作为首期事实源或输出。
+  hijacked socket。Hub/每连接的连接数、应用 data 帧与 payload 速率必须显式有界；
+  速率耗尽时使用可取消背压，不静默丢帧。AsyncAPI 不作为首期事实源或输出。
 - `contract-check` 对相同 schema version 做保守比较；V2 方法形态、消息字段、
   requiredness、cursor 映射和 terminal event 变化均参与兼容判定。V1 与 V2 之间
   不做隐式迁移；新增方法不能静默扩宽已有生成 interface。
@@ -298,7 +299,12 @@ psp/                             # module github.com/forgeplex/psp
 └── .github/workflows/           # 集成 CI：拉各域 tag 编译 + 双模式集成测试
 ```
 
-### 5.1 核心接口（appkit 稳定面，只依赖 stdlib）
+### 5.1 根包核心边界（只依赖 stdlib）
+
+`Module` / `Registry` / `Provide` / `Resolve` 是根包稳定核心。此处为完整性展示的
+`Headless` 与 Contribution API 按 ADR-0047 §8 仍属实验性，不自动进入 v1.0 稳定面；
+`App.Start` 和新 Host Profile API 同样未自动提升为稳定面；
+配置、CLI、manifest、生成物及迁移的候选承诺见 [STABILITY.md](STABILITY.md)。
 
 ```go
 // appkit.go
@@ -310,11 +316,11 @@ type Module interface {
 // Registry —— 模块向系统贡献能力（fx value groups 思想，手写实现，无反射魔法）
 func Provide[T any](reg *Registry, ctor func(*Registry) (T, error)) // 注册契约实现（惰性构造）
 func Resolve[T any](reg *Registry) (T, error)                       // 取依赖；启动期缺失 fail-fast、循环依赖报错
-type Contribution[T any] struct { Name, Module string; Value T }
-func Contribute[T any](reg *Registry, name string, ctor func(*Registry) (T, error)) // 注册扩展集合条目
-func ResolveContributions[T any](reg *Registry) ([]Contribution[T], error)           // Setup 中读确定性快照
+type Contribution[T any] struct { Name, Module string; Value T }                    // 实验性，见 ADR-0047 §8
+func Contribute[T any](reg *Registry, name string, ctor func(*Registry) (T, error)) // 实验性：注册扩展集合条目
+func ResolveContributions[T any](reg *Registry) ([]Contribution[T], error)           // 实验性：Setup 中读确定性快照
 func Security(mode SecurityMode) Option                              // HTTP 身份边界模式，Run 必须显式选择
-func Headless() Option                                               // 不启用业务 HTTP；声明路由或 pprof 时启动拒绝
+func Headless() Option                                               // 实验性：不启用业务 HTTP；声明路由或 pprof 时启动拒绝
 func DisableMigrations() Option                                       // 未启用迁移 capability 时拒绝有迁移的模块
 func (r *Registry) MountPublic(pattern string, h http.Handler)       // 明示公开路由
 func (r *Registry) MountAuthenticated(pattern string, h http.Handler)// 需用户主体
@@ -335,6 +341,15 @@ func (r *Registry) ManagedService(name string, policy ServicePolicy, factory Man
 实例。ManagedService 的 Host 关停顺序是全体反序 Drain、取消 Service Run Context、
 等待全体 Run 退出、全体反序 Close；普通 `Worker` 与 `ManagedSubscriber` 保持各自现有
 语义，不隐式升级为 ManagedService。
+
+`appkit.host.managed_service.state` 是 ObservableGauge，表示当前进程中每个已解析
+ManagedService 实例的生命周期状态数量，按稳定的 module/service 名与固定 state 枚举
+聚合，不含 Host/实例 ID。`created` 表示 factory 已解析，`starting` 表示调用 Start，
+`running` 表示 Run 已启动，`ready` 表示 Ready 检查通过；启动或运行期失败进入 `failed`
+且该状态在清理后仍保留；正常关停依次经过 `draining`（调用 Drain）、`stopping`
+（Drain 全部结束、开始取消 Run Context）和 `stopped`（Close 成功）。Host 尚未调用某实例的
+Start 就发生回滚时，其状态为 `not_started`。该 gauge 是生命周期状态计数，不是活跃连接数、readiness
+判定或健康检查；它只观察 Host 已有的生命周期转换，不参与启动、错误传播和关停决策。
 
 Contribution 使用独立于普通、具名与 Remote binding 的 `(reflect.Type, name)` 集合
 命名空间。同类型同名在 Register 阶段失败，不同类型可同名；启动解析先完成普通
@@ -640,6 +655,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 规则 | 落点 | 强度 |
 |---|---|---|
 | Stream 不继承 Unary 调用期限与值边界 | `contract.OpenLocal` 显式校验事务、应用 `Firewall`、根最大时长/idle policy 与有界双向队列；`contract/streamtest` 锁定 Local 行为；SSE 与 WSS adapter 分别锁定 framing、per-frame deadline、背压、取消、终态、凭证过期及 Host drain | ▲ 运行时 + 本地/HTTP 集成测试；含 Local、SSE 与 WSS 传输测试，不代表 required CI、下游运行、发布或业务验收 |
+| WebSocket 连接准入与应用消息速率有有限边界 | `NewWebSocketHubWithLimits` 要求显式 `MaxConnections` 与双向帧/字节速率及 burst；Hub 在 Upgrade 前原子计算 pending+active；每连接只对应用 `data` 帧 paced backpressure；旧无界 Hub 无法 Start/接纳 Upgrade | ▲ Hub/连接运行时守卫 + 并发/速率/取消本地测试；仅单 Hub 与单连接预算，不是跨副本全局配额 |
 | 同契约的多个实例不误回退到无名绑定 | `ProvideContractNamed` / `ResolveNamed` 精确匹配 `(Go 类型, 实例名)`，共享启动期重复/缺失/循环检查 | ▲ 运行时装配级；名字不是租户隔离或消费方 binding manifest |
 | 多实现扩展集合不污染 binding 命名空间 | `Contribute` 使用独立 `(reflect.Type, name)` map；target 过滤后仅对已注册条目 eager 构造一次，保留 Module 并稳定排序；`ResolveContributions` 只读缓存快照 | ▲ Register/启动解析守卫 + 本地测试；不提供授权或租户隔离语义 |
 | Agent 不用旧生成结果覆盖已修改的目标 | plan 绑定输入及全部输出的选定文件快照，`apply` 在协作锁内复核；schema 另绑定迁移/产出目录成员 | ▲ 工具运行时级；非整个仓库摘要，外部编辑器不受锁约束 |
@@ -689,7 +705,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 长驻任务死了必被发现 | `Registry.Worker` 托管：异常退出上报主循环并触发关停；需要资源生命周期的组件用 `ManagedService`（Critical/Optional、Ready、反序 Drain/Close） | ★ API 设计级 |
 | ctx 只能传白名单元数据 | `callctx.Meta` 是具名字段的 struct 而非 map，防火墙剥值后只放回它 | ★ 编译器级：塞不进去 |
 | 周期任务多副本不重跑 | `job.Every` 用 Postgres advisory lock（session 级，连接断开自动释放） | ▲ API 设计级：正确写法零成本，裸 ticker 拦不住 |
-| 指标基数不失控 | 标签值只能是代码常量或 `internal/metrics` 收敛过的枚举；SQL 动词过白名单，未识别塌缩为 `other` | ▲ API 设计级：业务传不进框架指标，但自建 meter 仍可自伤 |
+| 指标基数不失控 | 标签值只能是稳定契约名或 `internal/metrics` 收敛过的枚举；Stream transport/direction/outcome 固定，错误码过框架白名单，未知塌缩为 `other`；SQL 动词同样过白名单 | ▲ API 设计级：业务传不进框架指标，但自建 meter 仍可自伤 |
 | 已死的 ctx 不落到实现上 | `contract.Call` 在进 fn 前查 `ctx.Err()`——跨网络时这种调用本来就发不出去 | ★ 运行时级：两种形态由构造一致 |
 | 两种部署形态语义一致 | `apptest.Conform` 让同一批用例跑过每个绑定，比对错误码/返回值/边界语义 | ▲ 测试级：写了才有；但不写就只剩口头承诺 |
 | 契约超时不制造伪取消 | `contract.Call` 只传播 deadline，已启动的同步 fn 必须自行协作取消；忽略 ctx 的迟到返回按结果/未知结果处理，不用 goroutine+select 强杀 | ★ 语义明确级：不能强制停止任意 Go 函数；业务须用幂等与查询/对账收敛 |
@@ -788,9 +804,9 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
 - **长驻任务一律经 `reg.Worker(name, run)`**：框架起 goroutine、关停等它退出、异常退出
   上报主循环并触发关停。自己起 goroutine 的三种典型写错（关停不等、关停预算耗尽不放手、
   崩了没人管）都收在这一处。周期任务再套 `job.Every(pool, job.Task{...})` 拿跨副本互斥。
-- **可观测性自动就位，业务不写埋点**：契约调用、outbox 投递与死信、周期任务、数据库查询
-  四条路径由框架产出 RED 指标（HTTP 入站由 otelhttp 出，不重复埋）；outbox 积压深度与
-  最老待投递年龄以 gauge 观测（告警看年龄而不是条数）。标签集在 `internal/metrics` 钉死，
+- **可观测性自动就位，业务不写埋点**：契约调用、Local Stream、outbox 投递与死信、周期任务、数据库查询
+  五条路径由框架产出 RED 指标（HTTP 入站由 otelhttp 出，不重复埋）；Local Stream 另记活动数、首消息延迟、消息数、终态和满队列等待；SSE/WSS 另记传输帧数与应用载荷字节，WSS 记录协议错误和 Hub drain 强制关闭；outbox 积压深度与
+  最老待投递年龄以 gauge 观测（告警看年龄而不是条数）。传输字节按 SSE ResponseWriter 实际接受量或 WebSocket JSON envelope payload 计算，不含 HTTP/RFC6455 framing、TLS、控制帧或代理封装；协议错误只表示被拒绝的应用帧，强制关闭按 Hub 管理连接去重。标签集在 `internal/metrics` 钉死，
   业务无法追加维度——指标事故几乎都源于"顺手加一个标签"。
 - **跨边界元数据走 `callctx` 白名单**：契约 ctx 防火墙剥掉一切值，
   只有 request/partition/tenant/caller 四个具名字段被放回；事件 meta 也由 outbox/relay
@@ -852,7 +868,7 @@ go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走*
    - `callctx`（穿越契约 ctx 防火墙的元数据白名单，事件 meta 也可快照/还原；
      HTTP 根入站另受身份信任边界约束）
    - `job`（advisory lock 跨副本互斥的周期任务）
-   - `internal/metrics`（四条路径的 RED 指标 + outbox 积压 gauge，标签集框架内钉死）
+   - `internal/metrics`（五条路径的 RED 指标 + Local Stream 生命周期/消息/backpressure 指标 + SSE/WSS 传输帧/字节、WSS 协议错误/强制关闭 + outbox 积压 gauge + ManagedService 状态 gauge，标签集框架内钉死）
    - `apptest.Conform`（契约一致性套件：同一批用例过每个绑定，比对错误码/返回值/
      边界语义）+ `contract.Call` 在进 fn 前拦掉已死的 ctx——**§5.3 的四件套至此
      既是承诺也是可运行的断言**

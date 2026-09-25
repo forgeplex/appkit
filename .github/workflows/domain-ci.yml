@@ -16,27 +16,63 @@ permissions:
 jobs:
   ci:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:18.6@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
-        env:
-          POSTGRES_PASSWORD: appkit
-          POSTGRES_DB: appkit_test
-        ports:
-          - 55499:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d appkit_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     env:
       TEST_DATABASE_URL: postgres://postgres:appkit@127.0.0.1:55499/appkit_test?sslmode=disable
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ inputs.go-version }}
+
+      # 仍保留 CI 中现有的 TCP DSN（checkout / transfer 的 fixture 守卫精确
+      # 校验它），同时给 webhook 的破坏性集成测试提供独立随机 Unix socket。
+      # PostgreSQL 只在本 job 的容器里；TCP 仅绑定 runner 回环地址，数据目录
+      # 在容器可写层，socket 目录是本 job 新建的随机路径。
+      - name: 启动隔离 PostgreSQL 测试库
+        shell: bash
+        run: |
+          set -euo pipefail
+          db_root=$(mktemp -d /tmp/webhook-db-test.XXXXXXXX)
+          chmod 0755 "$db_root"
+          db_socket="$db_root/socket"
+          mkdir -m 0777 "$db_socket"
+          db_container="appkit-domain-db-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          {
+            printf 'APPKIT_TEST_DB_ROOT=%s\n' "$db_root"
+            printf 'APPKIT_TEST_DB_CONTAINER=%s\n' "$db_container"
+            printf 'WEBHOOK_TEST_DATABASE_URL=postgresql:///appkit_test?host=%s&user=postgres&sslmode=disable\n' "$db_socket"
+            printf 'WEBHOOK_TEST_DISPOSABLE=1\n'
+          } >> "$GITHUB_ENV"
+
+          docker run --detach --name "$db_container" \
+            --publish 127.0.0.1:55499:5432 \
+            --mount "type=bind,source=$db_root,target=$db_root" \
+            --tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m \
+            --env POSTGRES_USER=postgres \
+            --env POSTGRES_PASSWORD=appkit \
+            --env POSTGRES_DB=appkit_test \
+            postgres:18.6@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280 \
+            -c "unix_socket_directories=/var/run/postgresql,$db_socket" \
+            -c shared_preload_libraries=pg_stat_statements \
+            -c pg_stat_statements.max=100000
+
+          ready=0
+          for ((attempt = 0; attempt < 60; attempt++)); do
+            if docker exec "$db_container" pg_isready -h "$db_socket" -U postgres -d appkit_test >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != 1 ]]; then
+            docker logs "$db_container"
+            echo "::error::隔离 PostgreSQL 未在 60 秒内就绪"
+            exit 1
+          fi
+          docker exec "$db_container" psql --no-psqlrc --set ON_ERROR_STOP=1 \
+            --username postgres --dbname appkit_test \
+            --command 'CREATE EXTENSION pg_stat_statements'
 
       - name: gofmt 检查
         run: |
@@ -108,3 +144,40 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
+
+      - name: 清理隔离 PostgreSQL
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${APPKIT_TEST_DB_CONTAINER:-}" ]] && docker container inspect "$APPKIT_TEST_DB_CONTAINER" >/dev/null 2>&1; then
+            if [[ "$(docker inspect --format '{{.State.Running}}' "$APPKIT_TEST_DB_CONTAINER")" == true ]]; then
+              docker stop --timeout 10 "$APPKIT_TEST_DB_CONTAINER"
+            fi
+            docker rm "$APPKIT_TEST_DB_CONTAINER"
+          fi
+          if [[ -n "${APPKIT_TEST_DB_ROOT:-}" ]]; then
+            if [[ ! "$APPKIT_TEST_DB_ROOT" =~ ^/tmp/webhook-db-test\.[A-Za-z0-9]{8}$ ]]; then
+              echo "::error::隔离 PostgreSQL 临时目录路径不符合预期，保留现场"
+              exit 1
+            fi
+            if [[ -L "$APPKIT_TEST_DB_ROOT" ]]; then
+              echo "::error::隔离 PostgreSQL 临时目录变成了符号链接，拒绝删除"
+              exit 1
+            fi
+            if [[ -d "$APPKIT_TEST_DB_ROOT" ]]; then
+              if [[ -L "$APPKIT_TEST_DB_ROOT/socket" || ! -d "$APPKIT_TEST_DB_ROOT/socket" ]]; then
+                echo "::error::隔离 PostgreSQL socket 目录不存在或不是普通目录"
+                exit 1
+              fi
+              for entry in "$APPKIT_TEST_DB_ROOT"/socket/.[!.]* "$APPKIT_TEST_DB_ROOT"/socket/*; do
+                [[ -e "$entry" || -L "$entry" ]] || continue
+                if [[ -d "$entry" && ! -L "$entry" ]]; then
+                  echo "::error::隔离 PostgreSQL socket 目录包含意外子目录，保留现场"
+                  exit 1
+                fi
+                unlink -- "$entry"
+              done
+              rmdir -- "$APPKIT_TEST_DB_ROOT/socket" "$APPKIT_TEST_DB_ROOT"
+            fi
+          fi

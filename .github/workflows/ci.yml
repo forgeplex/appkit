@@ -28,13 +28,13 @@ jobs:
     env:
       TEST_DATABASE_URL: postgres://postgres:appkit@127.0.0.1:55499/appkit_test?sslmode=disable
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # apidiff 门禁需要完整历史与 tag
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26"
+          go-version-file: go.mod
 
       # 内部 acceptance/scaffold 测试会在子进程中关闭网络，构建完整的
       # appkit 工作区。显式预热整个 module graph，不能依赖 runner 缓存恰好
@@ -42,43 +42,17 @@ jobs:
       - name: 预热完整 Go module cache
         run: go mod download all
 
-      - name: gofmt 检查
-        run: |
-          out=$(gofmt -l .)
-          if [ -n "$out" ]; then
-            echo "以下文件未经 gofmt 格式化:"
-            echo "$out"
-            exit 1
-          fi
-
-      - name: go vet
-        run: go vet ./...
-
-      - name: go build
-        run: go build ./...
-
-      - name: go test
-        run: go test -race -count=1 ./...
+      # Makefile 是框架自检的唯一事实源；该入口要求一次性数据库并运行 race 测试。
+      - name: 框架自检（make ci）
+        run: make ci
 
       - name: go.mod 整洁检查
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
 
-      - name: lint 子 module（appkit-lint analyzers）
-        run: |
-          cd lint
-          go build ./...
-          go test ./...
-
-      # appkit 只生产规则集（ruleset/templates）、自己不消费——golden 测试锁的是
-      # 「模板文本没变」，防不住「规则从写下来那天就是错的」。这一步生成一个
-      # 每个组件都带子包的域仓库，用钉版本的检查器真跑，再植入已知违规确认会红。
-      - name: 规则集端到端（真跑 golangci-lint + go-arch-lint）
-        run: make test-rules
-
       # appkit 经 MVS 依赖钻石被全部域仓库共享，公开 API 近乎终身兼容
-      # （DESIGN §9）。基线 = 最新发版 tag，破坏性变更直接红灯。
+      # （DESIGN §9）。主 module 与 lint/ 嵌套 module 分别对比最新发版 tag。
       - name: API 向后兼容门禁（apidiff vs 最新 tag）
         run: |
           # --match 排除 lint/vX.Y.Z 路标 tag（lint/ 嵌套 module 的 Go 模块
@@ -100,3 +74,15 @@ jobs:
             exit 1
           fi
           echo "相对 $base 无破坏性变更"
+
+          # lint/ 是单独发布的 Go module；主 module 的 apidiff 不会加载它。
+          # 两个 module 的版本 tag 锁步，因此从同一 base commit 比较。
+          (cd /tmp/apidiff-base/lint && go run "$apidiff" -m -w /tmp/base.lint.export github.com/forgeplex/appkit/lint)
+          (cd lint && go run "$apidiff" -m -w /tmp/head.lint.export github.com/forgeplex/appkit/lint)
+          lint_out=$(go run "$apidiff" -m -incompatible /tmp/base.lint.export /tmp/head.lint.export 2>/dev/null)
+          if [ -n "$lint_out" ]; then
+            echo "相对 $base 存在破坏性 API 变更（lint module，见 docs/STABILITY.md）:"
+            echo "$lint_out"
+            exit 1
+          fi
+          echo "lint module 相对 $base 无破坏性变更"

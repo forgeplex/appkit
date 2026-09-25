@@ -21,6 +21,7 @@ import (
 
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/contract"
+	"github.com/forgeplex/appkit/internal/metrics"
 	"github.com/forgeplex/appkit/tx"
 )
 
@@ -114,6 +115,9 @@ func validateWebSocketConfig(cfg WebSocketConfig) error {
 	case cfg.Hub == nil:
 		return apperr.InvalidArgument("httpserver WebSocket: Hub is required for Host drain tracking")
 	}
+	if err := cfg.Hub.validateMessageLimit(cfg.MaxMessageBytes); err != nil {
+		return err
+	}
 	for _, origin := range cfg.OriginPatterns {
 		if strings.TrimSpace(origin) != origin {
 			return apperr.InvalidArgument("httpserver WebSocket: OriginPatterns entries must not contain surrounding whitespace")
@@ -142,16 +146,19 @@ func validateWebSocketConfig(cfg WebSocketConfig) error {
 // 接口的结构化实现）。在模块 Register 中通过 Registry.ManagedService 注册。
 // Start 打开连接入口，Drain 停止新升级并按预算发送 GoingAway/强制关停。
 type WebSocketHub struct {
-	mu          sync.Mutex
-	started     bool
-	accepting   bool
-	closed      bool
-	pending     map[*webSocketReservation]struct{}
-	connections map[*managedWebSocket]struct{}
-	changed     chan struct{}
+	mu               sync.Mutex
+	started          bool
+	accepting        bool
+	closed           bool
+	limitsConfigured bool
+	limits           WebSocketHubLimits
+	pending          map[*webSocketReservation]struct{}
+	connections      map[*managedWebSocket]struct{}
+	changed          chan struct{}
 }
 
-// NewWebSocketHub 创建尚未 Start 的 WebSocket 连接注册表。
+// NewWebSocketHub 创建尚未 Start、且未配置连接/速率预算的 WebSocket Hub。
+// 为保持现有调用签名，该 Hub 仍可构造，但 Start 不会使其进入可接纳状态。
 func NewWebSocketHub() *WebSocketHub {
 	return &WebSocketHub{
 		pending:     make(map[*webSocketReservation]struct{}),
@@ -171,6 +178,9 @@ func (h *WebSocketHub) Start(ctx context.Context) error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.limitsConfigured {
+		return apperr.InvalidArgument("httpserver WebSocket hub: explicit finite limits are required")
+	}
 	if h.closed || h.started {
 		return apperr.Conflict("httpserver WebSocket hub cannot be started more than once")
 	}
@@ -198,6 +208,9 @@ func (h *WebSocketHub) Ready(ctx context.Context) error {
 	defer h.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return apperr.Unavailable(err)
+	}
+	if !h.limitsConfigured {
+		return apperr.Unavailable(nil)
 	}
 	if !h.started || !h.accepting || h.closed {
 		return apperr.Unavailable(errors.New("websocket hub is not accepting connections"))
@@ -255,8 +268,14 @@ func (h *WebSocketHub) Close(ctx context.Context) error {
 func (h *WebSocketHub) reserve() (*webSocketReservation, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if !h.limitsConfigured {
+		return nil, apperr.Unavailable(nil)
+	}
 	if !h.started || !h.accepting || h.closed {
 		return nil, apperr.Unavailable(errors.New("websocket hub is draining"))
+	}
+	if len(h.pending) >= h.limits.MaxConnections || len(h.connections) >= h.limits.MaxConnections-len(h.pending) {
+		return nil, apperr.Unavailable(nil)
 	}
 	if h.pending == nil {
 		h.pending = make(map[*webSocketReservation]struct{})
@@ -394,20 +413,25 @@ func (r *webSocketReservation) force() {
 }
 
 type managedWebSocket struct {
-	hub       *WebSocketHub
-	conn      *websocket.Conn
-	raw       net.Conn
-	cancelIO  context.CancelFunc
-	stopApp   func() error
-	stopMu    sync.Mutex
-	draining  atomic.Bool
-	expired   atomic.Bool
-	forced    atomic.Bool
-	peerClose atomic.Bool
-	termMu    sync.Mutex
-	termCode  string
-	termClose websocket.StatusCode
-	drainOnce sync.Once
+	hub            *WebSocketHub
+	conn           *websocket.Conn
+	raw            net.Conn
+	rateCtx        context.Context
+	rates          *webSocketConnectionRateLimiter
+	cancelRateWait context.CancelFunc
+	system         string
+	method         string
+	cancelIO       context.CancelFunc
+	stopApp        func() error
+	stopMu         sync.Mutex
+	draining       atomic.Bool
+	expired        atomic.Bool
+	forced         atomic.Bool
+	peerClose      atomic.Bool
+	termMu         sync.Mutex
+	termCode       string
+	termClose      websocket.StatusCode
+	drainOnce      sync.Once
 }
 
 func (c *managedWebSocket) setStopApp(fn func() error) {
@@ -429,17 +453,27 @@ func (c *managedWebSocket) closeApp() {
 	}
 }
 
+func (c *managedWebSocket) stopRateWait() {
+	if c.cancelRateWait != nil {
+		c.cancelRateWait()
+	}
+}
+
 func (c *managedWebSocket) beginDrain() {
 	c.drainOnce.Do(func() {
 		c.draining.Store(true)
+		c.stopRateWait()
 		go c.closeApp()
 		go func() { _ = c.conn.Close(websocket.StatusGoingAway, "") }()
 	})
 }
 
 func (c *managedWebSocket) forceClose() {
-	c.forced.Store(true)
+	if c.forced.CompareAndSwap(false, true) {
+		metrics.StreamDrainForcedClose(context.Background(), c.system, c.method, metrics.TransportWebSocket)
+	}
 	c.cancelIO()
+	c.stopRateWait()
 	go c.closeApp()
 	_ = c.raw.Close()
 }
@@ -549,13 +583,21 @@ func serveWebSocket[Send, Receive any](
 	}
 	conn.SetReadLimit(cfg.MaxMessageBytes + maxFrameOverhead)
 	ioCtx, cancelIO := context.WithCancel(connectionBaseCtx)
-	record := &managedWebSocket{conn: conn, raw: raw, cancelIO: cancelIO, termClose: websocket.StatusInternalError}
+	rateCtx, cancelRateWait := context.WithTimeout(ioCtx, cfg.Stream.MaxDuration)
+	record := &managedWebSocket{
+		conn: conn, raw: raw, system: cfg.System, method: cfg.Method,
+		cancelIO: cancelIO, cancelRateWait: cancelRateWait, rateCtx: rateCtx,
+		rates:     newWebSocketConnectionRateLimiter(cfg.Hub.limits),
+		termClose: websocket.StatusInternalError,
+	}
 	if !reservation.attach(record) {
+		cancelRateWait()
 		cancelIO()
 		_ = raw.Close()
 		return
 	}
 	defer func() {
+		cancelRateWait()
 		cancelIO()
 		_ = raw.Close()
 		cfg.Hub.remove(record)
@@ -567,7 +609,7 @@ func serveWebSocket[Send, Receive any](
 		},
 	)
 	if err != nil {
-		writeTerminalFrame(ioCtx, conn, cfg.WriteTimeout, wsFrame{Type: "error", Code: safeWireCode(apperr.From(err).Code())})
+		writeTerminalFrame(ioCtx, conn, wsFrame{Type: "error", Code: safeWireCode(apperr.From(err).Code())}, cfg, metrics.DirectionServerToClient)
 		_ = conn.Close(websocket.StatusInternalError, "")
 		return
 	}
@@ -577,7 +619,7 @@ func serveWebSocket[Send, Receive any](
 	}
 	readDone := make(chan error, 1)
 	go func() {
-		err := readWebSocketRequests(ioCtx, conn, stream, record, cfg.MaxMessageBytes)
+		err := readWebSocketRequests(ioCtx, conn, stream, record, cfg)
 		readDone <- err
 	}()
 	writeWebSocketResponses(ioCtx, conn, stream, record, cfg)
@@ -737,24 +779,29 @@ func encodeWSFrame(frame wsFrame, maxBytes int64) ([]byte, error) {
 	return raw, nil
 }
 
-func writeWSFrame(ctx context.Context, conn *websocket.Conn, timeout time.Duration, frame wsFrame, maxBytes int64) error {
-	raw, err := encodeWSFrame(frame, maxBytes)
+func writeWSFrame(ctx context.Context, conn *websocket.Conn, frame wsFrame, cfg WebSocketConfig, direction string) error {
+	raw, err := encodeWSFrame(frame, cfg.MaxMessageBytes)
 	if err != nil {
 		return err
 	}
-	writeCtx, cancel := context.WithTimeout(ctx, timeout)
+	writeCtx, cancel := context.WithTimeout(ctx, cfg.WriteTimeout)
 	defer cancel()
 	if err := conn.Write(writeCtx, websocket.MessageText, raw); err != nil {
 		return apperr.Unavailable(nil)
 	}
+	metrics.StreamTransportBytesSent(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, direction, int64(len(raw)))
+	metrics.StreamTransportFrameSent(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, direction, frame.Type)
 	return nil
 }
 
-func writeTerminalFrame(ctx context.Context, conn *websocket.Conn, timeout time.Duration, frame wsFrame) {
-	writeCtx, cancel := context.WithTimeout(ctx, timeout)
+func writeTerminalFrame(ctx context.Context, conn *websocket.Conn, frame wsFrame, cfg WebSocketConfig, direction string) {
+	writeCtx, cancel := context.WithTimeout(ctx, cfg.WriteTimeout)
 	defer cancel()
 	if raw, err := json.Marshal(frame); err == nil {
-		_ = conn.Write(writeCtx, websocket.MessageText, raw)
+		if err := conn.Write(writeCtx, websocket.MessageText, raw); err == nil {
+			metrics.StreamTransportBytesSent(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, direction, int64(len(raw)))
+			metrics.StreamTransportFrameSent(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, direction, frame.Type)
+		}
 	}
 }
 
@@ -763,8 +810,13 @@ func readWebSocketRequests(
 	conn *websocket.Conn,
 	stream contract.ClientStream[json.RawMessage, json.RawMessage],
 	record *managedWebSocket,
-	maxBytes int64,
-) error {
+	cfg WebSocketConfig,
+) (result error) {
+	defer func() {
+		if record.draining.Load() || record.expired.Load() || record.forced.Load() || record.peerClose.Load() || result != nil {
+			record.stopRateWait()
+		}
+	}()
 	halfClosed := false
 	for {
 		typ, raw, err := conn.Read(ctx)
@@ -781,16 +833,23 @@ func readWebSocketRequests(
 			_ = stream.Close()
 			return apperr.Unavailable(nil)
 		}
+		metrics.StreamTransportBytesReceived(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionClientToServer, int64(len(raw)))
 		if record.draining.Load() || record.expired.Load() {
+			metrics.StreamTransportFrameReceived(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionClientToServer, metrics.OutcomeOther)
 			continue
 		}
 		if typ != websocket.MessageText {
+			err := apperr.InvalidArgument("WebSocket frames must use JSON text messages")
+			metrics.StreamTransportFrameReceived(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionClientToServer, metrics.OutcomeOther)
+			metrics.StreamProtocolError(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionClientToServer, err)
 			record.setTerminal(apperr.CodeInvalidArgument, websocket.StatusProtocolError)
 			_ = stream.Close()
-			return apperr.InvalidArgument("WebSocket frames must use JSON text messages")
+			return err
 		}
-		frame, err := decodeWSFrame(raw, maxBytes)
+		frame, err := decodeWSFrame(raw, cfg.MaxMessageBytes)
 		if err != nil {
+			metrics.StreamTransportFrameReceived(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionClientToServer, metrics.OutcomeOther)
+			metrics.StreamProtocolError(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionClientToServer, err)
 			code := apperr.CodeInvalidArgument
 			if apperr.Is(err, apperr.CodeInternal) {
 				code = apperr.CodeInternal
@@ -799,17 +858,31 @@ func readWebSocketRequests(
 			_ = stream.Close()
 			return err
 		}
+		metrics.StreamTransportFrameReceived(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionClientToServer, frame.Type)
 		if frame.Type != "data" && frame.Type != "half_close" {
+			err := apperr.InvalidArgument("client sent a server-only WebSocket frame")
+			metrics.StreamProtocolError(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionClientToServer, err)
 			record.setTerminal(apperr.CodeInvalidArgument, websocket.StatusPolicyViolation)
 			_ = stream.Close()
-			return apperr.InvalidArgument("client sent a server-only WebSocket frame")
+			return err
 		}
 		switch frame.Type {
 		case "data":
 			if halfClosed {
+				err := apperr.InvalidArgument("data frame received after half-close")
+				metrics.StreamProtocolError(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionClientToServer, err)
 				record.setTerminal(apperr.CodeInvalidArgument, websocket.StatusProtocolError)
 				_ = stream.Close()
-				return apperr.InvalidArgument("data frame received after half-close")
+				return err
+			}
+			if err := record.rates.waitInbound(record.rateCtx, cfg.Stream.IdleTimeout, int64(len(frame.Data))); err != nil {
+				if record.draining.Load() || record.expired.Load() || record.forced.Load() || record.peerClose.Load() {
+					return err
+				}
+				waitErr := webSocketRateWaitError(err)
+				record.setTerminal(waitErr.Code(), websocket.StatusInternalError)
+				_ = stream.Close()
+				return waitErr
 			}
 			if err := stream.Send(ctx, frame.Data); err != nil {
 				if errors.Is(err, io.EOF) {
@@ -823,9 +896,11 @@ func readWebSocketRequests(
 			}
 		case "half_close":
 			if halfClosed {
+				err := apperr.InvalidArgument("duplicate half-close frame")
+				metrics.StreamProtocolError(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionClientToServer, err)
 				record.setTerminal(apperr.CodeInvalidArgument, websocket.StatusProtocolError)
 				_ = stream.Close()
-				return apperr.InvalidArgument("duplicate half-close frame")
+				return err
 			}
 			halfClosed = true
 			if err := stream.CloseSend(ctx); err != nil {
@@ -857,7 +932,7 @@ func writeWebSocketResponses(
 			}
 			if code == "" {
 				if errors.Is(err, io.EOF) {
-					if writeWSFrame(ctx, conn, cfg.WriteTimeout, wsFrame{Type: "end"}, cfg.MaxMessageBytes) == nil {
+					if writeWSFrame(ctx, conn, wsFrame{Type: "end"}, cfg, metrics.DirectionServerToClient) == nil {
 						_ = conn.Close(websocket.StatusNormalClosure, "")
 					}
 					return
@@ -865,14 +940,31 @@ func writeWebSocketResponses(
 				code = safeWireCode(apperr.From(err).Code())
 				closeCode = websocket.StatusInternalError
 			}
-			writeTerminalFrame(ctx, conn, cfg.WriteTimeout, wsFrame{Type: "error", Code: safeWireCode(code)})
+			writeTerminalFrame(ctx, conn, wsFrame{Type: "error", Code: safeWireCode(code)}, cfg, metrics.DirectionServerToClient)
 			_ = conn.Close(closeCode, "")
 			return
 		}
 		if record.draining.Load() || record.expired.Load() {
 			continue
 		}
-		if err := writeWSFrame(ctx, conn, cfg.WriteTimeout, wsFrame{Type: "data", Data: value}, cfg.MaxMessageBytes); err != nil {
+		if err := record.rates.waitOutbound(record.rateCtx, cfg.Stream.IdleTimeout, int64(len(value))); err != nil {
+			if record.forced.Load() || record.peerClose.Load() || record.draining.Load() {
+				return
+			}
+			code, closeCode := record.terminal()
+			if record.expired.Load() {
+				code, closeCode = apperr.CodeUnauthenticated, websocket.StatusPolicyViolation
+			} else if code == "" {
+				waitErr := webSocketRateWaitError(err)
+				code, closeCode = waitErr.Code(), websocket.StatusInternalError
+				record.setTerminal(code, closeCode)
+				_ = stream.Close()
+			}
+			writeTerminalFrame(ctx, conn, wsFrame{Type: "error", Code: safeWireCode(code)}, cfg, metrics.DirectionServerToClient)
+			_ = conn.Close(closeCode, "")
+			return
+		}
+		if err := writeWSFrame(ctx, conn, wsFrame{Type: "data", Data: value}, cfg, metrics.DirectionServerToClient); err != nil {
 			record.setTerminal(apperr.From(err).Code(), websocket.StatusInternalError)
 			_ = conn.CloseNow()
 			return
@@ -890,6 +982,7 @@ func watchServerWebSocketExpiry(
 	if delay <= 0 {
 		record.expired.Store(true)
 		record.setTerminal(apperr.CodeUnauthenticated, websocket.StatusPolicyViolation)
+		record.stopRateWait()
 		_ = stream.Close()
 		return
 	}
@@ -900,6 +993,7 @@ func watchServerWebSocketExpiry(
 	case <-timer.C:
 		record.expired.Store(true)
 		record.setTerminal(apperr.CodeUnauthenticated, websocket.StatusPolicyViolation)
+		record.stopRateWait()
 		_ = stream.Close()
 	}
 }
@@ -1109,7 +1203,7 @@ func runWebSocketClient(
 	cfg WebSocketConfig,
 ) (retErr error) {
 	defer func() { _ = conn.CloseNow() }()
-	gate := &wsClientWriteGate{conn: conn, timeout: cfg.WriteTimeout, maxBytes: cfg.MaxMessageBytes, expires: expiresAt}
+	gate := &wsClientWriteGate{conn: conn, cfg: cfg, expires: expiresAt}
 	readDone := make(chan error, 1)
 	go func() { readDone <- readWebSocketResponses(ctx, conn, peer, gate, expiresAt, cfg) }()
 	timer := time.NewTimer(time.Until(expiresAt))
@@ -1145,12 +1239,11 @@ func runWebSocketClient(
 var errWebSocketHalfClosed = errors.New("websocket send direction half-closed")
 
 type wsClientWriteGate struct {
-	mu       sync.Mutex
-	conn     *websocket.Conn
-	timeout  time.Duration
-	maxBytes int64
-	expires  time.Time
-	expired  bool
+	mu      sync.Mutex
+	conn    *websocket.Conn
+	cfg     WebSocketConfig
+	expires time.Time
+	expired bool
 }
 
 func (g *wsClientWriteGate) write(ctx context.Context, frame wsFrame) error {
@@ -1159,7 +1252,7 @@ func (g *wsClientWriteGate) write(ctx context.Context, frame wsFrame) error {
 	if g.expired || !g.expires.After(time.Now()) {
 		return apperr.Unauthenticated("service credential expired")
 	}
-	return writeWSFrame(ctx, g.conn, g.timeout, frame, g.maxBytes)
+	return writeWSFrame(ctx, g.conn, frame, g.cfg, metrics.DirectionClientToServer)
 }
 
 func (g *wsClientWriteGate) expire() {
@@ -1220,16 +1313,24 @@ func readWebSocketResponses(
 			}
 			return apperr.Unavailable(nil)
 		}
+		metrics.StreamTransportBytesReceived(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionServerToClient, int64(len(raw)))
 		if gate.isExpired() || !expiresAt.After(time.Now()) {
+			metrics.StreamTransportFrameReceived(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionServerToClient, metrics.OutcomeOther)
 			return apperr.Unauthenticated("service credential expired")
 		}
 		if typ != websocket.MessageText {
-			return apperr.InvalidArgument("WebSocket frames must use JSON text messages")
+			err := apperr.InvalidArgument("WebSocket frames must use JSON text messages")
+			metrics.StreamTransportFrameReceived(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionServerToClient, metrics.OutcomeOther)
+			metrics.StreamProtocolError(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionServerToClient, err)
+			return err
 		}
 		frame, err := decodeWSFrame(raw, cfg.MaxMessageBytes)
 		if err != nil {
+			metrics.StreamTransportFrameReceived(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionServerToClient, metrics.OutcomeOther)
+			metrics.StreamProtocolError(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionServerToClient, err)
 			return err
 		}
+		metrics.StreamTransportFrameReceived(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionServerToClient, frame.Type)
 		switch frame.Type {
 		case "data":
 			if err := peer.Send(ctx, frame.Data); err != nil {
@@ -1240,7 +1341,9 @@ func readWebSocketResponses(
 		case "error":
 			return remoteWireError(frame.Code)
 		default:
-			return apperr.InvalidArgument("unexpected WebSocket frame from server")
+			err := apperr.InvalidArgument("unexpected WebSocket frame from server")
+			metrics.StreamProtocolError(ctx, cfg.System, cfg.Method, metrics.TransportWebSocket, metrics.DirectionServerToClient, err)
+			return err
 		}
 	}
 }

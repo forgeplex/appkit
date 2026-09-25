@@ -9,12 +9,13 @@ forgeplex 的 Go 后端运行时框架：任何业务域拿来即用；用工具
 **可复用框架验收：[docs/FRAMEWORK_ACCEPTANCE.md](docs/FRAMEWORK_ACCEPTANCE.md)**（真实多 module 复用/升级、数据库隔离与可重复执行的门禁）。
 **服务认证：[docs/SERVICE_AUTH.md](docs/SERVICE_AUTH.md)**（短期服务 JWT、显式委托、bootstrap 配置与 HTTPS 契约客户端）。
 **可选业务引用：[docs/REFS.md](docs/REFS.md)**（跨产品复用的具名引用、资源规范与校验，附订单示例）。
+**v1.0 稳定面与版本支持候选政策：[docs/STABILITY.md](docs/STABILITY.md)**（须结合试点与消费方运行证据最终确认）。
 
 ## 包一览
 
 | 包 | 职责 |
 |---|---|
-| `appkit`（根） | 运行时核心：`Module` / `Registry` / `Provide` / `Resolve` / `App.Run` / `App.Start`，只依赖标准库 |
+| `appkit`（根） | 运行时核心：`Module` / `Registry` / `Provide` / `Resolve` / `App.Run`，只依赖标准库；`App.Start` 属于 ADR-0047 新 Host API，稳定性见候选政策 |
 | `contract` | 跨模块契约调用边界：事务守卫、ctx 防火墙、超时、错误规范化 |
 | `config` | koanf 分层配置（file→env）+ 强类型校验，启动 fail-fast |
 | `bootstrap` | 保留现有完整 HTTP/PostgreSQL/Bus 入口；新 `Core` 可组合 Headless、Probe-only、One-shot、Embedded 与进程 Runner |
