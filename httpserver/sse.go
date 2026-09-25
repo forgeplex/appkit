@@ -13,6 +13,7 @@ import (
 
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/contract"
+	"github.com/forgeplex/appkit/internal/metrics"
 )
 
 const (
@@ -212,7 +213,7 @@ func serveSSE[Request, Event any](
 		case <-r.Context().Done():
 			return
 		case <-heartbeatC:
-			if err := writeSSEFrame(w, controller, cfg.WriteTimeout, ": keep-alive\n\n", &committed); err != nil {
+			if err := writeSSEFrame(r.Context(), cfg, w, controller, ": keep-alive\n\n", metrics.FrameHeartbeat, &committed); err != nil {
 				if !committed {
 					writeSSEProblem(w, controller, cfg.WriteTimeout, err)
 				}
@@ -235,7 +236,7 @@ func serveSSE[Request, Event any](
 				if !committed {
 					writeSSEProblem(w, controller, cfg.WriteTimeout, result.err)
 				} else {
-					_ = writeSSEError(w, controller, cfg.WriteTimeout, result.err)
+					_ = writeSSEError(r.Context(), cfg, w, controller, result.err)
 				}
 				return
 			}
@@ -245,11 +246,11 @@ func serveSSE[Request, Event any](
 				if !committed {
 					writeSSEProblem(w, controller, cfg.WriteTimeout, err)
 				} else {
-					_ = writeSSEError(w, controller, cfg.WriteTimeout, err)
+					_ = writeSSEError(r.Context(), cfg, w, controller, err)
 				}
 				return
 			}
-			if err := writeSSEFrame(w, controller, cfg.WriteTimeout, frame, &committed); err != nil {
+			if err := writeSSEFrame(r.Context(), cfg, w, controller, frame, metrics.FrameEvent, &committed); err != nil {
 				if !committed {
 					writeSSEProblem(w, controller, cfg.WriteTimeout, err)
 				}
@@ -318,20 +319,34 @@ func commitSSE(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusOK)
 }
 
-func writeSSEFrame(w http.ResponseWriter, controller *http.ResponseController, timeout time.Duration, frame string, committed *bool) error {
-	if err := controller.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+func writeSSEFrame(
+	ctx context.Context,
+	cfg SSEConfig,
+	w http.ResponseWriter,
+	controller *http.ResponseController,
+	frame string,
+	frameType string,
+	committed *bool,
+) error {
+	if err := controller.SetWriteDeadline(time.Now().Add(cfg.WriteTimeout)); err != nil {
 		return err
 	}
 	if committed != nil && !*committed {
 		commitSSE(w)
 		*committed = true
 	}
-	if _, err := io.WriteString(w, frame); err != nil {
+	written, err := io.WriteString(w, frame)
+	metrics.StreamTransportBytesSent(ctx, cfg.System, cfg.Method, metrics.TransportSSE, metrics.DirectionServerToClient, int64(written))
+	if err == nil && written != len(frame) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		return err
 	}
 	if err := controller.Flush(); err != nil {
 		return err
 	}
+	metrics.StreamTransportFrameSent(ctx, cfg.System, cfg.Method, metrics.TransportSSE, metrics.DirectionServerToClient, frameType)
 	return controller.SetWriteDeadline(time.Time{})
 }
 
@@ -346,11 +361,11 @@ func writeEmptySSE(w http.ResponseWriter, controller *http.ResponseController, t
 	return true, controller.SetWriteDeadline(time.Time{})
 }
 
-func writeSSEError(w http.ResponseWriter, controller *http.ResponseController, timeout time.Duration, err error) error {
+func writeSSEError(ctx context.Context, cfg SSEConfig, w http.ResponseWriter, controller *http.ResponseController, err error) error {
 	e := apperr.From(err)
 	payload, _ := json.Marshal(map[string]string{"code": e.Code()})
 	frame := fmt.Sprintf("event: %s\ndata: %s\n\n", sseErrorEvent, payload)
-	return writeSSEFrame(w, controller, timeout, frame, nil)
+	return writeSSEFrame(ctx, cfg, w, controller, frame, metrics.FrameError, nil)
 }
 
 func writeSSEProblem(w http.ResponseWriter, controller *http.ResponseController, timeout time.Duration, err error) {

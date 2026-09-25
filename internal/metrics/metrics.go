@@ -6,10 +6,11 @@
 // 要么是代码里的常量（系统名、方法名、topic、任务名），要么是本包收敛过的
 // 枚举（outcome、SQL 动词），没有第三种。
 //
-// 埋点覆盖 RED 三件套（Rate / Errors / Duration，直方图一并给出）的四条路径：
-// 契约调用、outbox 投递、周期任务、数据库查询。HTTP 入站不在此列——
-// otelhttp 已经产出 http.server.request.duration（含 http.route），
-// 再埋一遍就是双重计数。
+// 埋点覆盖 RED 三件套（Rate / Errors / Duration，直方图一并给出）的五条路径：
+// 契约调用、Local Stream、outbox 投递、周期任务、数据库查询；SSE/WSS 另记录传输帧、
+// 应用载荷字节、协议错误与 WebSocket 强制关闭。Host ManagedService 另提供按稳定
+// module/service 名与固定状态枚举聚合的当前实例数。HTTP 入站不在此列——otelhttp 已经
+// 产出 http.server.request.duration（含 http.route），再埋一遍就是双重计数。
 //
 // 未配置 OTLP 端点时全局 MeterProvider 是 noop，各 Record 调用近乎零成本，
 // 因此埋点无开关。
@@ -18,6 +19,8 @@ package metrics
 import (
 	"cmp"
 	"context"
+	"errors"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +29,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
+
+	"github.com/forgeplex/appkit/internal/hoststate"
 )
 
 // scope 是本框架全部指标的 instrumentation scope。
@@ -34,21 +39,45 @@ const scope = "github.com/forgeplex/appkit"
 // 标签键。与 OTel 语义约定不冲突的一律加 appkit. 前缀，避免与
 // 用户或其它库的同名标签混淆。
 const (
-	AttrSystem    = "appkit.contract.system"
-	AttrMethod    = "appkit.contract.method"
-	AttrTopic     = "appkit.outbox.topic"
-	AttrSchema    = "appkit.outbox.schema"
-	AttrJob       = "appkit.job.name"
-	AttrOperation = "db.operation"
-	AttrOutcome   = "appkit.outcome"
-	AttrErrorCode = "appkit.error.code"
+	AttrSystem            = "appkit.contract.system"
+	AttrMethod            = "appkit.contract.method"
+	AttrTopic             = "appkit.outbox.topic"
+	AttrSchema            = "appkit.outbox.schema"
+	AttrJob               = "appkit.job.name"
+	AttrOperation         = "db.operation"
+	AttrOutcome           = "appkit.outcome"
+	AttrErrorCode         = "appkit.error.code"
+	AttrTransport         = "appkit.contract.stream.transport"
+	AttrDirection         = "appkit.contract.stream.direction"
+	AttrFrameType         = "appkit.contract.stream.frame.type"
+	AttrHostServiceModule = "appkit.host.managed_service.module"
+	AttrHostServiceName   = "appkit.host.managed_service.name"
+	AttrHostServiceState  = "appkit.host.managed_service.state"
 )
 
-// outcome 的取值全集。四条路径共用同一套，仪表盘只需写一遍。
+// outcome 的取值全集。
 const (
-	OutcomeOK      = "ok"
-	OutcomeError   = "error"
-	OutcomeSkipped = "skipped"
+	OutcomeOK       = "ok"
+	OutcomeError    = "error"
+	OutcomeSkipped  = "skipped"
+	OutcomeCanceled = "canceled"
+	OutcomeTimeout  = "timeout"
+	OutcomeOther    = "other"
+
+	TransportLocal          = "local"
+	TransportSSE            = "sse"
+	TransportWebSocket      = "websocket"
+	DirectionClientToServer = "client_to_server"
+	DirectionServerToClient = "server_to_client"
+)
+
+const (
+	FrameEvent     = "event"
+	FrameHeartbeat = "heartbeat"
+	FrameError     = "error"
+	FrameData      = "data"
+	FrameHalfClose = "half_close"
+	FrameEnd       = "end"
 )
 
 // durationBuckets 是秒为单位的桶边界（OTel 对 duration 类指标的推荐值）。
@@ -58,18 +87,35 @@ var durationBuckets = []float64{
 }
 
 type instruments struct {
-	contract metric.Float64Histogram
-	outbox   metric.Float64Histogram
-	dead     metric.Int64Counter
-	job      metric.Float64Histogram
-	db       metric.Float64Histogram
+	contract           metric.Float64Histogram
+	outbox             metric.Float64Histogram
+	dead               metric.Int64Counter
+	job                metric.Float64Histogram
+	db                 metric.Float64Histogram
+	streamActive       metric.Int64UpDownCounter
+	streamOpened       metric.Int64Counter
+	streamClosed       metric.Int64Counter
+	streamCanceled     metric.Int64Counter
+	streamMessagesSent metric.Int64Counter
+	streamMessagesRecv metric.Int64Counter
+	streamDuration     metric.Float64Histogram
+	streamFirstMessage metric.Float64Histogram
+	streamBackpressure metric.Float64Histogram
+	streamFramesSent   metric.Int64Counter
+	streamFramesRecv   metric.Int64Counter
+	streamBytesSent    metric.Int64Counter
+	streamBytesRecv    metric.Int64Counter
+	streamProtocolErr  metric.Int64Counter
+	streamForcedClose  metric.Int64Counter
+	hostServiceState   metric.Int64ObservableGauge
+	hostStateCallback  metric.Registration
 }
 
-// inst 懒初始化：全局 MeterProvider 由 telemetry.Init 装配，而 Init 在
-// 包级变量初始化之后才跑。首次埋点必然发生在服务就绪之后，此时 provider 已就位。
+// inst 懒初始化：telemetry.Init 在装配全局 MeterProvider 后会显式预热；
+// 未使用该初始化入口的调用方则在首次埋点时绑定当时的全局 provider。
 var inst = sync.OnceValue(func() *instruments {
 	m := otel.Meter(scope)
-	return &instruments{
+	result := &instruments{
 		contract: histogram(m, "appkit.contract.call.duration",
 			"跨模块契约调用耗时（进程内与远程同口径）"),
 		outbox: histogram(m, "appkit.outbox.delivery.duration",
@@ -77,8 +123,79 @@ var inst = sync.OnceValue(func() *instruments {
 		dead: counter(m, "appkit.outbox.dead", "投递重试达上限、转入死信的事件数"),
 		job:  histogram(m, "appkit.job.run.duration", "周期任务单轮执行耗时"),
 		db:   histogram(m, "appkit.db.query.duration", "数据库查询耗时"),
+		streamActive: upDownCounter(m, "appkit.contract.stream.active",
+			"当前活动的本地契约流数量", "{stream}"),
+		streamOpened: counter(m, "appkit.contract.stream.opened", "成功建立的本地契约流数量"),
+		streamClosed: counter(m, "appkit.contract.stream.closed", "已结束的本地契约流数量"),
+		streamCanceled: counter(m, "appkit.contract.stream.canceled",
+			"因取消而结束的本地契约流数量"),
+		streamMessagesSent: counter(m, "appkit.contract.stream.message.sent",
+			"本地契约流成功发送的消息数量"),
+		streamMessagesRecv: counter(m, "appkit.contract.stream.message.received",
+			"本地契约流成功接收的消息数量"),
+		streamDuration: histogram(m, "appkit.contract.stream.duration",
+			"本地契约流从建立到终态的时长"),
+		streamFirstMessage: histogram(m, "appkit.contract.stream.time_to_first_message",
+			"本地契约流每个接收方向从建立到首条消息的时长"),
+		streamBackpressure: histogram(m, "appkit.contract.stream.send.backpressure.wait",
+			"本地契约流发送遇到满队列时的等待时长"),
+		streamFramesSent: counter(m, "appkit.contract.stream.transport.frame.sent",
+			"流传输层成功写出的应用帧数量"),
+		streamFramesRecv: counter(m, "appkit.contract.stream.transport.frame.received",
+			"流传输层成功读取的应用帧数量"),
+		streamBytesSent: byteCounter(m, "appkit.contract.stream.transport.bytes.sent",
+			"流传输层成功交给底层写入器的应用载荷字节数"),
+		streamBytesRecv: byteCounter(m, "appkit.contract.stream.transport.bytes.received",
+			"流传输层成功读取的应用载荷字节数"),
+		streamProtocolErr: counter(m, "appkit.contract.stream.protocol.error",
+			"流传输层拒绝的无效应用协议帧数量"),
+		streamForcedClose: counter(m, "appkit.contract.stream.drain.forced_close",
+			"由 Host 管理的 WebSocket Hub 强制关闭的连接数量"),
 	}
+	result.hostServiceState, result.hostStateCallback = observeManagedServiceState(m)
+	return result
 })
+
+// Initialize eagerly binds instruments to the current global MeterProvider.
+// telemetry.Init calls this immediately after installing its provider.
+func Initialize() { _ = inst() }
+
+func observeManagedServiceState(m metric.Meter) (metric.Int64ObservableGauge, metric.Registration) {
+	gauge, err := m.Int64ObservableGauge("appkit.host.managed_service.state",
+		metric.WithDescription("当前处于各 ManagedService 生命周期状态的实例数"),
+		metric.WithUnit("{service}"))
+	if err != nil {
+		otel.Handle(err)
+		gauge, _ = noop.Meter{}.Int64ObservableGauge("appkit.host.managed_service.state")
+		return gauge, nil
+	}
+	registration, err := m.RegisterCallback(func(ctx context.Context, observer metric.Observer) error {
+		for _, count := range hoststate.Snapshot() {
+			observer.ObserveInt64(gauge, count.Count, metric.WithAttributes(
+				attribute.String(AttrHostServiceModule, count.Module),
+				attribute.String(AttrHostServiceName, count.Service),
+				attribute.String(AttrHostServiceState, managedServiceState(count.State)),
+			))
+		}
+		return nil
+	}, gauge)
+	if err != nil {
+		otel.Handle(err)
+		return gauge, nil
+	}
+	return gauge, registration
+}
+
+func managedServiceState(state hoststate.State) string {
+	switch state {
+	case hoststate.StateCreated, hoststate.StateStarting, hoststate.StateRunning,
+		hoststate.StateReady, hoststate.StateFailed, hoststate.StateDraining,
+		hoststate.StateStopping, hoststate.StateStopped, hoststate.StateNotStarted:
+		return string(state)
+	default:
+		return OutcomeOther
+	}
+}
 
 func histogram(m metric.Meter, name, desc string) metric.Float64Histogram {
 	h, err := m.Float64Histogram(name,
@@ -98,6 +215,25 @@ func counter(m metric.Meter, name, desc string) metric.Int64Counter {
 	if err != nil {
 		otel.Handle(err)
 		c, _ = noop.Meter{}.Int64Counter(name)
+	}
+	return c
+}
+
+func byteCounter(m metric.Meter, name, desc string) metric.Int64Counter {
+	c, err := m.Int64Counter(name, metric.WithDescription(desc), metric.WithUnit("By"))
+	if err != nil {
+		otel.Handle(err)
+		c, _ = noop.Meter{}.Int64Counter(name)
+	}
+	return c
+}
+
+func upDownCounter(m metric.Meter, name, desc, unit string) metric.Int64UpDownCounter {
+	c, err := m.Int64UpDownCounter(name,
+		metric.WithDescription(desc), metric.WithUnit(unit))
+	if err != nil {
+		otel.Handle(err)
+		c, _ = noop.Meter{}.Int64UpDownCounter(name)
 	}
 	return c
 }
@@ -165,6 +301,186 @@ func ContractCall(ctx context.Context, system, method, code string, start time.T
 		attrs = append(attrs, attribute.String(AttrErrorCode, code))
 	}
 	inst().contract.Record(ctx, since(start), metric.WithAttributes(attrs...))
+}
+
+// StreamOpened 记录一次成功建立的 Local Contract Stream。
+func StreamOpened(ctx context.Context, system, method string) {
+	attrs := streamAttrs(system, method)
+	inst().streamOpened.Add(ctx, 1, metric.WithAttributes(attrs...))
+	inst().streamActive.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// StreamClosed 记录唯一终态。错误码只保留框架已知的有限集合，其余值折叠为 other。
+func StreamClosed(ctx context.Context, system, method string, err error, duration time.Duration, timedOut bool) {
+	outcome := streamOutcome(err)
+	if timedOut {
+		outcome = OutcomeTimeout
+	}
+	attrs := append(streamAttrs(system, method), attribute.String(AttrOutcome, outcome))
+	if err != nil && !errors.Is(err, io.EOF) {
+		attrs = append(attrs, attribute.String(AttrErrorCode, streamErrorCode(err)))
+	}
+	inst().streamActive.Add(ctx, -1, metric.WithAttributes(streamAttrs(system, method)...))
+	inst().streamClosed.Add(ctx, 1, metric.WithAttributes(attrs...))
+	inst().streamDuration.Record(ctx, duration.Seconds(), metric.WithAttributes(attrs...))
+	if outcome == OutcomeCanceled {
+		inst().streamCanceled.Add(ctx, 1, metric.WithAttributes(attrs...))
+	}
+}
+
+// StreamMessageSent 记录成功进入有界队列的消息，不读取或序列化消息内容。
+func StreamMessageSent(ctx context.Context, system, method, direction string) {
+	inst().streamMessagesSent.Add(ctx, 1,
+		metric.WithAttributes(streamDirectionAttrs(system, method, direction)...))
+}
+
+// StreamMessageReceived 记录成功从有界队列取出的消息。
+func StreamMessageReceived(ctx context.Context, system, method, direction string) {
+	inst().streamMessagesRecv.Add(ctx, 1,
+		metric.WithAttributes(streamDirectionAttrs(system, method, direction)...))
+}
+
+// StreamFirstMessage 记录某一接收方向首条成功消息的延迟；同一方向只由调用方记录一次。
+func StreamFirstMessage(ctx context.Context, system, method, direction string, duration time.Duration) {
+	inst().streamFirstMessage.Record(ctx, duration.Seconds(),
+		metric.WithAttributes(streamDirectionAttrs(system, method, direction)...))
+}
+
+// StreamBackpressureWait 记录发送开始时队列已满后的等待时长。
+func StreamBackpressureWait(ctx context.Context, system, method, direction string, duration time.Duration) {
+	inst().streamBackpressure.Record(ctx, duration.Seconds(),
+		metric.WithAttributes(streamDirectionAttrs(system, method, direction)...))
+}
+
+// StreamTransportFrameSent records one successfully written application frame.
+// frameType and transport are normalized to fixed transport-specific enums.
+func StreamTransportFrameSent(ctx context.Context, system, method, transport, direction, frameType string) {
+	inst().streamFramesSent.Add(ctx, 1, metric.WithAttributes(
+		streamFrameAttrs(system, method, transport, direction, frameType)...))
+}
+
+// StreamTransportFrameReceived records one successfully read application frame.
+func StreamTransportFrameReceived(ctx context.Context, system, method, transport, direction, frameType string) {
+	inst().streamFramesRecv.Add(ctx, 1, metric.WithAttributes(
+		streamFrameAttrs(system, method, transport, direction, frameType)...))
+}
+
+// StreamTransportBytesSent records bytes accepted by the transport writer. A
+// partial write is recorded by its actual positive byte count.
+func StreamTransportBytesSent(ctx context.Context, system, method, transport, direction string, n int64) {
+	if n <= 0 {
+		return
+	}
+	inst().streamBytesSent.Add(ctx, n, metric.WithAttributes(
+		streamTransportDirectionAttrs(system, method, transport, direction)...))
+}
+
+// StreamTransportBytesReceived records the payload bytes returned by a
+// successful transport read.
+func StreamTransportBytesReceived(ctx context.Context, system, method, transport, direction string, n int64) {
+	if n <= 0 {
+		return
+	}
+	inst().streamBytesRecv.Add(ctx, n, metric.WithAttributes(
+		streamTransportDirectionAttrs(system, method, transport, direction)...))
+}
+
+// StreamProtocolError records a rejected inbound application frame. Error codes
+// are restricted to the framework whitelist; unknown values collapse to other.
+func StreamProtocolError(ctx context.Context, system, method, transport, direction string, err error) {
+	attrs := streamTransportDirectionAttrs(system, method, transport, direction)
+	attrs = append(attrs, attribute.String(AttrErrorCode, streamErrorCode(err)))
+	inst().streamProtocolErr.Add(ctx, 1, metric.WithAttributes(attrs...))
+}
+
+// StreamDrainForcedClose records the first forced close of one managed stream
+// connection. Callers are responsible for deduplicating per connection.
+func StreamDrainForcedClose(ctx context.Context, system, method, transport string) {
+	inst().streamForcedClose.Add(ctx, 1,
+		metric.WithAttributes(streamTransportAttrs(system, method, transport)...))
+}
+
+func streamAttrs(system, method string) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.String(AttrSystem, system),
+		attribute.String(AttrMethod, method),
+		attribute.String(AttrTransport, TransportLocal),
+	}
+}
+
+func streamDirectionAttrs(system, method, direction string) []attribute.KeyValue {
+	if direction != DirectionClientToServer && direction != DirectionServerToClient {
+		direction = OutcomeOther
+	}
+	attrs := streamAttrs(system, method)
+	return append(attrs, attribute.String(AttrDirection, direction))
+}
+
+func streamTransportAttrs(system, method, transport string) []attribute.KeyValue {
+	if transport != TransportSSE && transport != TransportWebSocket {
+		transport = OutcomeOther
+	}
+	return []attribute.KeyValue{
+		attribute.String(AttrSystem, system),
+		attribute.String(AttrMethod, method),
+		attribute.String(AttrTransport, transport),
+	}
+}
+
+func streamTransportDirectionAttrs(system, method, transport, direction string) []attribute.KeyValue {
+	if direction != DirectionClientToServer && direction != DirectionServerToClient {
+		direction = OutcomeOther
+	}
+	attrs := streamTransportAttrs(system, method, transport)
+	return append(attrs, attribute.String(AttrDirection, direction))
+}
+
+func streamFrameAttrs(system, method, transport, direction, frameType string) []attribute.KeyValue {
+	attrs := streamTransportDirectionAttrs(system, method, transport, direction)
+	attrs = append(attrs, attribute.String(AttrFrameType, streamFrameType(transport, frameType)))
+	return attrs
+}
+
+func streamFrameType(transport, frameType string) string {
+	switch transport {
+	case TransportSSE:
+		switch frameType {
+		case FrameEvent, FrameHeartbeat, FrameError:
+			return frameType
+		}
+	case TransportWebSocket:
+		switch frameType {
+		case FrameData, FrameHalfClose, FrameEnd, FrameError:
+			return frameType
+		}
+	}
+	return OutcomeOther
+}
+
+func streamOutcome(err error) string {
+	switch {
+	case err == nil, errors.Is(err, io.EOF):
+		return OutcomeOK
+	case errors.Is(err, context.Canceled):
+		return OutcomeCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return OutcomeTimeout
+	default:
+		return OutcomeError
+	}
+}
+
+func streamErrorCode(err error) string {
+	var coded interface{ Code() string }
+	if errors.As(err, &coded) {
+		switch coded.Code() {
+		case "INTERNAL", "INVALID_ARGUMENT", "NOT_FOUND", "CONFLICT", "UNAUTHENTICATED",
+			"PERMISSION_DENIED", "UNAVAILABLE", "TX_BOUNDARY", "IDEMPOTENCY_CONFLICT",
+			"IDEMPOTENCY_RESULT_UNAVAILABLE", "MIGRATION_DRIFT", "STEP_UP_REQUIRED":
+			return coded.Code()
+		}
+	}
+	return OutcomeOther
 }
 
 func outcomeOfCode(code string) string {

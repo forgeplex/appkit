@@ -65,6 +65,14 @@ SSE 使用 `Last-Event-ID` 将应用 cursor 原样交给应用层。AppKit 不�
 
 WebSocket Bidi 放在 SSE/Local conformance 之后单独交付。Upgrade 前必须完成 Origin allowlist、认证、授权、路由分类和身份重建；身份进入连接 Context，不从 frame/query string 读取 tenant/caller。Transport 不在 Upgrade 后自动刷新凭证；认证器提供凭证有效期时，过期即停止接收/发送应用帧、取消连接 Context，并以脱敏策略关闭码结束连接。每条连接的收发队列都必须有帧数和字节上限，达到上限时背压，不静默丢帧。Upgrade 后错误使用脱敏 frame。Transport 追踪每条 hijacked 连接，停止接收新连接、发送关闭信号、按预算 drain，最后强制关闭；不能依赖 `http.Server.Shutdown`。
 
+#### WebSocket 资源边界（ADR-0047 补充，2026-09-24 接受）
+
+- AppKit Hub/Transport 执行连接与消息速率限额；限额由应用显式提供，必须有限且为正，不设置猜测的框架默认容量。
+- `MaxConnections` 以单个 Hub 为边界；pending Upgrade reservation 与 active connection 共用原子计数。它不是跨进程或跨副本配额。未显式配置限额的既有 `NewWebSocketHub()` 仍可构造，但不得接受 Upgrade；容量拒绝须发生在 Upgrade 与应用 handler 之前，使用稳定、脱敏的 problem 响应。
+- 每条连接分别限制入站和出站应用 `data` 帧的帧数速率、JSON payload 字节速率，并分别配置有限 burst。入站 payload 按 `frame.data` 原始 JSON 字节数计量；出站按应用值编码后的 JSON 字节数计量。`half_close`、`end`、`error` 控制/终态帧不占用应用消息速率预算。既有 `MaxMessageBytes` 继续限制单条消息，且单条消息必须能被 byte burst 接纳。
+- 速率预算暂时耗尽时采用可取消的 paced backpressure；不得丢弃、重排已接纳的数据帧。等待受现有 Stream 最大时长、idle、关闭、连接取消及 Host drain 语义约束。速率状态仅在连接本地维护，不按未验证的 forwarded IP、Subject 或其他动态身份建表。
+- 新公开类型、构造入口、合法范围和容量错误映射由独立实现子 Issue [#88](https://github.com/forgeplex/appkit/issues/88) 冻结；不得改变既有导出签名或向既有导出结构体追加字段。
+
 ### 6. Contract Schema 与兼容
 
 - 现有 `contract.yaml version: 1` 保持严格 Unary 语义，生成输出逐字节无关变化。

@@ -17,9 +17,13 @@ import (
 
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
+	"github.com/forgeplex/appkit/contract/streamtest"
 	"github.com/forgeplex/appkit/httpserver"
 	"github.com/forgeplex/appkit/tx"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 var _ appkit.ManagedService = (*httpserver.WebSocketHub)(nil)
@@ -103,9 +107,46 @@ func startWebSocketTestServer(
 
 func startWebSocketHub(t *testing.T) *httpserver.WebSocketHub {
 	t.Helper()
-	hub := httpserver.NewWebSocketHub()
+	return startWebSocketHubWithCapacity(t, 64)
+}
+
+func startWebSocketHubWithCapacity(t *testing.T, maxConnections int) *httpserver.WebSocketHub {
+	t.Helper()
+	return startWebSocketHubWithRates(t, maxConnections, fastWebSocketRateLimits(), fastWebSocketRateLimits())
+}
+
+func fastWebSocketRateLimits() httpserver.WebSocketRateLimits {
+	return httpserver.WebSocketRateLimits{
+		FramesPerSecond: 1000,
+		FrameBurst:      100,
+		BytesPerSecond:  1 << 20,
+		ByteBurst:       1 << 20,
+	}
+}
+
+func startWebSocketHubWithRates(
+	t *testing.T,
+	maxConnections int,
+	inbound, outbound httpserver.WebSocketRateLimits,
+) *httpserver.WebSocketHub {
+	t.Helper()
+	hub := newWebSocketHubWithRates(t, maxConnections, inbound, outbound)
 	if err := hub.Start(context.Background()); err != nil {
 		t.Fatalf("Hub.Start: %v", err)
+	}
+	return hub
+}
+
+func newWebSocketHubWithRates(
+	t *testing.T,
+	maxConnections int,
+	inbound, outbound httpserver.WebSocketRateLimits,
+) *httpserver.WebSocketHub {
+	t.Helper()
+	limits := httpserver.WebSocketHubLimits{MaxConnections: maxConnections, Inbound: inbound, Outbound: outbound}
+	hub, err := httpserver.NewWebSocketHubWithLimits(limits)
+	if err != nil {
+		t.Fatalf("NewWebSocketHubWithLimits: %v", err)
 	}
 	return hub
 }
@@ -488,15 +529,267 @@ func TestWebSocketMessageLimitAndHubDrain(t *testing.T) {
 	}
 }
 
+func TestWebSocketHubRequiresExplicitLimitsBeforeUpgrade(t *testing.T) {
+	hub := httpserver.NewWebSocketHub()
+	cfg := websocketTestConfig(hub)
+	called := make(chan struct{}, 1)
+	server, _ := startWebSocketServer(t, cfg, func(context.Context) (httpserver.WebSocketIdentity, error) {
+		return httpserver.WebSocketIdentity{Subject: "unbounded-test"}, nil
+	}, func(context.Context, contract.Stream[string, string]) error {
+		called <- struct{}{}
+		return nil
+	})
+
+	conn, response, err := websocket.Dial(context.Background(), server.URL+"/bidi", &websocket.DialOptions{
+		HTTPClient: server.Client(), Subprotocols: []string{"appkit.contract.bidi.v1"},
+	})
+	if err == nil || response == nil {
+		if conn != nil {
+			_ = conn.CloseNow()
+		}
+		t.Fatalf("unbounded Hub upgrade = (%v, %v), want pre-upgrade rejection", conn, err)
+	}
+	defer response.Body.Close()
+	body, readErr := io.ReadAll(response.Body)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	var problem apperr.Problem
+	if err := json.Unmarshal(body, &problem); err != nil {
+		t.Fatalf("decode problem response %q: %v", body, err)
+	}
+	if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Content-Type") != "application/problem+json" || problem.Code != apperr.CodeUnavailable {
+		t.Fatalf("unbounded Hub response = status %d, content-type %q, problem %+v", response.StatusCode, response.Header.Get("Content-Type"), problem)
+	}
+	if strings.Contains(problem.Detail, "MaxConnections") || strings.Contains(problem.Detail, "rate") {
+		t.Fatalf("problem response leaked internal budget detail: %+v", problem)
+	}
+	select {
+	case <-called:
+		t.Fatal("application handler ran for an unbounded Hub")
+	default:
+	}
+}
+
+func TestWebSocketHubConnectionLimitCountsActiveConnections(t *testing.T) {
+	hub := startWebSocketHubWithCapacity(t, 1)
+	started := make(chan struct{}, 2)
+	server, _ := startWebSocketServer(t, websocketTestConfig(hub), func(context.Context) (httpserver.WebSocketIdentity, error) {
+		return httpserver.WebSocketIdentity{Subject: "capacity-test"}, nil
+	}, func(ctx context.Context, _ contract.Stream[string, string]) error {
+		started <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	first := dialTestWebSocket(t, server)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first WebSocket handler did not start")
+	}
+
+	second, response, err := websocket.Dial(context.Background(), server.URL+"/bidi", &websocket.DialOptions{
+		HTTPClient: server.Client(), Subprotocols: []string{"appkit.contract.bidi.v1"},
+	})
+	if second != nil {
+		_ = second.CloseNow()
+	}
+	if err == nil || response == nil {
+		t.Fatalf("second connection = (%v, %v), want capacity rejection", second, err)
+	}
+	defer response.Body.Close()
+	var problem apperr.Problem
+	if err := json.NewDecoder(response.Body).Decode(&problem); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusServiceUnavailable || problem.Code != apperr.CodeUnavailable {
+		t.Fatalf("capacity response = status %d, problem %+v, want 503 UNAVAILABLE", response.StatusCode, problem)
+	}
+	if len(started) != 0 {
+		t.Fatalf("application handler started %d extra times after capacity rejection", len(started))
+	}
+	_ = first.CloseNow()
+}
+
+func TestWebSocketHandlerRejectsMessageLargerThanRateByteBurst(t *testing.T) {
+	rate := fastWebSocketRateLimits()
+	rate.ByteBurst = 64
+	hub, err := httpserver.NewWebSocketHubWithLimits(httpserver.WebSocketHubLimits{
+		MaxConnections: 2,
+		Inbound:        rate,
+		Outbound:       rate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := websocketTestConfig(hub)
+	_, err = httpserver.NewWebSocketHandler[string, string](cfg,
+		func(context.Context) (httpserver.WebSocketIdentity, error) {
+			return httpserver.WebSocketIdentity{Subject: "burst-test"}, nil
+		}, func(context.Context, contract.Stream[string, string]) error { return nil })
+	if !apperr.Is(err, apperr.CodeInvalidArgument) {
+		t.Fatalf("handler config error = %v, want INVALID_ARGUMENT for MaxMessageBytes > byte burst", err)
+	}
+}
+
+func TestWebSocketRateLimitsPaceInboundAndOutboundFramesAndBytes(t *testing.T) {
+	largePayload := strings.Repeat("x", 90)
+	cases := []struct {
+		name         string
+		inbound      httpserver.WebSocketRateLimits
+		outbound     httpserver.WebSocketRateLimits
+		serverStream bool
+		payload      string
+		minDelay     time.Duration
+	}{
+		{
+			name: "inbound frame rate", inbound: func() httpserver.WebSocketRateLimits {
+				limits := fastWebSocketRateLimits()
+				limits.FramesPerSecond, limits.FrameBurst = 2, 1
+				return limits
+			}(), outbound: fastWebSocketRateLimits(), payload: "message", minDelay: 300 * time.Millisecond,
+		},
+		{
+			name: "inbound payload byte rate", inbound: func() httpserver.WebSocketRateLimits {
+				limits := fastWebSocketRateLimits()
+				limits.BytesPerSecond, limits.ByteBurst = 100, 128
+				return limits
+			}(), outbound: fastWebSocketRateLimits(), payload: largePayload, minDelay: 400 * time.Millisecond,
+		},
+		{
+			name: "outbound frame rate", inbound: fastWebSocketRateLimits(), outbound: func() httpserver.WebSocketRateLimits {
+				limits := fastWebSocketRateLimits()
+				limits.FramesPerSecond, limits.FrameBurst = 2, 1
+				return limits
+			}(), serverStream: true, payload: "message", minDelay: 300 * time.Millisecond,
+		},
+		{
+			name: "outbound payload byte rate", inbound: fastWebSocketRateLimits(), outbound: func() httpserver.WebSocketRateLimits {
+				limits := fastWebSocketRateLimits()
+				limits.BytesPerSecond, limits.ByteBurst = 100, 128
+				return limits
+			}(), serverStream: true, payload: largePayload, minDelay: 400 * time.Millisecond,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hub := startWebSocketHubWithRates(t, 4, tc.inbound, tc.outbound)
+			cfg := websocketTestConfig(hub)
+			cfg.MaxMessageBytes = 128
+			received := make(chan time.Time, 2)
+			server, _ := startWebSocketServer(t, cfg, func(context.Context) (httpserver.WebSocketIdentity, error) {
+				return httpserver.WebSocketIdentity{Subject: "rate-test"}, nil
+			}, func(ctx context.Context, peer contract.Stream[string, string]) error {
+				if tc.serverStream {
+					for range 2 {
+						if err := peer.Send(ctx, tc.payload); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+				for {
+					value, err := peer.Recv(ctx)
+					if errors.Is(err, io.EOF) {
+						return nil
+					}
+					if err != nil {
+						return err
+					}
+					received <- time.Now()
+					if err := peer.Send(ctx, value); err != nil {
+						return err
+					}
+				}
+			})
+			conn := dialTestWebSocket(t, server)
+			if tc.serverStream {
+				first := readTestFrame(t, conn)
+				if first.Type != "data" || first.Data != tc.payload {
+					t.Fatalf("first frame = %+v", first)
+				}
+				started := time.Now()
+				second := readTestFrame(t, conn)
+				if elapsed := time.Since(started); elapsed < tc.minDelay {
+					t.Fatalf("second outbound frame arrived after %s, want at least %s", elapsed, tc.minDelay)
+				}
+				if second.Type != "data" || second.Data != tc.payload {
+					t.Fatalf("second frame = %+v", second)
+				}
+				if terminal := readTestFrame(t, conn); terminal.Type != "end" {
+					t.Fatalf("terminal frame = %+v, want end", terminal)
+				}
+				return
+			}
+
+			writeTestFrame(t, conn, testWireFrame{Type: "data", Data: tc.payload})
+			writeTestFrame(t, conn, testWireFrame{Type: "data", Data: tc.payload})
+			firstAt := <-received
+			secondAt := <-received
+			if elapsed := secondAt.Sub(firstAt); elapsed < tc.minDelay {
+				t.Fatalf("second inbound frame reached service after %s, want at least %s", elapsed, tc.minDelay)
+			}
+			for range 2 {
+				if frame := readTestFrame(t, conn); frame.Type != "data" || frame.Data != tc.payload {
+					t.Fatalf("echo frame = %+v", frame)
+				}
+			}
+			writeTestFrame(t, conn, testWireFrame{Type: "half_close"})
+			if terminal := readTestFrame(t, conn); terminal.Type != "end" {
+				t.Fatalf("terminal frame = %+v, want end", terminal)
+			}
+		})
+	}
+}
+
+func TestWebSocketHubDrainCancelsPacedOutboundRateWait(t *testing.T) {
+	outbound := fastWebSocketRateLimits()
+	outbound.FramesPerSecond, outbound.FrameBurst = 1, 1
+	hub := startWebSocketHubWithRates(t, 2, fastWebSocketRateLimits(), outbound)
+	server, _ := startWebSocketServer(t, websocketTestConfig(hub), func(context.Context) (httpserver.WebSocketIdentity, error) {
+		return httpserver.WebSocketIdentity{Subject: "drain-rate-test"}, nil
+	}, func(ctx context.Context, peer contract.Stream[string, string]) error {
+		if err := peer.Send(ctx, "first"); err != nil {
+			return err
+		}
+		return peer.Send(ctx, "second")
+	})
+	conn := dialTestWebSocket(t, server)
+	if frame := readTestFrame(t, conn); frame.Type != "data" || frame.Data != "first" {
+		t.Fatalf("first frame = %+v", frame)
+	}
+
+	started := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	closeResult := make(chan error, 1)
+	go func() {
+		_, _, err := conn.Read(ctx)
+		closeResult <- err
+	}()
+	if err := hub.Drain(ctx); err != nil {
+		t.Fatalf("Hub.Drain while rate wait is pending: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 700*time.Millisecond {
+		t.Fatalf("Hub.Drain took %s, want to cancel the one-second rate wait", elapsed)
+	}
+	err := <-closeResult
+	if status := websocket.CloseStatus(err); status != websocket.StatusGoingAway {
+		t.Fatalf("close status = %d, error=%v; want GoingAway", status, err)
+	}
+}
+
 func TestWebSocketCancellationReachesServiceAndBoundedQueuePreservesOrder(t *testing.T) {
 	t.Run("connection cancellation", func(t *testing.T) {
 		hub := startWebSocketHub(t)
 		cfg := websocketTestConfig(hub)
 		started := make(chan struct{})
 		cancelled := make(chan struct{})
+		handlerDone := make(chan struct{})
 		server, _ := startWebSocketServer(t, cfg, func(context.Context) (httpserver.WebSocketIdentity, error) {
 			return httpserver.WebSocketIdentity{Subject: "test-user"}, nil
 		}, func(ctx context.Context, _ contract.Stream[string, string]) error {
+			defer close(handlerDone)
 			close(started)
 			<-ctx.Done()
 			close(cancelled)
@@ -515,6 +808,11 @@ func TestWebSocketCancellationReachesServiceAndBoundedQueuePreservesOrder(t *tes
 		case <-cancelled:
 		case <-time.After(2 * time.Second):
 			t.Fatal("WebSocket disconnect did not cancel service context")
+		}
+		select {
+		case <-handlerDone:
+		case <-time.After(time.Second):
+			t.Fatal("WebSocket disconnect cancelled the service but its handler did not exit")
 		}
 	})
 
@@ -561,6 +859,24 @@ func TestWebSocketCancellationReachesServiceAndBoundedQueuePreservesOrder(t *tes
 			t.Fatalf("terminal frame = %+v, want end", got)
 		}
 	})
+}
+
+func TestWebSocketSecureClientConformance(t *testing.T) {
+	previousPropagator := otel.GetTextMapPropagator()
+	otel.SetTextMapPropagator(propagation.TraceContext{})
+	t.Cleanup(func() { otel.SetTextMapPropagator(previousPropagator) })
+	streamtest.Verify(t,
+		func(ctx context.Context, cfg contract.StreamConfig, handler contract.StreamHandler[string, string]) (contract.ClientStream[string, string], error) {
+			return openSecureWebSocketStream(t, ctx, cfg, handler)
+		},
+		contract.StreamConfig{
+			MaxDuration:  2 * time.Second,
+			CloseTimeout: time.Second,
+			QueueSize:    2,
+		},
+		[]string{"first", "second", "third"},
+		func(value string) string { return value },
+	)
 }
 
 func TestWebSocketSecureClientOperationCancellationIsRetryable(t *testing.T) {
@@ -626,6 +942,53 @@ func TestWebSocketSecureClientRemoteErrorIsStableAndSanitized(t *testing.T) {
 	}
 }
 
+func TestWebSocketSecureClientCloseCancelsRemoteHandlerWithoutWaitingForIt(t *testing.T) {
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	release := make(chan struct{})
+	handlerDone := make(chan struct{})
+	stream, err := openSecureWebSocketStream(t, context.Background(), websocketTestConfig(httpserver.NewWebSocketHub()).Stream,
+		func(ctx context.Context, _ contract.Stream[string, string]) error {
+			defer close(handlerDone)
+			close(started)
+			<-ctx.Done()
+			close(cancelled)
+			<-release // The remote application ignores cancellation until the test releases it.
+			return nil
+		})
+	if err != nil {
+		close(release)
+		t.Fatalf("openSecureWebSocketStream: %v", err)
+	}
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	defer stream.Close()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("remote handler did not start")
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("client Close: %v", err)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("client Close did not cancel the remote handler context")
+	}
+	close(release)
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("released remote handler did not exit after client Close")
+	}
+}
+
 func TestWebSocketSecureClientRejectsTransactionBoundary(t *testing.T) {
 	ctx := tx.With(context.Background(), "test-transaction")
 	_, err := httpserver.DialSecureWebSocket[string, string](ctx, "wss://example.test/bidi", httpserver.WebSocketConfig{}, contract.SecureClientOptions{})
@@ -644,14 +1007,29 @@ func openSecureWebSocketStream(
 	hub := startWebSocketHub(t)
 	webSocketConfig := websocketTestConfig(hub)
 	webSocketConfig.Stream = cfg
+	scopes := make(chan contract.ServiceScope, 1)
+	wrappedHandler := func(ctx context.Context, peer contract.Stream[string, string]) error {
+		meta := callctx.From(ctx)
+		if meta.Caller != "conformance-client" {
+			t.Errorf("server caller metadata = %q, want authenticated service subject", meta.Caller)
+		}
+		return handler(ctx, peer)
+	}
 	wsHandler, err := httpserver.NewWebSocketHandler[string, string](webSocketConfig,
 		func(context.Context) (httpserver.WebSocketIdentity, error) {
 			return httpserver.WebSocketIdentity{Subject: "conformance-client"}, nil
-		}, httpserver.WebSocketHandler[string, string](handler))
+		}, httpserver.WebSocketHandler[string, string](wrappedHandler))
 	if err != nil {
 		return nil, err
 	}
-	server := httptest.NewTLSServer(wsHandler)
+	trustedServiceContext := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := <-scopes // The fixture models the verifier rebuilding trusted identity from the signed service credential.
+		meta := callctx.From(r.Context())
+		meta.Partition, meta.TenantID, meta.Caller = scope.Partition, scope.TenantID, "conformance-client"
+		wsHandler.ServeHTTP(w, r.WithContext(callctx.With(r.Context(), meta)))
+	})
+	serverHandler := httpserver.RequestID()(httpserver.OTel()(trustedServiceContext))
+	server := httptest.NewTLSServer(serverHandler)
 	t.Cleanup(func() {
 		closeCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -661,7 +1039,12 @@ func openSecureWebSocketStream(
 	address := "wss" + strings.TrimPrefix(server.URL, "https") + "/bidi"
 	return httpserver.DialSecureWebSocket[string, string](ctx, address, webSocketConfig, contract.SecureClientOptions{
 		Audience: "websocket-conformance",
-		Credentials: contract.ServiceCredentialProviderFunc(func(context.Context, contract.ServiceScope) (contract.ServiceCredential, error) {
+		Credentials: contract.ServiceCredentialProviderFunc(func(ctx context.Context, scope contract.ServiceScope) (contract.ServiceCredential, error) {
+			meta := callctx.From(ctx)
+			if scope.Partition != meta.Partition || scope.TenantID != meta.TenantID {
+				t.Errorf("credential scope = %+v, want partition/tenant from callctx %+v", scope, meta)
+			}
+			scopes <- scope
 			return contract.ServiceCredential{Token: "conformance-token", ExpiresAt: time.Now().Add(time.Hour)}, nil
 		}),
 		HTTPClient: server.Client(),
@@ -669,8 +1052,9 @@ func openSecureWebSocketStream(
 }
 
 func TestWebSocketHubIsDrainedByHostManagedService(t *testing.T) {
-	hub := httpserver.NewWebSocketHub()
+	hub := newWebSocketHubWithRates(t, 64, fastWebSocketRateLimits(), fastWebSocketRateLimits())
 	cfg := websocketTestConfig(hub)
+	handlerDone := make(chan struct{})
 	wsHandler, err := httpserver.NewWebSocketHandler[string, string](cfg,
 		func(ctx context.Context) (httpserver.WebSocketIdentity, error) {
 			if _, ok := appkit.ServicePrincipalFrom(ctx); !ok {
@@ -679,6 +1063,7 @@ func TestWebSocketHubIsDrainedByHostManagedService(t *testing.T) {
 			return httpserver.WebSocketIdentity{Subject: "host-test"}, nil
 		},
 		func(ctx context.Context, peer contract.Stream[string, string]) error {
+			defer close(handlerDone)
 			_, err := peer.Recv(ctx)
 			return err
 		})
@@ -760,5 +1145,10 @@ func TestWebSocketHubIsDrainedByHostManagedService(t *testing.T) {
 	}
 	if err := host.Wait(); err != nil {
 		t.Fatalf("Host.Wait: %v", err)
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("Host.Wait completed before the WebSocket handler exited")
 	}
 }

@@ -26,12 +26,13 @@ type OpenFunc[Send, Receive any] func(
 	contract.StreamHandler[Send, Receive],
 ) (contract.ClientStream[Send, Receive], error)
 
-// Verify runs the shared lifecycle, ordering, cancellation, backpressure,
-// transaction, firewall, terminal-error, and close-budget checks against an
-// adapter. It requires at least one input value and a deterministic echo mapper.
-// The adapter is responsible for mapping the supplied handler to its test
-// server; a transport that cannot support bidi may use focused assertions over
-// the same public Stream contract instead.
+// Verify runs the transport-neutral lifecycle, ordering, cancellation,
+// slow-consumer delivery, transaction, context-firewall, terminal-error,
+// root-cancellation, max-duration, and idle checks against a bidi adapter. It
+// requires at least one input value and a deterministic echo mapper. The adapter
+// is responsible for mapping the supplied handler to its test server. Exact
+// queue blocking, process-local error causes, and remote-handler close budgets
+// are transport-specific and should be asserted by the adapter's own tests.
 func Verify[Send, Receive any](
 	t *testing.T,
 	open OpenFunc[Send, Receive],
@@ -142,27 +143,17 @@ func Verify[Send, Receive any](
 		}
 	})
 
-	t.Run("bounded_backpressure_does_not_drop", func(t *testing.T) {
+	t.Run("slow_consumer_preserves_accepted_values", func(t *testing.T) {
 		cfg := base
 		cfg.QueueSize = 1
-		if cfg.MaxDuration < time.Second {
-			cfg.MaxDuration = time.Second
-		}
 		gate := make(chan struct{})
-		consumed := make(chan struct{})
+		waiting := make(chan struct{})
 		s, _ := mustOpen(t, open, cfg, func(ctx context.Context, peer contract.Stream[Receive, Send]) error {
+			close(waiting)
 			select {
 			case <-gate:
 			case <-ctx.Done():
 				return ctx.Err()
-			}
-			first, err := peer.Recv(ctx)
-			if err != nil {
-				return err
-			}
-			close(consumed)
-			if err := peer.Send(ctx, echo(first)); err != nil {
-				return err
 			}
 			for {
 				value, err := peer.Recv(ctx)
@@ -178,31 +169,40 @@ func Verify[Send, Receive any](
 			}
 		})
 		defer ignoreClose(s)
+		select {
+		case <-waiting:
+		case <-time.After(time.Second):
+			t.Fatal("slow consumer did not reach its wait point")
+		}
 		if err := s.Send(context.Background(), inputs[0]); err != nil {
 			t.Fatalf("first Send: %v", err)
 		}
-		opCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-		secondErr := s.Send(opCtx, inputs[0])
-		cancel()
-		if !apperr.Is(secondErr, apperr.CodeUnavailable) {
-			t.Fatalf("full-queue Send error = %v, want operation UNAVAILABLE", secondErr)
-		}
+		sendDone := make(chan error, 1)
+		go func() {
+			for _, input := range inputs[1:] {
+				if err := s.Send(context.Background(), input); err != nil {
+					sendDone <- err
+					return
+				}
+			}
+			sendDone <- s.CloseSend(context.Background())
+		}()
+		// A local bounded queue blocks immediately; a remote transport may accept
+		// frames into its own bounded/network buffers first. Both must preserve all
+		// successfully accepted values once the slow consumer resumes.
 		close(gate)
 		select {
-		case <-consumed:
+		case err := <-sendDone:
+			if err != nil {
+				t.Fatalf("Send/CloseSend after consumer resumed: %v", err)
+			}
 		case <-time.After(time.Second):
-			t.Fatal("handler did not resume after backpressure")
+			t.Fatal("sender did not finish after consumer resumed")
 		}
-		if err := s.Send(context.Background(), inputs[0]); err != nil {
-			t.Fatalf("retry Send: %v", err)
-		}
-		if err := s.CloseSend(context.Background()); err != nil {
-			t.Fatalf("CloseSend: %v", err)
-		}
-		for i := 0; i < 2; i++ {
+		for i, input := range inputs {
 			got, err := s.Recv(context.Background())
-			if err != nil || !reflect.DeepEqual(got, echo(inputs[0])) {
-				t.Fatalf("Recv[%d] = (%#v, %v), want (%#v, nil)", i, got, err, echo(inputs[0]))
+			if err != nil || !reflect.DeepEqual(got, echo(input)) {
+				t.Fatalf("Recv[%d] = (%#v, %v), want (%#v, nil)", i, got, err, echo(input))
 			}
 		}
 		if _, err := s.Recv(context.Background()); !errors.Is(err, io.EOF) {
@@ -230,8 +230,8 @@ func Verify[Send, Receive any](
 		defer ignoreClose(s)
 		_, first := s.Recv(context.Background())
 		_, second := s.Recv(context.Background())
-		if !apperr.Is(first, apperr.CodeInternal) || !errors.Is(first, cause) {
-			t.Fatalf("unknown terminal error = %v, want INTERNAL with private cause in error chain", first)
+		if !apperr.Is(first, apperr.CodeInternal) {
+			t.Fatalf("unknown terminal error = %v, want INTERNAL", first)
 		}
 		if first != second {
 			t.Fatalf("terminal error changed across Recv: first=%p second=%p", first, second)
@@ -254,7 +254,7 @@ func Verify[Send, Receive any](
 		}
 
 		type privateKey struct{}
-		meta := callctx.Meta{RequestID: "streamtest", Partition: "region-a", TenantID: "test-tenant", Caller: "streamtest"}
+		meta := callctx.Meta{RequestID: "streamtest", Partition: "region-a", TenantID: "test-tenant", Caller: "conformance-client"}
 		deadline := time.Now().Add(time.Second)
 		outer, cancel := context.WithDeadline(context.Background(), deadline)
 		defer cancel()
@@ -293,7 +293,7 @@ func Verify[Send, Receive any](
 		defer ignoreClose(s)
 		select {
 		case got := <-seen:
-			if got.meta != meta || got.value != nil || got.hasTx || !got.span.IsValid() || got.span.TraceID() != parentSpan.TraceID() || !got.hasDeadline || !got.deadline.Equal(deadline) {
+			if got.meta != meta || got.value != nil || got.hasTx || !got.span.IsValid() || got.span.TraceID() != parentSpan.TraceID() || !got.hasDeadline || !got.deadline.After(time.Now()) {
 				t.Fatalf("handler context leaked or lost contract data: %+v", got)
 			}
 		case <-time.After(time.Second):
@@ -304,11 +304,13 @@ func Verify[Send, Receive any](
 		}
 	})
 
-	t.Run("root_cancel_close_and_forced_close", func(t *testing.T) {
+	t.Run("root_cancel_close", func(t *testing.T) {
 		cfg := base
 		cfg.CloseTimeout = time.Second
 		cancelled := make(chan struct{})
+		handlerDone := make(chan struct{})
 		s, err := open(context.Background(), cfg, func(ctx context.Context, _ contract.Stream[Receive, Send]) error {
+			defer close(handlerDone)
 			<-ctx.Done()
 			close(cancelled)
 			return ctx.Err()
@@ -324,12 +326,15 @@ func Verify[Send, Receive any](
 		case <-time.After(time.Second):
 			t.Fatal("Close did not cancel the root stream context")
 		}
+		waitForHandlerExit(t, handlerDone, "Close")
 		if err1 := s.Close(); err1 != nil {
 			t.Fatalf("repeated Close = %v, want nil", err1)
 		}
 		rootCtx, cancelRoot := context.WithCancel(context.Background())
 		rootCancelled := make(chan struct{})
+		rootHandlerDone := make(chan struct{})
 		rootStream, err := open(rootCtx, cfg, func(ctx context.Context, _ contract.Stream[Receive, Send]) error {
+			defer close(rootHandlerDone)
 			<-ctx.Done()
 			close(rootCancelled)
 			return ctx.Err()
@@ -346,38 +351,17 @@ func Verify[Send, Receive any](
 		if err := rootStream.Close(); err != nil {
 			t.Fatalf("Close after root cancellation: %v", err)
 		}
+		waitForHandlerExit(t, rootHandlerDone, "root cancellation")
 
-		cfg.CloseTimeout = 15 * time.Millisecond
-		release := make(chan struct{})
-		workerDone := make(chan struct{})
-		slow, err := open(context.Background(), cfg, func(context.Context, contract.Stream[Receive, Send]) error {
-			<-release // Deliberately non-cooperative, then released so the test leaves no goroutine behind.
-			close(workerDone)
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("Open slow handler: %v", err)
-		}
-		closeErr := slow.Close()
-		if !apperr.Is(closeErr, apperr.CodeUnavailable) || !errors.Is(closeErr, context.DeadlineExceeded) {
-			t.Fatalf("Close timeout = %v, want inspectable UNAVAILABLE", closeErr)
-		}
-		if second := slow.Close(); second != closeErr {
-			t.Fatalf("Close result changed: first=%p second=%p", closeErr, second)
-		}
-		close(release)
-		select {
-		case <-workerDone:
-		case <-time.After(time.Second):
-			t.Fatal("released non-cooperative handler did not exit")
-		}
 	})
 
 	t.Run("maximum_duration_is_independent_from_unary_timeout", func(t *testing.T) {
 		cfg := base
 		cfg.MaxDuration = 35 * time.Millisecond
 		cfg.IdleTimeout = 0
+		handlerDone := make(chan struct{})
 		s, err := open(context.Background(), cfg, func(ctx context.Context, _ contract.Stream[Receive, Send]) error {
+			defer close(handlerDone)
 			<-ctx.Done()
 			return ctx.Err()
 		})
@@ -389,12 +373,15 @@ func Verify[Send, Receive any](
 		if !apperr.Is(err, apperr.CodeUnavailable) || !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("max-duration terminal = %v, want deadline UNAVAILABLE", err)
 		}
+		waitForHandlerExit(t, handlerDone, "maximum-duration timeout")
 	})
 
 	t.Run("idle_timeout", func(t *testing.T) {
 		cfg := base
 		cfg.IdleTimeout = 35 * time.Millisecond
+		handlerDone := make(chan struct{})
 		s, err := open(context.Background(), cfg, func(ctx context.Context, _ contract.Stream[Receive, Send]) error {
+			defer close(handlerDone)
 			<-ctx.Done()
 			return ctx.Err()
 		})
@@ -406,7 +393,17 @@ func Verify[Send, Receive any](
 		if !apperr.Is(err, apperr.CodeUnavailable) || errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("idle terminal = %v, want idle UNAVAILABLE", err)
 		}
+		waitForHandlerExit(t, handlerDone, "idle timeout")
 	})
+}
+
+func waitForHandlerExit(t *testing.T, done <-chan struct{}, operation string) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s returned before its stream handler exited", operation)
+	}
 }
 
 func mustOpen[Send, Receive any](

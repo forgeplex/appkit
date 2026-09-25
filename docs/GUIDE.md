@@ -700,9 +700,11 @@ func streamGreeting(ctx context.Context) (retErr error) {
 建立后的生产错误会以稳定的 `*apperr.Error` 由 `Recv` 返回；正常结束是
 `io.EOF`，不能把 EOF 当成业务终态。每条流最多一个并发 `Send` 和一个并发
 `Recv`，两者可重叠；满队列会背压，不会丢弃事件。`contract/streamtest` 提供
-可复用的 Adapter conformance suite；本地实现由 `OpenLocal` 驱动，后续 Transport
-可以为同一 suite 提供 `OpenFunc` 和测试服务。该 suite 不自动让应用契约生成器
-支持 Streaming。按 ADR-0047 §8，Streaming 新 API 在被显式提升前保持实验性。
+可复用的 Adapter conformance suite；本地实现由 `OpenLocal` 驱动，secure WSS
+Remote Client 也用同一 suite 验证跨传输语义。精确队列阻塞、进程内 error cause
+链和远端 handler 的关闭预算由各 Transport 的专项测试验证。该 suite 不自动让
+应用契约生成器支持 Streaming。按 ADR-0047 §8，Streaming 新 API 在被显式提升前
+保持实验性；其他 API 的稳定面与支持候选政策见 [STABILITY.md](STABILITY.md)。
 
 `contract.Call` 的 timeout 是协作式的：deadline 会传给实现，已经启动的同步
 实现若忽略 ctx 仍可能迟到返回，框架不会强杀 goroutine。涉及写入时，超时后的
@@ -713,9 +715,29 @@ func streamGreeting(ctx context.Context) (retErr error) {
 V2 Bidi 的远程 Transport 使用 `httpserver` 子包；公开类型不会进入根包。
 服务器必须把 `WebSocketHub` 注册为 Host `ManagedService`，这样 Host 才能停止
 新连接、发送 GoingAway 并在关停预算耗尽时关闭 hijacked socket：
+Hub 不提供可用于生产接入的隐式默认预算，必须显式设置连接数以及双向帧/字节速率和突发上限。
+下面的数值仅用于展示配置方式，部署前应按实际负载与容量测试调整；`MaxConnections`
+只约束这个 Hub，不是进程级或跨副本配额。
 
 ```go
-hub := httpserver.NewWebSocketHub()
+hub, err := httpserver.NewWebSocketHubWithLimits(httpserver.WebSocketHubLimits{
+	MaxConnections: 64,
+	Inbound: httpserver.WebSocketRateLimits{
+		FramesPerSecond: 10,
+		FrameBurst:      2,
+		BytesPerSecond:  1 << 20,
+		ByteBurst:       1 << 20,
+	},
+	Outbound: httpserver.WebSocketRateLimits{
+		FramesPerSecond: 10,
+		FrameBurst:      2,
+		BytesPerSecond:  1 << 20,
+		ByteBurst:       1 << 20,
+	},
+})
+if err != nil {
+	return err
+}
 if err := reg.ManagedService("websocket-hub", appkit.ServiceCritical,
     func(*appkit.Registry) (appkit.ManagedService, error) { return hub, nil }); err != nil {
     return err
@@ -734,6 +756,8 @@ handler, err := chatv2.NewChatWebSocketHandlerV2(httpserver.WebSocketConfig{
 if err != nil { return err }
 reg.MountAuthenticated("GET /v2/chat", handler)
 ```
+`WebSocketConfig.MaxMessageBytes` 必须不大于 Inbound 和 Outbound 的 `ByteBurst`；超出时
+handler 创建会 fail-fast。上例的 1 MiB `ByteBurst` 与 1 MiB `MaxMessageBytes` 相匹配。
 
 按具体授权模型选择 `MountAuthenticated`、`MountPermission` 或
 `MountInternalService`；认证和路由分类在 Upgrade 前执行。生成 Handler 默认从

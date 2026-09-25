@@ -235,11 +235,11 @@ func TestRender_Golden(t *testing.T) {
 // appkit 仓库自带的 workflow 文件也必须是合法 YAML（与 ci.yml.tmpl 引用点保持一致）。
 func TestWorkflows_合法YAML(t *testing.T) {
 	tests := []struct {
-		path string
-		want string // 文件内须出现的片段
+		path  string
+		wants []string // 文件内须出现的片段
 	}{
-		{"../.github/workflows/domain-ci.yml", "workflow_call"},
-		{"../.github/workflows/ci.yml", "cd lint"},
+		{"../.github/workflows/domain-ci.yml", []string{"workflow_call"}},
+		{"../.github/workflows/ci.yml", []string{"run: make ci", "go-version-file: go.mod"}},
 	}
 	for _, tt := range tests {
 		t.Run(filepath.Base(tt.path), func(t *testing.T) {
@@ -254,10 +254,40 @@ func TestWorkflows_合法YAML(t *testing.T) {
 			if _, ok := doc["jobs"]; !ok {
 				t.Errorf("%s 缺少 jobs", tt.path)
 			}
-			if !strings.Contains(string(body), tt.want) {
-				t.Errorf("%s 缺少片段 %q", tt.path, tt.want)
+			for _, want := range tt.wants {
+				if !strings.Contains(string(body), want) {
+					t.Errorf("%s 缺少片段 %q", tt.path, want)
+				}
 			}
 		})
+	}
+}
+
+func TestDomainCI_隔离数据库满足域测试安全契约(t *testing.T) {
+	body, err := os.ReadFile("../.github/workflows/domain-ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(body)
+	for _, required := range []string{
+		"TEST_DATABASE_URL: postgres://postgres:appkit@127.0.0.1:55499/appkit_test?sslmode=disable",
+		"mktemp -d /tmp/webhook-db-test.XXXXXXXX",
+		"WEBHOOK_TEST_DATABASE_URL=postgresql:///appkit_test?host=",
+		"WEBHOOK_TEST_DISPOSABLE=1",
+		"--publish 127.0.0.1:55499:5432",
+		"--tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m",
+		"shared_preload_libraries=pg_stat_statements",
+		"CREATE EXTENSION pg_stat_statements",
+		"if: ${{ always() }}",
+		"unlink -- \"$entry\"",
+		"rmdir -- \"$APPKIT_TEST_DB_ROOT/socket\" \"$APPKIT_TEST_DB_ROOT\"",
+	} {
+		if !strings.Contains(s, required) {
+			t.Errorf("domain-ci.yml 缺少数据库隔离条件 %q", required)
+		}
+	}
+	if strings.Contains(s, "services:\n") {
+		t.Error("domain-ci.yml 不应再依赖无法提供可审计 Unix socket 的共享服务容器")
 	}
 }
 
