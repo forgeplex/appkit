@@ -299,7 +299,12 @@ psp/                             # module github.com/forgeplex/psp
 └── .github/workflows/           # 集成 CI：拉各域 tag 编译 + 双模式集成测试
 ```
 
-### 5.1 核心接口（appkit 稳定面，只依赖 stdlib）
+### 5.1 根包核心边界（只依赖 stdlib）
+
+`Module` / `Registry` / `Provide` / `Resolve` 是根包稳定核心。此处为完整性展示的
+`Headless` 与 Contribution API 按 ADR-0047 §8 仍属实验性，不自动进入 v1.0 稳定面；
+`App.Start` 和新 Host Profile API 同样未自动提升为稳定面；
+配置、CLI、manifest、生成物及迁移的候选承诺见 [STABILITY.md](STABILITY.md)。
 
 ```go
 // appkit.go
@@ -311,11 +316,11 @@ type Module interface {
 // Registry —— 模块向系统贡献能力（fx value groups 思想，手写实现，无反射魔法）
 func Provide[T any](reg *Registry, ctor func(*Registry) (T, error)) // 注册契约实现（惰性构造）
 func Resolve[T any](reg *Registry) (T, error)                       // 取依赖；启动期缺失 fail-fast、循环依赖报错
-type Contribution[T any] struct { Name, Module string; Value T }
-func Contribute[T any](reg *Registry, name string, ctor func(*Registry) (T, error)) // 注册扩展集合条目
-func ResolveContributions[T any](reg *Registry) ([]Contribution[T], error)           // Setup 中读确定性快照
+type Contribution[T any] struct { Name, Module string; Value T }                    // 实验性，见 ADR-0047 §8
+func Contribute[T any](reg *Registry, name string, ctor func(*Registry) (T, error)) // 实验性：注册扩展集合条目
+func ResolveContributions[T any](reg *Registry) ([]Contribution[T], error)           // 实验性：Setup 中读确定性快照
 func Security(mode SecurityMode) Option                              // HTTP 身份边界模式，Run 必须显式选择
-func Headless() Option                                               // 不启用业务 HTTP；声明路由或 pprof 时启动拒绝
+func Headless() Option                                               // 实验性：不启用业务 HTTP；声明路由或 pprof 时启动拒绝
 func DisableMigrations() Option                                       // 未启用迁移 capability 时拒绝有迁移的模块
 func (r *Registry) MountPublic(pattern string, h http.Handler)       // 明示公开路由
 func (r *Registry) MountAuthenticated(pattern string, h http.Handler)// 需用户主体

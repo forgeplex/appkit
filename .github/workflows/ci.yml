@@ -52,7 +52,7 @@ jobs:
           git diff --exit-code go.mod go.sum
 
       # appkit 经 MVS 依赖钻石被全部域仓库共享，公开 API 近乎终身兼容
-      # （DESIGN §9）。基线 = 最新发版 tag，破坏性变更直接红灯。
+      # （DESIGN §9）。主 module 与 lint/ 嵌套 module 分别对比最新发版 tag。
       - name: API 向后兼容门禁（apidiff vs 最新 tag）
         run: |
           # --match 排除 lint/vX.Y.Z 路标 tag（lint/ 嵌套 module 的 Go 模块
@@ -74,3 +74,15 @@ jobs:
             exit 1
           fi
           echo "相对 $base 无破坏性变更"
+
+          # lint/ 是单独发布的 Go module；主 module 的 apidiff 不会加载它。
+          # 两个 module 的版本 tag 锁步，因此从同一 base commit 比较。
+          (cd /tmp/apidiff-base/lint && go run "$apidiff" -m -w /tmp/base.lint.export github.com/forgeplex/appkit/lint)
+          (cd lint && go run "$apidiff" -m -w /tmp/head.lint.export github.com/forgeplex/appkit/lint)
+          lint_out=$(go run "$apidiff" -m -incompatible /tmp/base.lint.export /tmp/head.lint.export 2>/dev/null)
+          if [ -n "$lint_out" ]; then
+            echo "相对 $base 存在破坏性 API 变更（lint module，见 docs/STABILITY.md）:"
+            echo "$lint_out"
+            exit 1
+          fi
+          echo "lint module 相对 $base 无破坏性变更"
