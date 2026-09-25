@@ -887,10 +887,12 @@ func TestSSEStreamDrainsDuringHostShutdown(t *testing.T) {
 	release := make(chan struct{})
 	started := make(chan struct{}, 2)
 	cancelled := make(chan struct{}, 1)
+	handlerDone := make(chan struct{})
 	var startedCount atomic.Int32
 	cfg := sseTestConfig()
 	cfg.HeartbeatInterval = 15 * time.Millisecond
 	handler := makeSSEHandler(t, cfg, func(ctx context.Context, _ string, peer contract.Stream[httpserver.SSEEvent[sseTestReply], sseTestRequest]) error {
+		defer close(handlerDone)
 		if _, err := peer.Recv(ctx); err != nil {
 			return err
 		}
@@ -971,14 +973,21 @@ func TestSSEStreamDrainsDuringHostShutdown(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Host shutdown did not complete after stream drained")
 	}
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("Host shutdown completed before the drained SSE handler exited")
+	}
 }
 
 func TestSSEStreamIsCancelledWhenHostShutdownBudgetExpires(t *testing.T) {
 	started := make(chan struct{})
 	cancelled := make(chan struct{})
+	handlerDone := make(chan struct{})
 	cfg := sseTestConfig()
 	cfg.HeartbeatInterval = 10 * time.Millisecond
 	handler := makeSSEHandler(t, cfg, func(ctx context.Context, _ string, peer contract.Stream[httpserver.SSEEvent[sseTestReply], sseTestRequest]) error {
+		defer close(handlerDone)
 		if _, err := peer.Recv(ctx); err != nil {
 			return err
 		}
@@ -1004,5 +1013,10 @@ func TestSSEStreamIsCancelledWhenHostShutdownBudgetExpires(t *testing.T) {
 	case <-cancelled:
 	case <-time.After(time.Second):
 		t.Fatal("forced HTTP close did not cancel the stream producer")
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("forced HTTP close cancelled the producer but its handler did not exit")
 	}
 }

@@ -115,6 +115,8 @@ func OpenLocal[Send, Receive any](ctx context.Context, system, method string, cf
 		touch:       make(chan struct{}, 1),
 		span:        span,
 		started:     started,
+		system:      system,
+		method:      method,
 	}
 	requests := newStreamDirection[Send](cfg.QueueSize)
 	responses := newStreamDirection[Receive](cfg.QueueSize)
@@ -123,14 +125,17 @@ func OpenLocal[Send, Receive any](ctx context.Context, system, method string, cf
 		out:     requests,
 		in:      responses,
 		config:  cfg,
+		side:    streamClient,
 	}
 	server := &localStream[Receive, Send]{
 		session: session,
 		out:     responses,
 		in:      requests,
 		config:  cfg,
+		side:    streamServer,
 	}
 
+	metrics.StreamOpened(streamCtx, system, method)
 	go func() {
 		defer close(session.watchDone)
 		session.watch(cfg.IdleTimeout)
@@ -247,16 +252,20 @@ func (d *streamDirection[T]) closeSend(ctx context.Context, session *localSessio
 }
 
 type localSession struct {
-	ctx          context.Context
-	cancel       context.CancelFunc
-	done         chan struct{}
-	handlerDone  chan struct{}
-	watchDone    chan struct{}
-	force        chan struct{}
-	touch        chan struct{}
-	span         trace.Span
-	started      time.Time
-	lastActivity atomic.Int64
+	ctx             context.Context
+	cancel          context.CancelFunc
+	done            chan struct{}
+	handlerDone     chan struct{}
+	watchDone       chan struct{}
+	force           chan struct{}
+	touch           chan struct{}
+	span            trace.Span
+	started         time.Time
+	system          string
+	method          string
+	lastActivity    atomic.Int64
+	clientFirstRecv sync.Once
+	serverFirstRecv sync.Once
 
 	finishOnce sync.Once
 	forceOnce  sync.Once
@@ -299,6 +308,14 @@ func (s *localSession) currentTerminal() error {
 }
 
 func (s *localSession) finish(err error) {
+	s.finishWithTimeout(err, false)
+}
+
+func (s *localSession) finishTimeout(err error) {
+	s.finishWithTimeout(err, true)
+}
+
+func (s *localSession) finishWithTimeout(err error, timedOut bool) {
 	s.finishOnce.Do(func() {
 		if err == nil || errors.Is(err, io.EOF) {
 			if ctxErr := s.ctx.Err(); ctxErr != nil {
@@ -318,6 +335,7 @@ func (s *localSession) finish(err error) {
 		} else {
 			s.span.SetStatus(codes.Ok, "")
 		}
+		metrics.StreamClosed(s.ctx, s.system, s.method, err, time.Since(s.started), timedOut)
 		close(s.done)
 		s.cancel()
 		s.span.End()
@@ -340,14 +358,14 @@ func (s *localSession) watch(idleTimeout time.Duration) {
 		case <-s.touch:
 			remaining := idleTimeout - (time.Since(s.started) - time.Duration(s.lastActivity.Load()))
 			if remaining <= 0 {
-				s.finish(apperr.Unavailable(errStreamIdle))
+				s.finishTimeout(apperr.Unavailable(errStreamIdle))
 				return
 			}
 			resetTimer(timer, remaining)
 		case <-timer.C:
 			remaining := idleTimeout - (time.Since(s.started) - time.Duration(s.lastActivity.Load()))
 			if remaining <= 0 {
-				s.finish(apperr.Unavailable(errStreamIdle))
+				s.finishTimeout(apperr.Unavailable(errStreamIdle))
 				return
 			}
 			timer.Reset(remaining)
@@ -370,12 +388,20 @@ type localStream[Send, Receive any] struct {
 	out     *streamDirection[Send]
 	in      *streamDirection[Receive]
 	config  StreamConfig
+	side    streamSide
 
 	recvBusy  busyGate
 	closeOnce sync.Once
 	closeDone chan struct{}
 	closeErr  error
 }
+
+type streamSide uint8
+
+const (
+	streamClient streamSide = iota
+	streamServer
+)
 
 // busyGate is a small gate used only to reject overlapping Recv calls. It
 // avoids leaving a second blocked Recv goroutine behind the active operation.
@@ -414,6 +440,35 @@ func (s *localStream[Send, Receive]) Send(ctx context.Context, value Send) error
 	if err := s.session.currentTerminal(); err != nil {
 		return err
 	}
+	direction := s.sendDirection()
+	var backpressureStarted time.Time
+	if len(s.out.queue) == cap(s.out.queue) {
+		select {
+		case <-ctx.Done():
+			return normalize(ctx, ctx.Err())
+		case <-s.session.done:
+			return s.session.terminalError()
+		case <-s.session.ctx.Done():
+			s.session.finish(normalize(s.session.ctx, s.session.ctx.Err()))
+			return s.session.terminalError()
+		case <-s.session.force:
+			return s.session.terminalError()
+		case <-s.out.closed:
+			return apperr.From(errSendSideClosed)
+		case s.out.queue <- value:
+			metrics.StreamMessageSent(s.session.ctx, s.session.system, s.session.method, direction)
+			s.session.touchActivity()
+			return nil
+		default:
+			backpressureStarted = time.Now()
+		}
+	}
+	if !backpressureStarted.IsZero() {
+		defer func() {
+			metrics.StreamBackpressureWait(s.session.ctx, s.session.system, s.session.method,
+				direction, time.Since(backpressureStarted))
+		}()
+	}
 	select {
 	case <-ctx.Done():
 		return normalize(ctx, ctx.Err())
@@ -427,6 +482,7 @@ func (s *localStream[Send, Receive]) Send(ctx context.Context, value Send) error
 	case <-s.out.closed:
 		return apperr.From(errSendSideClosed)
 	case s.out.queue <- value:
+		metrics.StreamMessageSent(s.session.ctx, s.session.system, s.session.method, direction)
 		s.session.touchActivity()
 		return nil
 	}
@@ -448,30 +504,26 @@ func (s *localStream[Send, Receive]) Recv(ctx context.Context) (Receive, error) 
 		// Drain accepted messages before reporting a half-close or stream terminal.
 		select {
 		case value := <-s.in.queue:
-			s.session.touchActivity()
-			return value, nil
+			return s.recordReceived(value)
 		default:
 		}
 		if s.session.isDone() {
 			select {
 			case value := <-s.in.queue:
-				s.session.touchActivity()
-				return value, nil
+				return s.recordReceived(value)
 			default:
 			}
 			return zero, s.session.terminalError()
 		}
 		select {
 		case value := <-s.in.queue:
-			s.session.touchActivity()
-			return value, nil
+			return s.recordReceived(value)
 		case <-s.in.closed:
 			// CloseSend may race with the blocking select after the first drain;
 			// drain once more before exposing EOF so accepted values are not lost.
 			select {
 			case value := <-s.in.queue:
-				s.session.touchActivity()
-				return value, nil
+				return s.recordReceived(value)
 			default:
 				return zero, io.EOF
 			}
@@ -486,6 +538,35 @@ func (s *localStream[Send, Receive]) Recv(ctx context.Context) (Receive, error) 
 			continue
 		}
 	}
+}
+
+func (s *localStream[Send, Receive]) sendDirection() string {
+	if s.side == streamClient {
+		return metrics.DirectionClientToServer
+	}
+	return metrics.DirectionServerToClient
+}
+
+func (s *localStream[Send, Receive]) receiveDirection() string {
+	if s.side == streamClient {
+		return metrics.DirectionServerToClient
+	}
+	return metrics.DirectionClientToServer
+}
+
+func (s *localStream[Send, Receive]) recordReceived(value Receive) (Receive, error) {
+	s.session.touchActivity()
+	direction := s.receiveDirection()
+	metrics.StreamMessageReceived(s.session.ctx, s.session.system, s.session.method, direction)
+	first := &s.session.clientFirstRecv
+	if s.side == streamServer {
+		first = &s.session.serverFirstRecv
+	}
+	first.Do(func() {
+		metrics.StreamFirstMessage(s.session.ctx, s.session.system, s.session.method,
+			direction, time.Since(s.session.started))
+	})
+	return value, nil
 }
 
 func (s *localStream[Send, Receive]) CloseSend(ctx context.Context) error {
