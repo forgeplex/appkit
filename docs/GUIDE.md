@@ -715,9 +715,29 @@ Remote Client 也用同一 suite 验证跨传输语义。精确队列阻塞、�
 V2 Bidi 的远程 Transport 使用 `httpserver` 子包；公开类型不会进入根包。
 服务器必须把 `WebSocketHub` 注册为 Host `ManagedService`，这样 Host 才能停止
 新连接、发送 GoingAway 并在关停预算耗尽时关闭 hijacked socket：
+Hub 不提供可用于生产接入的隐式默认预算，必须显式设置连接数以及双向帧/字节速率和突发上限。
+下面的数值仅用于展示配置方式，部署前应按实际负载与容量测试调整；`MaxConnections`
+只约束这个 Hub，不是进程级或跨副本配额。
 
 ```go
-hub := httpserver.NewWebSocketHub()
+hub, err := httpserver.NewWebSocketHubWithLimits(httpserver.WebSocketHubLimits{
+	MaxConnections: 64,
+	Inbound: httpserver.WebSocketRateLimits{
+		FramesPerSecond: 10,
+		FrameBurst:      2,
+		BytesPerSecond:  1 << 20,
+		ByteBurst:       1 << 20,
+	},
+	Outbound: httpserver.WebSocketRateLimits{
+		FramesPerSecond: 10,
+		FrameBurst:      2,
+		BytesPerSecond:  1 << 20,
+		ByteBurst:       1 << 20,
+	},
+})
+if err != nil {
+	return err
+}
 if err := reg.ManagedService("websocket-hub", appkit.ServiceCritical,
     func(*appkit.Registry) (appkit.ManagedService, error) { return hub, nil }); err != nil {
     return err
@@ -736,6 +756,8 @@ handler, err := chatv2.NewChatWebSocketHandlerV2(httpserver.WebSocketConfig{
 if err != nil { return err }
 reg.MountAuthenticated("GET /v2/chat", handler)
 ```
+`WebSocketConfig.MaxMessageBytes` 必须不大于 Inbound 和 Outbound 的 `ByteBurst`；超出时
+handler 创建会 fail-fast。上例的 1 MiB `ByteBurst` 与 1 MiB `MaxMessageBytes` 相匹配。
 
 按具体授权模型选择 `MountAuthenticated`、`MountPermission` 或
 `MountInternalService`；认证和路由分类在 Upgrade 前执行。生成 Handler 默认从

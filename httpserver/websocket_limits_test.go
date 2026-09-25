@@ -3,6 +3,8 @@ package httpserver
 import (
 	"context"
 	"errors"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +20,57 @@ func testWebSocketHubLimits(maxConnections int) WebSocketHubLimits {
 		ByteBurst:       256,
 	}
 	return WebSocketHubLimits{MaxConnections: maxConnections, Inbound: rate, Outbound: rate}
+}
+
+func TestGuideWebSocketExampleUsesConfiguredHubLimits(t *testing.T) {
+	guide, err := os.ReadFile("../docs/GUIDE.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	guideText := string(guide)
+	sectionStart := strings.Index(guideText, "### 远程双向 Stream：WSS")
+	if sectionStart < 0 {
+		t.Fatal("GUIDE.md is missing the remote bidirectional WebSocket section")
+	}
+	section := guideText[sectionStart:]
+	codeStart := strings.Index(section, "```go\n")
+	if codeStart < 0 {
+		t.Fatal("GUIDE.md WebSocket section is missing its Go example")
+	}
+	codeStart += len("```go\n")
+	codeEnd := strings.Index(section[codeStart:], "\n```")
+	if codeEnd < 0 {
+		t.Fatal("GUIDE.md WebSocket Go example is not closed")
+	}
+	example := section[codeStart : codeStart+codeEnd]
+	for _, want := range []string{
+		"NewWebSocketHubWithLimits(",
+		"MaxConnections:",
+		"Inbound: httpserver.WebSocketRateLimits{",
+		"Outbound: httpserver.WebSocketRateLimits{",
+		"FramesPerSecond:",
+		"FrameBurst:",
+		"BytesPerSecond:",
+		"ByteBurst:",
+		"MaxMessageBytes: 1 << 20",
+		"if err != nil",
+	} {
+		if !strings.Contains(example, want) {
+			t.Errorf("GUIDE.md WebSocket example is missing %q", want)
+		}
+	}
+	if strings.Contains(example, "NewWebSocketHub()") {
+		t.Error("GUIDE.md WebSocket example must not construct an unbounded Hub")
+	}
+	byteBurstCount := 0
+	for _, line := range strings.Split(example, "\n") {
+		if strings.Contains(line, "ByteBurst:") && strings.Contains(line, "1 << 20") {
+			byteBurstCount++
+		}
+	}
+	if byteBurstCount != 2 {
+		t.Errorf("GUIDE.md WebSocket example has %d 1 MiB byte bursts, want one for each direction", byteBurstCount)
+	}
 }
 
 func TestNewWebSocketHubWithLimitsRejectsUnboundedOrInvalidBudgets(t *testing.T) {
