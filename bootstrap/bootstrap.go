@@ -29,7 +29,6 @@ import (
 	"github.com/forgeplex/appkit/outbox"
 	"github.com/forgeplex/appkit/pgmigrate"
 	"github.com/forgeplex/appkit/pgtx"
-	"github.com/forgeplex/appkit/telemetry"
 )
 
 // telShutdownTimeout 是遥测 flush 的独立预算：主流程此时已结束，
@@ -254,12 +253,7 @@ func RunWithSecurity(ctx context.Context, o Options, r RunOptions, security Secu
 		return err
 	}
 
-	tel, err := telemetry.Init(ctx, telemetry.Config{
-		ServiceName: o.Service,
-		Env:         base.Env,
-		LogLevel:    base.Log.Level,
-		LogFormat:   base.Log.Format,
-	})
+	tel, err := initTelemetry(ctx, copts, o.Service, base.Env, base.Log.Level, base.Log.Format)
 	if err != nil {
 		return fmt.Errorf("%s: 初始化遥测: %w", o.Service, err)
 	}

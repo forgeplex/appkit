@@ -8,6 +8,14 @@ security:
 log:
   level: debug
   format: text
+telemetry:
+  # 用配置显式启停；启用后填写完整的 signal endpoint（含 /v1/traces 或 /v1/metrics）。
+  traces:
+    enabled: false
+    # endpoint: http://127.0.0.1:4318/v1/traces
+  metrics:
+    enabled: false
+    # endpoint: http://127.0.0.1:4318/v1/metrics
 database:
   # 留空时正常启动会 fail closed；零依赖试跑必须显式 make run-minimal。
   # 完整模式：make dev-db 启动一次性 Postgres 后，取消下一行注释（或 make run-db 直接以环境变量注入）。

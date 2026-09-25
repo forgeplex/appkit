@@ -1077,6 +1077,38 @@ func runEmbedded(ctx context.Context) error {
 - Core 先初始化日志/Telemetry，再创建可选基础设施；关停时逆序清理，Telemetry 最后 flush。
   清理错误使用 `errors.Join` 保留，配置与数据库初始化错误不得回显 DSN/秘密。
 
+### 配置驱动的 traces 与 metrics
+
+`bootstrap` 自动读取服务配置并创建/flush OTLP HTTP exporter；业务模块不调用
+`telemetry.Init` 或设置全局 OTel provider。每个已启用 signal 使用完整 endpoint URL：
+
+```yaml
+log:
+  level: info
+  format: json
+
+telemetry:
+  traces:
+    enabled: true
+    endpoint: http://otel-collector:4318/v1/traces
+  metrics:
+    enabled: true
+    endpoint: http://otel-collector:4318/v1/metrics
+```
+
+`telemetry` 块出现后，`traces.enabled`、`metrics.enabled` 各自决定是否导出；未设置
+的开关按 `false` 处理，现有服务前缀环境变量覆盖层仍可覆盖任一配置项。已启用
+signal 必须能解析出 endpoint，否则启动 fail-fast。地址优先级为
+`OTEL_EXPORTER_OTLP_<SIGNAL>_ENDPOINT`、通用
+`OTEL_EXPORTER_OTLP_ENDPOINT`、服务前缀环境变量（如
+`IDENTITYD_TELEMETRY__TRACES__ENDPOINT`）、YAML endpoint。标准 OTEL endpoint 环境变量
+只覆盖地址，不会重新启用 YAML 已禁用的 signal；空值等价于未设置。认证 headers、token、
+证书私料放在环境变量或 secret store，不写入普通 YAML。
+
+迁移期间，没有 `telemetry` 块的服务保留旧兼容行为：非空
+`OTEL_EXPORTER_OTLP_ENDPOINT` 同时启用 traces 与 metrics；未设置则不装 SDK。
+日志仍由 `log.level` / `log.format` 控制并输出到 stdout；当前不提供 OTLP log exporter。
+
 ## 7. 第六步：跑起来
 
 单个域仓库（identity 目录内）：

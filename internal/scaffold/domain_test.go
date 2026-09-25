@@ -75,7 +75,8 @@ func TestDomainScaffold(t *testing.T) {
 	t.Run("运行配置与最小模式", func(t *testing.T) {
 		mustContain(t, "config/dev.yaml", readFile(t, dir, "config/dev.yaml"),
 			"security:", "mode: disabled", "env=dev", "staging/prod",
-			"database:", `url: ""`, "LEDGERD_DATABASE__URL", "fail closed", "debug:", "pprof: false")
+			"database:", `url: ""`, "LEDGERD_DATABASE__URL", "fail closed", "debug:", "pprof: false",
+			"telemetry:", "traces:", "metrics:", "enabled: false", "/v1/traces", "/v1/metrics")
 		// 总线/迁移器/遥测的装配已收进 bootstrap（生成物里不再出现，
 		// 也就改不坏）；main 只声明最小模式装什么。
 		mustContain(t, "main.go", readFile(t, dir, "cmd/ledgerd/main.go"),

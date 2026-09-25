@@ -1,6 +1,6 @@
 # ADR-0048：出站客户端与配置驱动观测
 
-- 状态：Proposed（待评审；不冻结 Go API 名称和签名）
+- 状态：Accepted（架构与配置语义已冻结；后续切片仍分别评审 Go API 名称/签名）
 - 日期：2026-09-25
 - 关联：[Epic #97](https://github.com/forgeplex/appkit/issues/97)、[Phase 0 #98](https://github.com/forgeplex/appkit/issues/98)、[已完成的宿主与流式 Epic #47](https://github.com/forgeplex/appkit/issues/47)
 - 基线：`main@21b7eb80e2bc15972bbab78d60e88b077ea2fee9`，release `v0.9.9`
@@ -61,9 +61,22 @@ AppKit 是共享 Go 框架：新增公开 API 必须纯加法；根包/tx 不能
 - Bootstrap 从其现有 YAML 配置加载 private runtime telemetry schema，并将解析/验证后的配置传给新增的 Telemetry 初始化入口；**业务代码无需调用 `telemetry.Init`、`otel.SetTracerProvider` 或创建 exporter**。
 - 配置按 signal 独立控制框架已支持的 traces 与 metrics exporter；每个 signal 可有显式启用开关、OTLP/HTTP endpoint 和必要的 timeout/sampling。service name/environment 继续由 Bootstrap 的服务名与运行环境产生，不允许 YAML 覆写身份来源。
 - 默认不启用远端 trace/metric 导出；instrumentation 留在 AppKit 自动执行，未启用 exporter 时使用 noop provider。日志保持 stdout，由已有 `log.level` / `log.format` 配置控制；本 ADR 不新增远程日志 exporter。
-- 新 YAML 配置块按 signal 显式选择启停；当该配置块存在时，trace/metric 的 `enabled` 由 YAML 决定，标准 OTLP endpoint 环境变量只能提供或覆盖地址，不能把 YAML 禁用的 signal 重新打开。地址优先级为 signal 专属环境变量（`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`）> 通用环境变量（`OTEL_EXPORTER_OTLP_ENDPOINT`）> 对应 signal 的 YAML endpoint；空环境变量按标准语义视为未设置。配置块存在且 signal 已启用但最终没有可用 endpoint 时，启动校验失败并说明配置路径，不静默回退到 localhost。
+- 新 YAML 配置块按 signal 显式选择启停；当该配置块存在时，`traces.enabled` / `metrics.enabled` 由 YAML 与现有服务前缀环境覆盖层决定，标准 OTLP endpoint 环境变量只能覆盖地址，不能把已禁用的 signal 重新打开。地址优先级为 signal 专属环境变量（`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`）> 通用环境变量（`OTEL_EXPORTER_OTLP_ENDPOINT`）> 服务前缀环境覆盖（如 `IDENTITYD_TELEMETRY__TRACES__ENDPOINT`）> 对应 signal 的 YAML endpoint；空标准环境变量按规范视为未设置。配置块存在且 signal 已启用但最终没有可用 endpoint 时，启动校验失败，不静默回退到 localhost。
 - 为不改变未迁移服务的现有行为，完全没有 AppKit telemetry 配置块时保留旧兼容路径：非空 `OTEL_EXPORTER_OTLP_ENDPOINT` 仍同时启用 trace/metric OTLP；没有该变量时保持 noop。该兼容路径不作为新服务的推荐配置方式，后续是否移除由独立迁移决策处理。
 - endpoint 可写普通配置；认证 header/token、私钥和证书私密材料只从环境变量或 secret provider 读取，不能落入普通 YAML 或错误日志。标准 OTLP 环境变量的名称和空值规则遵循 [OpenTelemetry SDK environment variable specification](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/) 与 [OTLP exporter configuration](https://opentelemetry.io/docs/specs/otel/protocol/exporter/)。
+- 首期配置示例（endpoint 是完整的 signal URL；禁用的 signal 可省略 endpoint）：
+
+  ```yaml
+  telemetry:
+    traces:
+      enabled: true
+      endpoint: http://otel-collector:4318/v1/traces
+    metrics:
+      enabled: true
+      endpoint: http://otel-collector:4318/v1/metrics
+  ```
+
+- 日志继续通过现有 `log.level` / `log.format` 输出 stdout；首期不增加 OTLP Log exporter。
 - exporter 构造失败必须 fail-fast 并给出脱敏配置路径/原因；shutdown 在其他资源结束后 flush，并受关停预算约束。
 
 ### 4. 自动观测、安全与数据边界
@@ -88,13 +101,13 @@ AppKit 是共享 Go 框架：新增公开 API 必须纯加法；根包/tx 不能
 | WSS | 双向 | Send/Recv/CloseSend，复用现有 secure dialer | 半关闭、EOF、错误、凭证过期、限额、关停 |
 | Local Stream | 双向进程内 | 既有 `ClientStream` | 背压、并发限制、取消、Close 和 handler 退出 |
 
-实现 issue 的验收至少包括：YAML 按 signal enable/disable 与独立端点验证；环境优先级（signal 专属 endpoint > 通用 endpoint > YAML endpoint）、空环境值视为未设置、`enabled: false` 不被 endpoint 环境变量重新打开、启用但无 endpoint 时 fail-fast，以及无 AppKit telemetry 块时旧 `OTEL_EXPORTER_OTLP_ENDPOINT` 兼容行为；fake OTLP collector 收到预期 signal；业务模块不调用 OTel 初始化仍能自动观测；安全标签/日志拒绝敏感字段；HTTP/SSE/WSS 客户端的安全、取消和错误测试；相应 adapter 的 conformance；`make check`、`make test-lint`、必要的 `make test-rules` 及相对最新 tag 的零 incompatible apidiff。
+实现 issue 的验收至少包括：按 signal 的 YAML enable/disable 与独立 endpoint；环境优先级（signal 专属 OTEL endpoint > 通用 OTEL endpoint > 服务前缀环境覆盖 > YAML endpoint）、标准空环境值视为未设置、OTEL endpoint 不得重新打开禁用 signal、启用但无 endpoint 时 fail-fast，以及无 AppKit telemetry 块时旧 `OTEL_EXPORTER_OTLP_ENDPOINT` 兼容行为；fake OTLP collector 收到预期 signal；业务模块不调用 OTel 初始化仍能自动观测；安全标签/日志拒绝敏感字段；HTTP/SSE/WSS 客户端的安全、取消和错误测试；相应 adapter 的 conformance；`make check`、`make test-lint`、必要的 `make test-rules` 及相对最新 tag 的零 incompatible apidiff。
 
 ## 后续切片
 
 ```text
 Epic #97 出站客户端与配置驱动观测
-└─ Phase 0 #98 本 ADR / 行为基线（本 PR）
+└─ Phase 0 #98 本 ADR / 行为基线
    ├─ telemetry YAML schema + Bootstrap 自动装配
    ├─ 共享 outbound HTTP foundation / 既有 Unary client 接缝
    ├─ SSE server-stream client
@@ -102,4 +115,4 @@ Epic #97 出站客户端与配置驱动观测
    └─ 流形态 conformance、fake collector 与下游固定消费者验证
 ```
 
-每个实现切片应由独立 issue 冻结 API 名称/签名、错误语义、配置字段和验收命令；本提案未接受之前，不实现破坏性变更或宣称 Streaming 已稳定。
+每个实现切片应由独立 issue 冻结 API 名称/签名、错误语义、配置字段和验收命令；本 ADR 已接受架构/配置语义，但新 client API 仍须经过对应实现切片的审查，并依照既有稳定性政策取得消费者与运行时证据后才能宣称稳定。

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -205,6 +206,169 @@ func TestInitWithEndpoint(t *testing.T) {
 	if err := tm.Shutdown(ctx); err != nil {
 		t.Errorf("Shutdown: %v", err)
 	}
+}
+
+func TestInitWithExportConfigUsesIndependentYAMLEndpoints(t *testing.T) {
+	t.Setenv(envEndpoint, "")
+	t.Setenv(envTraceEndpoint, "")
+	t.Setenv(envMetricEndpoint, "")
+	restoreGlobalTelemetry(t)
+
+	var traceRequests, metricRequests atomic.Int64
+	traceServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/traces" {
+			t.Errorf("trace endpoint path = %q, want /v1/traces", r.URL.Path)
+		}
+		traceRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer traceServer.Close()
+	metricServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/metrics" {
+			t.Errorf("metrics endpoint path = %q, want /v1/metrics", r.URL.Path)
+		}
+		metricRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer metricServer.Close()
+
+	tm, err := InitWithExportConfig(context.Background(), Config{ServiceName: "svc", Env: "test"}, ExportConfig{
+		Traces:  OTLPExportConfig{Enabled: true, Endpoint: traceServer.URL + "/v1/traces"},
+		Metrics: OTLPExportConfig{Enabled: true, Endpoint: metricServer.URL + "/v1/metrics"},
+	})
+	if err != nil {
+		t.Fatalf("InitWithExportConfig: %v", err)
+	}
+	if tm.traces == nil || tm.metrics == nil {
+		t.Fatal("两个 signal 均启用时应分别装配 provider")
+	}
+	_, span := tm.traces.Tracer("telemetry_test").Start(context.Background(), "configured")
+	span.End()
+	counter, err := tm.metrics.Meter("telemetry_test").Int64Counter("configured.counter")
+	if err != nil {
+		t.Fatalf("create metric counter: %v", err)
+	}
+	counter.Add(context.Background(), 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tm.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if traceRequests.Load() == 0 || metricRequests.Load() == 0 {
+		t.Fatalf("fake collectors requests: traces=%d metrics=%d", traceRequests.Load(), metricRequests.Load())
+	}
+}
+
+func TestInitWithExportConfigOTELSignalEndpointOverridesGenericAndYAML(t *testing.T) {
+	t.Setenv(envEndpoint, "")
+	restoreGlobalTelemetry(t)
+
+	var yamlRequests, genericRequests, signalRequests atomic.Int64
+	newCollector := func(counter *atomic.Int64, path string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != path {
+				t.Errorf("collector path = %q, want %q", r.URL.Path, path)
+			}
+			counter.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}))
+	}
+	yamlServer := newCollector(&yamlRequests, "/v1/traces")
+	defer yamlServer.Close()
+	genericServer := newCollector(&genericRequests, "/v1/traces")
+	defer genericServer.Close()
+	signalServer := newCollector(&signalRequests, "/v1/traces")
+	defer signalServer.Close()
+	t.Setenv(envEndpoint, genericServer.URL)
+	t.Setenv(envTraceEndpoint, signalServer.URL+"/v1/traces")
+
+	tm, err := InitWithExportConfig(context.Background(), Config{ServiceName: "svc"}, ExportConfig{
+		Traces: OTLPExportConfig{Enabled: true, Endpoint: yamlServer.URL + "/v1/traces"},
+	})
+	if err != nil {
+		t.Fatalf("InitWithExportConfig: %v", err)
+	}
+	_, span := tm.traces.Tracer("telemetry_test").Start(context.Background(), "precedence")
+	span.End()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := tm.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if signalRequests.Load() == 0 || genericRequests.Load() != 0 || yamlRequests.Load() != 0 {
+		t.Fatalf("endpoint precedence requests: signal=%d generic=%d yaml=%d", signalRequests.Load(), genericRequests.Load(), yamlRequests.Load())
+	}
+}
+
+func TestInitWithExportConfigDisabledDoesNotEnableFromEndpointEnv(t *testing.T) {
+	restoreGlobalTelemetry(t)
+	var requests atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	t.Setenv(envEndpoint, srv.URL)
+	t.Setenv(envTraceEndpoint, "")
+	t.Setenv(envMetricEndpoint, "")
+
+	tm, err := InitWithExportConfig(context.Background(), Config{ServiceName: "svc"}, ExportConfig{})
+	if err != nil {
+		t.Fatalf("InitWithExportConfig: %v", err)
+	}
+	if tm.traces != nil || tm.metrics != nil {
+		t.Fatal("disabled signals were activated by endpoint environment variable")
+	}
+	if err := tm.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if requests.Load() != 0 {
+		t.Errorf("disabled signals sent %d requests", requests.Load())
+	}
+}
+
+func TestInitWithExportConfigRequiresEndpointForEnabledSignal(t *testing.T) {
+	t.Setenv(envEndpoint, "")
+	t.Setenv(envTraceEndpoint, "")
+	t.Setenv(envMetricEndpoint, "")
+	_, err := InitWithExportConfig(context.Background(), Config{ServiceName: "svc"}, ExportConfig{
+		Traces: OTLPExportConfig{Enabled: true},
+	})
+	if !apperr.Is(err, apperr.CodeInvalidArgument) {
+		t.Fatalf("error = %v, want INVALID_ARGUMENT", err)
+	}
+}
+
+func TestInitWithExportConfigRejectsCredentialEndpointWithoutEcho(t *testing.T) {
+	t.Setenv(envEndpoint, "")
+	t.Setenv(envTraceEndpoint, "")
+	t.Setenv(envMetricEndpoint, "")
+	for _, endpoint := range []string{
+		"https://user:sensitive-value@collector.example/v1/traces",
+		"https://collector.example/v1/traces?token=sensitive-value",
+	} {
+		_, err := InitWithExportConfig(context.Background(), Config{ServiceName: "svc"}, ExportConfig{
+			Traces: OTLPExportConfig{Enabled: true, Endpoint: endpoint},
+		})
+		if !apperr.Is(err, apperr.CodeInvalidArgument) {
+			t.Fatalf("endpoint %q error = %v, want INVALID_ARGUMENT", endpoint, err)
+		}
+		if strings.Contains(err.Error(), "sensitive-value") {
+			t.Fatalf("error echoed credential component: %v", err)
+		}
+	}
+}
+
+func restoreGlobalTelemetry(t *testing.T) {
+	t.Helper()
+	prevTP := otel.GetTracerProvider()
+	prevMP := otel.GetMeterProvider()
+	prevProp := otel.GetTextMapPropagator()
+	t.Cleanup(func() {
+		otel.SetTracerProvider(prevTP)
+		otel.SetMeterProvider(prevMP)
+		otel.SetTextMapPropagator(prevProp)
+	})
 }
 
 func contains(ss []string, want string) bool {

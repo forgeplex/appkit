@@ -67,7 +67,9 @@ func TestSchemaGuidanceScaffoldMatrix(t *testing.T) {
 			}
 			assertRendered(t, dir)
 			assertGoParses(t, dir)
-			mustContain(t, "config/dev.yaml", readFile(t, dir, "config/dev.yaml"), "security:", "mode: disabled", "staging/prod")
+			mustContain(t, "config/dev.yaml", readFile(t, dir, "config/dev.yaml"),
+				"security:", "mode: disabled", "staging/prod",
+				"telemetry:", "traces:", "metrics:", "enabled: false")
 			mustContain(t, "Makefile", readFile(t, dir, "Makefile"), "run-minimal:", "-minimal")
 			if !tc.system {
 				for _, name := range []string{"cmd/sampled/main.go", "internal/module/module.go"} {

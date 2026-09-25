@@ -14,6 +14,14 @@ database:
 log:
   level: debug
   format: text
+telemetry:
+  # 用配置显式启停；启用后填写完整的 signal endpoint（含 /v1/traces 或 /v1/metrics）。
+  traces:
+    enabled: false
+    # endpoint: http://127.0.0.1:4318/v1/traces
+  metrics:
+    enabled: false
+    # endpoint: http://127.0.0.1:4318/v1/metrics
 debug:
   # disabled 模式下 pprof 无身份保护，只能在可信本机临时打开；严格模式仅
   # internal_service/mixed 可启用，并要求已验证的服务身份。
