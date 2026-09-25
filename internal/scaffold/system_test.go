@@ -73,11 +73,13 @@ func TestSystemScaffold(t *testing.T) {
 
 	t.Run("配置与部署说明", func(t *testing.T) {
 		mustContain(t, "config/dev.yaml", readFile(t, dir, "config/dev.yaml"),
-			"env: dev", "security:", "mode: disabled", "env=dev", "staging/prod")
+			"env: dev", "security:", "mode: disabled", "env=dev", "staging/prod",
+			"telemetry:", "traces:", "metrics:", "enabled: false", "/v1/traces", "/v1/metrics")
 		mustContain(t, "Makefile", readFile(t, dir, "Makefile"), "run-minimal:", "-minimal")
 		mustContain(t, "config/prod.yaml", readFile(t, dir, "config/prod.yaml"),
 			"env: prod", "security:", `mode: ""`, "user_facing",
-			"internal_service/mixed", "fail closed", "pprof: false")
+			"internal_service/mixed", "fail closed", "pprof: false",
+			"telemetry:", "traces:", "metrics:", "enabled: false", "otel.example.com/v1/traces", "otel.example.com/v1/metrics")
 		mustContain(t, "deploy/README.md", readFile(t, dir, "deploy/README.md"),
 			"-target=all", "-target=relay",
 			"security.mode", "AuthnPublicKey", "AuthnIssuer", "internal_service/mixed",

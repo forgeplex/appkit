@@ -214,12 +214,7 @@ func NewCore(ctx context.Context, options ProfileOptions) (*Core, error) {
 		return nil, fmt.Errorf("%s: PostgreSQL capability 需要 database.url", options.Service)
 	}
 
-	tel, err := telemetry.Init(ctx, telemetry.Config{
-		ServiceName: options.Service,
-		Env:         base.Env,
-		LogLevel:    base.Log.Level,
-		LogFormat:   base.Log.Format,
-	})
+	tel, err := initTelemetry(ctx, copts, options.Service, base.Env, base.Log.Level, base.Log.Format)
 	if err != nil {
 		return nil, fmt.Errorf("%s: 初始化遥测: %w", options.Service, err)
 	}
