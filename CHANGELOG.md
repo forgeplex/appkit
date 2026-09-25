@@ -2,6 +2,24 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.9.9（2026-09-25）
+
+v0.9.9 — stability policy candidate and documentation corrections
+
+This release records the candidate v1.0 stability surface and clarifies the
+distinction between stable candidates and experimental capabilities. It also
+adds API compatibility coverage for the nested lint module.
+
+- Add a candidate stability and version-support policy. Support duration and
+  deprecation windows remain undecided pending maintainer ownership under #43;
+  this release is not a v1.0 Go/No-Go decision.
+- Correct the GUIDE WebSocket hub example to use the configured limits API.
+- Extend CI API compatibility checks to the nested lint module.
+- Keep Streaming, Headless, and Contribution APIs explicitly experimental; no
+  cross-project runtime acceptance or promotion to stable is claimed.
+
+No public API, runtime behavior, or database migration changed.
+
 ## v0.9.8（2026-09-25）
 
 v0.9.8 — reproducible framework checks in CI
