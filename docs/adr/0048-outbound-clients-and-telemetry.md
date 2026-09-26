@@ -47,6 +47,8 @@ AppKit 是共享 Go 框架：新增公开 API 必须纯加法；根包/tx 不能
 - 新增的通用 HTTP 基础负责安全 transport、连接复用、超时、trace propagation 和低基数 client 指标；不擅自加入自动 retry。调用方可注入受限的标准库 HTTP transport 配置，但不能绕过 secure client 的 TLS/redirect/credential 防护。
 - WSS 复用 `httpserver.DialSecureWebSocket` 与生成式 `Dial<Method>WebSocketV2`，之后通过共享 outbound foundation 统一 metrics、trace 和配置来源；不另起一套协议实现。
 - 客户端目标地址由消费方配置/组合根拥有；telemetry collector 地址属于 AppKit 的 telemetry 配置。AppKit 不把业务服务注册表或业务 endpoint 命名强加给各域服务。
+- HTTP foundation 的首个实现切片 [#103](https://github.com/forgeplex/appkit/issues/103) 冻结为 `outbound.NewClient(outbound.Options)`、`(*outbound.Client).Do` 与 `CloseIdleConnections`；Option 仅含 timeout 和可克隆的标准 `*http.Transport`。所有重定向拒绝，URL credentials 禁止，TLS 1.2+ 校验不允许绕过，错误脱敏归一化为 `apperr.Error`。框架不增加应用级重试，标准库 transport 自身的透明行为不另行改变。
+- 该切片的指标名为 `appkit.http.client.request` 与 `appkit.http.client.request.duration`，属性只含标准化 `http.request.method`、`http.response.status_class` 与 `appkit.outcome`。client span 只记录标准化 method 与有限状态码，不记录 URL/path/query、header、payload 或错误文本。
 
 ### 2. Streaming client 与传输形态
 

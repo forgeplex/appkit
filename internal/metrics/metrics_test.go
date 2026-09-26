@@ -159,6 +159,7 @@ func TestRecordedAttributes(t *testing.T) {
 	OutboxDead(ctx, "ledger.entry.posted")
 	JobRun(ctx, "ledger.cleanup", OutcomeSkipped, start)
 	DBQueryOp(ctx, Operation("SELECT 1"), nil, start)
+	HTTPClientCall(ctx, "private-method", "unexpected-status", context.DeadlineExceeded, start)
 
 	ms := collect(t)
 
@@ -198,6 +199,17 @@ func TestRecordedAttributes(t *testing.T) {
 	if !hasAttrs(attrsOf(t, find(t, ms, "appkit.db.query.duration")),
 		map[string]string{AttrOperation: "SELECT", AttrOutcome: OutcomeOK}) {
 		t.Error("数据库指标标签集不符")
+	}
+	httpAttrs := map[string]string{
+		"http.request.method":        "other",
+		"http.response.status_class": "other",
+		AttrOutcome:                  OutcomeTimeout,
+	}
+	if !hasAttrs(attrsOf(t, find(t, ms, "appkit.http.client.request")), httpAttrs) {
+		t.Error("HTTP client counter 标签集不符")
+	}
+	if !hasAttrs(attrsOf(t, find(t, ms, "appkit.http.client.request.duration")), httpAttrs) {
+		t.Error("HTTP client duration 标签集不符")
 	}
 }
 
