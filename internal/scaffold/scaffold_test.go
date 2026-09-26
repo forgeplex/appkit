@@ -8,9 +8,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"testing"
+
+	"golang.org/x/mod/modfile"
 )
 
 // TestNameValidation 校验域名/系统名与 module path 的入口检查。
@@ -51,6 +54,31 @@ func TestNameValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPgxVersionFallbackTracksModule(t *testing.T) {
+	oldReadBuildInfo := readBuildInfo
+	readBuildInfo = func() (*debug.BuildInfo, bool) { return nil, false }
+	t.Cleanup(func() { readBuildInfo = oldReadBuildInfo })
+
+	data, err := os.ReadFile(filepath.Join(appkitRoot(t), "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	moduleFile, err := modfile.Parse("go.mod", data, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, require := range moduleFile.Require {
+		if require.Mod.Path != "github.com/jackc/pgx/v5" {
+			continue
+		}
+		if got := pgxVersion(); got != require.Mod.Version {
+			t.Fatalf("BuildInfo 不可用时生成 pgx 版本 %s，want go.mod require %s", got, require.Mod.Version)
+		}
+		return
+	}
+	t.Fatal("go.mod 未声明 github.com/jackc/pgx/v5")
 }
 
 // TestEnsureFreshDir 拒绝写入非空目录。

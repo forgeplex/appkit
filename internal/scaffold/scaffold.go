@@ -122,16 +122,20 @@ func newData(o Options, envPrefix string) tmplData {
 	return d
 }
 
+const defaultPgxVersion = "v5.11.0"
+
+var readBuildInfo = debug.ReadBuildInfo
+
 // pgxVersion 从自身构建信息取 pgx 版本，保证生成 go.mod 与 appkit 依赖一致。
 func pgxVersion() string {
-	if info, ok := debug.ReadBuildInfo(); ok {
+	if info, ok := readBuildInfo(); ok {
 		for _, dep := range info.Deps {
 			if dep.Path == "github.com/jackc/pgx/v5" {
 				return dep.Version
 			}
 		}
 	}
-	return "v5.10.0" // 兜底：与 appkit 当前 require 一致
+	return defaultPgxVersion // 兜底：与 appkit 当前 require 一致
 }
 
 // fileSpec 把一个模板映射到输出路径；路径中的 "NAME" 以域名/系统名替换。
