@@ -1286,6 +1286,33 @@ bootstrap 的 `internal_service` / `mixed` 需要有效服务验签器。上述 
 caller/租户/分区由接收端 ServiceVerifier 从授权后的签名声明重建。
 配置示例与限制见 [服务认证](SERVICE_AUTH.md)。
 
+非契约型的 HTTP 出站调用可使用 `outbound` 包复用连接、TLS 校验、取消、脱敏
+trace 和低基数请求指标；它只负责通用传输，不提供服务身份凭证，不替代契约
+生成 client 或 `contract.NewSecureHTTPClient`：
+
+```go
+client, err := outbound.NewClient(outbound.Options{Timeout: 5 * time.Second})
+if err != nil {
+    return err
+}
+defer client.CloseIdleConnections()
+
+req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+if err != nil {
+    return err
+}
+resp, err := client.Do(req)
+if err != nil {
+    return err
+}
+defer resp.Body.Close()
+```
+
+client 只接受 HTTP(S)，拒绝 URL credentials 和所有重定向；TLS 至少 1.2 且必须
+验证证书。`Do` 不添加应用级自动重试，`ctx` 控制请求的取消/截止时间。span 不含
+目标 URL，指标只记录标准化 method、HTTP status class 和 outcome；response body
+由调用方关闭。此 API 不会注入契约 `callctx` 或服务凭证。
+
 生成的 server `serve` 仍会把请求头里的 callctx 合并回 ctx，但在正常
 `App.Run` 严格模式下，它收到的已是信任边界清洗后的头。裸挂生成 handler
 只适合契约单测，不是绕过根边界的生产装配方式。

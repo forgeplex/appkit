@@ -88,6 +88,8 @@ var durationBuckets = []float64{
 
 type instruments struct {
 	contract           metric.Float64Histogram
+	httpClient         metric.Int64Counter
+	httpClientDuration metric.Float64Histogram
 	outbox             metric.Float64Histogram
 	dead               metric.Int64Counter
 	job                metric.Float64Histogram
@@ -118,6 +120,9 @@ var inst = sync.OnceValue(func() *instruments {
 	result := &instruments{
 		contract: histogram(m, "appkit.contract.call.duration",
 			"跨模块契约调用耗时（进程内与远程同口径）"),
+		httpClient: counter(m, "appkit.http.client.request", "出站 HTTP 请求数量"),
+		httpClientDuration: histogram(m, "appkit.http.client.request.duration",
+			"出站 HTTP 请求耗时"),
 		outbox: histogram(m, "appkit.outbox.delivery.duration",
 			"outbox relay 单条事件的投递耗时"),
 		dead: counter(m, "appkit.outbox.dead", "投递重试达上限、转入死信的事件数"),
@@ -301,6 +306,40 @@ func ContractCall(ctx context.Context, system, method, code string, start time.T
 		attrs = append(attrs, attribute.String(AttrErrorCode, code))
 	}
 	inst().contract.Record(ctx, since(start), metric.WithAttributes(attrs...))
+}
+
+// HTTPClientCall records one outbound request using only bounded attributes.
+func HTTPClientCall(ctx context.Context, method, statusClass string, err error, start time.Time) {
+	method = boundedHTTPMethod(method)
+	if statusClass != "1xx" && statusClass != "2xx" && statusClass != "3xx" &&
+		statusClass != "4xx" && statusClass != "5xx" {
+		statusClass = OutcomeOther
+	}
+	outcome := OutcomeOK
+	if err != nil {
+		outcome = OutcomeError
+		if errors.Is(err, context.Canceled) {
+			outcome = OutcomeCanceled
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			outcome = OutcomeTimeout
+		}
+	}
+	attrs := metric.WithAttributes(
+		attribute.String("http.request.method", method),
+		attribute.String("http.response.status_class", statusClass),
+		attribute.String(AttrOutcome, outcome),
+	)
+	inst().httpClient.Add(ctx, 1, attrs)
+	inst().httpClientDuration.Record(ctx, since(start), attrs)
+}
+
+func boundedHTTPMethod(method string) string {
+	switch strings.ToUpper(method) {
+	case "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE":
+		return strings.ToUpper(method)
+	default:
+		return OutcomeOther
+	}
 }
 
 // StreamOpened 记录一次成功建立的 Local Contract Stream。
