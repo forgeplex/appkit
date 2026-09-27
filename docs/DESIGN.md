@@ -202,11 +202,11 @@ psp-contracts/
   CI 跑 oasdiff（对 openapi.yaml 判破坏性）与 drift check（生成物未手改）→ tag。
 - HTTP 形态唯一：全方法 POST + JSON body，错误一律 problem+json。
   契约调用是 RPC 语义而非 REST 资源语义，client/server 编解码因此只有一份约定。
-- `version: 1` 永远只表达 Unary；生成物与 OpenAPI 保持逐字节兼容。`version: 2`
+- `version: 1` 永远只表达 Unary；生成 API、调用语义与 OpenAPI 保持兼容。`version: 2`
   显式声明 Unary、Server Stream 或 Bidi Stream，Streaming interface 与 V1 `Service`
   分离，生成至独立 `_v2` 文件。V2 OpenAPI 以 `x-appkit-call-shape` 和
   `x-appkit-stream` 扩展描述方向、cursor 映射和应用终态元数据；V2 Unary 可生成
-  HTTP client/server，Server Stream 生成 POST + SSE server adapter，Bidi 生成 WSS
+  HTTP client/server，Server Stream 生成 POST + SSE client/server adapter，Bidi 生成 WSS
   client/server adapter，并复用 `contract.OpenLocal` 的生命周期与有界队列。WebSocket
   Upgrade 前遵守分类路由和认证边界，Upgrade 后不刷新凭证；Host 通过受管 Hub 跟踪
   hijacked socket。Hub/每连接的连接数、应用 data 帧与 payload 速率必须显式有界；
@@ -654,6 +654,8 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 
 | 规则 | 落点 | 强度 |
 |---|---|---|
+| SSE 不暴露双向能力 | `contract.ServerStream[T]` 仅含 `Recv/Close`，生成式 SSE dial 返回该接口；`ClientStream` 保留双向方法 | ★ 类型/代码生成级；Local/SSE/WSS 的共同接收语义由 `streamtest.VerifyServer` 验证，双向另由 `Verify` 验证 |
+| 出站自动观测不削弱服务认证与传输策略 | 生成 Unary 与 `NewSecureHTTPClient` 共用 `outbound.InstrumentTransport`；SSE/WSS 复用 secure client，101 body 保留升级接口；HTTPConfig 只提供连接预算 | ▲ 生成装配 + 运行时守卫 + TLS/collector 测试；手写 transport 仍可绕过观测，配置不能证明下游运行时启用 |
 | Stream 不继承 Unary 调用期限与值边界 | `contract.OpenLocal` 显式校验事务、应用 `Firewall`、根最大时长/idle policy 与有界双向队列；`contract/streamtest` 锁定 Local 行为；SSE 与 WSS adapter 分别锁定 framing、per-frame deadline、背压、取消、终态、凭证过期及 Host drain | ▲ 运行时 + 本地/HTTP 集成测试；含 Local、SSE 与 WSS 传输测试，不代表 required CI、下游运行、发布或业务验收 |
 | WebSocket 连接准入与应用消息速率有有限边界 | `NewWebSocketHubWithLimits` 要求显式 `MaxConnections` 与双向帧/字节速率及 burst；Hub 在 Upgrade 前原子计算 pending+active；每连接只对应用 `data` 帧 paced backpressure；旧无界 Hub 无法 Start/接纳 Upgrade | ▲ Hub/连接运行时守卫 + 并发/速率/取消本地测试；仅单 Hub 与单连接预算，不是跨副本全局配额 |
 | 同契约的多个实例不误回退到无名绑定 | `ProvideContractNamed` / `ResolveNamed` 精确匹配 `(Go 类型, 实例名)`，共享启动期重复/缺失/循环检查 | ▲ 运行时装配级；名字不是租户隔离或消费方 binding manifest |

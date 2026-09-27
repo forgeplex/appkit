@@ -226,3 +226,70 @@ func mustRequest(t *testing.T, method, target string) *http.Request {
 	}
 	return req
 }
+
+func TestInstrumentTransportPreservesUpgradeAndRecordsHandshake(t *testing.T) {
+	previous := otel.GetTracerProvider()
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	otel.SetTracerProvider(provider)
+	t.Cleanup(func() {
+		_ = provider.Shutdown(context.Background())
+		otel.SetTracerProvider(previous)
+	})
+	body := &upgradeTestBody{}
+	base := roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusSwitchingProtocols, Body: body}, nil
+	})
+	transport := InstrumentTransport(base)
+	if InstrumentTransport(transport) != transport {
+		t.Fatal("repeated instrumentation must be idempotent")
+	}
+	response, err := transport.RoundTrip(mustRequest(t, http.MethodGet, "https://example.test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Body != body {
+		t.Fatal("101 upgrade body must retain its read/write capabilities and identity")
+	}
+	if _, ok := response.Body.(io.ReadWriteCloser); !ok {
+		t.Fatal("instrumentation removed WebSocket write capability")
+	}
+	if len(recorder.Ended()) != 1 {
+		t.Fatal("handshake span must end before the long-lived upgrade body closes")
+	}
+}
+
+func TestInstrumentTransportClearsNoncanonicalTraceHeaders(t *testing.T) {
+	transport := InstrumentTransport(roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		for name, values := range request.Header {
+			for _, value := range values {
+				if strings.Contains(value, "forged") || strings.EqualFold(name, "baggage") {
+					t.Errorf("untrusted trace header was forwarded: %s", name)
+				}
+			}
+		}
+		return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+	}))
+	request := mustRequest(t, http.MethodGet, "https://example.test")
+	request.Header["traceparent"] = []string{"forged"}
+	request.Header["tRaCeStAtE"] = []string{"forged=value"}
+	request.Header["bAgGaGe"] = []string{"secret=value"}
+	response, err := transport.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = response.Body.Close()
+	if request.Header["traceparent"][0] != "forged" {
+		t.Fatal("instrumentation mutated caller headers")
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
+
+type upgradeTestBody struct{}
+
+func (*upgradeTestBody) Read([]byte) (int, error)    { return 0, io.EOF }
+func (*upgradeTestBody) Write(p []byte) (int, error) { return len(p), nil }
+func (*upgradeTestBody) Close() error                { return nil }

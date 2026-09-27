@@ -14,6 +14,7 @@ import (
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
+	"github.com/forgeplex/appkit/outbound"
 )
 
 // Client 是 greet 契约的远程绑定：与进程内 wrapper（wrap.gen.go）实现
@@ -39,7 +40,7 @@ func NewClient(base, caller string, hc *http.Client) *Client {
 		hc = &http.Client{}
 	}
 	inner := *hc
-	inner.Transport = callctx.Transport{Base: hc.Transport, Caller: caller}
+	inner.Transport = callctx.Transport{Base: outbound.InstrumentTransport(hc.Transport), Caller: caller}
 	return &Client{base: strings.TrimSuffix(base, "/"), hc: &inner}
 }
 

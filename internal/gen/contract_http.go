@@ -38,6 +38,7 @@ func renderClient(doc *contractDoc) []byte {
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
+	"github.com/forgeplex/appkit/outbound"
 )
 
 `)
@@ -54,7 +55,7 @@ func renderClient(doc *contractDoc) []byte {
 	b.WriteString("// 「忘了装 Transport」这个静默失效形态在生成 client 里不存在。\n")
 	b.WriteString("func NewClient(base, caller string, hc *http.Client) *Client {\n")
 	b.WriteString("\tif hc == nil {\n\t\thc = &http.Client{}\n\t}\n")
-	b.WriteString("\tinner := *hc\n\tinner.Transport = callctx.Transport{Base: hc.Transport, Caller: caller}\n")
+	b.WriteString("\tinner := *hc\n\tinner.Transport = callctx.Transport{Base: outbound.InstrumentTransport(hc.Transport), Caller: caller}\n")
 	b.WriteString("\treturn &Client{base: strings.TrimSuffix(base, \"/\"), hc: &inner}\n}\n\n")
 	b.WriteString(`// NewSecureClient 返回显式认证的 HTTPS 契约 client。Audience 与服务凭证
 // provider 必填；每次尝试取新凭证，拒绝过期凭证、不安全 transport 和重定向。

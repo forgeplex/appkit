@@ -117,6 +117,9 @@ func parseContractV2Source(sourceName string, data []byte) (*contractDocV2, erro
 			if err := reserveV2Name(declared, "New"+m.Name+"SSEHandlerV2", "SSE handler for "+m.Name); err != nil {
 				return nil, fmt.Errorf("%s: %w", at, err)
 			}
+			if err := reserveV2Name(declared, "Dial"+m.Name+"SSEV2", "SSE client for "+m.Name); err != nil {
+				return nil, fmt.Errorf("%s: %w", at, err)
+			}
 		}
 		if m.Kind == "server_stream" || m.Kind == "bidi_stream" {
 			if err := reserveV2Name(declared, "Open"+m.Name+"LocalV2", "Local stream opener for "+m.Name); err != nil {

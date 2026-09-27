@@ -17,11 +17,11 @@ func renderClientV2(doc *contractDocV2) []byte {
 		b.WriteString("\t\"encoding/json\"\n\t\"io\"\n\t\"net/http\"\n\t\"strings\"\n\t\"time\"\n")
 	}
 	b.WriteString("\n\t\"github.com/forgeplex/appkit/contract\"\n")
-	if hasV2BidiStream(doc) {
+	if hasV2Streaming(doc) {
 		b.WriteString("\t\"github.com/forgeplex/appkit/httpserver\"\n")
 	}
 	if hasV2Unary(doc) {
-		b.WriteString("\t\"github.com/forgeplex/appkit/apperr\"\n\t\"github.com/forgeplex/appkit/callctx\"\n")
+		b.WriteString("\t\"github.com/forgeplex/appkit/apperr\"\n\t\"github.com/forgeplex/appkit/callctx\"\n\t\"github.com/forgeplex/appkit/outbound\"\n")
 	}
 	b.WriteString(")\n\n")
 
@@ -35,11 +35,28 @@ func renderClientV2(doc *contractDocV2) []byte {
 	}
 	if hasV2Streaming(doc) {
 		renderV2LocalStreamingClient(&b, doc)
+		renderV2SSEClient(&b, doc)
 	}
 	if hasV2BidiStream(doc) {
 		renderV2WebSocketClient(&b, doc)
 	}
 	return b.Bytes()
+}
+
+func renderV2SSEClient(b *bytes.Buffer, doc *contractDocV2) {
+	for _, m := range doc.Methods {
+		if m.Kind != "server_stream" {
+			continue
+		}
+		request, response := v2RequestType(m), v2ResponseType(m)
+		param, arg := "", "struct{}{}"
+		if len(m.Request) > 0 {
+			param, arg = ", req "+request, "req"
+		}
+		fmt.Fprintf(b, "// Dial%sSSEV2 opens the secure remote receive-only Server Stream for %s.\n// cfg.LastEventID is the application-owned resume cursor; this client does not reconnect or replay.\nfunc Dial%sSSEV2(ctx context.Context, address string, cfg httpserver.SSEClientConfig, secure contract.SecureClientOptions%s) (contract.ServerStream[httpserver.SSEEvent[%s]], error) {\n", m.Name, m.Path, m.Name, param, response)
+		fmt.Fprintf(b, "\tcfg.System, cfg.Method = %q, %q\n", doc.System, m.Name)
+		fmt.Fprintf(b, "\treturn httpserver.DialSecureSSE[%s, %s](ctx, address, cfg, secure, %s)\n}\n\n", request, response, arg)
+	}
 }
 
 func renderV2WebSocketClient(b *bytes.Buffer, doc *contractDocV2) {
@@ -98,7 +115,7 @@ func renderV2UnaryWrapper(b *bytes.Buffer, doc *contractDocV2) {
 
 func renderV2HTTPClient(b *bytes.Buffer, doc *contractDocV2) {
 	b.WriteString("// ClientV2 is the generated remote binding for V2 Unary methods.\ntype ClientV2 struct { base string; hc *http.Client; secure bool }\n\n")
-	b.WriteString("// NewClientV2 is the legacy/dev entry point; production callers should use NewSecureClientV2.\nfunc NewClientV2(base, caller string, hc *http.Client) *ClientV2 {\n\tif hc == nil { hc = &http.Client{} }\n\tinner := *hc\n\tinner.Transport = callctx.Transport{Base: hc.Transport, Caller: caller}\n\treturn &ClientV2{base: strings.TrimSuffix(base, \"/\"), hc: &inner}\n}\n\n")
+	b.WriteString("// NewClientV2 is the legacy/dev entry point; production callers should use NewSecureClientV2.\nfunc NewClientV2(base, caller string, hc *http.Client) *ClientV2 {\n\tif hc == nil { hc = &http.Client{} }\n\tinner := *hc\n\tinner.Transport = callctx.Transport{Base: outbound.InstrumentTransport(hc.Transport), Caller: caller}\n\treturn &ClientV2{base: strings.TrimSuffix(base, \"/\"), hc: &inner}\n}\n\n")
 	b.WriteString("// NewSecureClientV2 creates the authenticated HTTPS client for V2 Unary methods.\nfunc NewSecureClientV2(base string, opts contract.SecureClientOptions) (*ClientV2, error) {\n\thc, err := contract.NewSecureHTTPClient(base, opts)\n\tif err != nil { return nil, err }\n\treturn &ClientV2{base: strings.TrimSuffix(base, \"/\"), hc: hc, secure: true}, nil\n}\n\n")
 	b.WriteString("var _ ServiceV2 = (*ClientV2)(nil)\n\n")
 	for _, m := range doc.Methods {
@@ -187,7 +204,7 @@ func renderV2Retry(b *bytes.Buffer) {
 }
 
 func renderV2LocalStreamingClient(b *bytes.Buffer, doc *contractDocV2) {
-	b.WriteString("// StreamReaderV2 is a receive-only view returned by generated Server Stream local openers.\ntype StreamReaderV2[T any] interface { Recv(context.Context) (T, error); Close() error }\n\ntype streamReaderV2[T any] struct { inner contract.ClientStream[struct{}, T] }\nfunc (r streamReaderV2[T]) Recv(ctx context.Context) (T, error) { return r.inner.Recv(ctx) }\nfunc (r streamReaderV2[T]) Close() error { return r.inner.Close() }\n\ntype streamSenderAdapterV2[T any] struct { peer contract.Stream[T, struct{}] }\nfunc (s streamSenderAdapterV2[T]) Send(ctx context.Context, value T) error { return s.peer.Send(ctx, value) }\n\n")
+	b.WriteString("// StreamReaderV2 preserves the generated receive-only API and shares the contract Server Stream capability.\ntype StreamReaderV2[T any] interface { contract.ServerStream[T] }\n\ntype streamReaderV2[T any] struct { inner contract.ClientStream[struct{}, T] }\nfunc (r streamReaderV2[T]) Recv(ctx context.Context) (T, error) { return r.inner.Recv(ctx) }\nfunc (r streamReaderV2[T]) Close() error { return r.inner.Close() }\n\ntype streamSenderAdapterV2[T any] struct { peer contract.Stream[T, struct{}] }\nfunc (s streamSenderAdapterV2[T]) Send(ctx context.Context, value T) error { return s.peer.Send(ctx, value) }\n\n")
 	for _, m := range doc.Methods {
 		switch m.Kind {
 		case "server_stream":

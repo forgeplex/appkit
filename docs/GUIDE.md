@@ -639,11 +639,13 @@ appkit contract-check -base feedv2/contract.yaml -candidate feedv2-next/contract
 
 V2 会生成 `service_v2.gen.go`、`client_v2.gen.go`、`server_v2.gen.go` 和
 `openapi_v2.yaml`。V2 Unary 有独立的 `ServiceV2`、HTTP client/server 与
-`WrapServiceV2`；Server Stream 生成 Local opener 和 `New<Method>SSEHandlerV2`；
+`WrapServiceV2`；Server Stream 生成 Local opener、`New<Method>SSEHandlerV2`
+和 `Dial<Method>SSEV2`，后者返回 `contract.ServerStream[httpserver.SSEEvent[Response]]`；
 Bidi 生成 transport-neutral 接口、Local opener、`New<Method>WebSocketHandlerV2`
 和 `Dial<Method>WebSocketV2`。OpenAPI 用 `x-appkit-call-shape` /
 `x-appkit-stream` 扩展表达流形态；不生成 AsyncAPI。V1 五份生成文件与 OpenAPI
-保持逐字节稳定，V1 schema 也拒绝 V2 流形态字段。
+保持 API 与调用语义兼容；重新生成后 Unary client 自动接入共享出站观测。
+V1 schema 仍拒绝 V2 流形态字段。
 
 ### Local 双向 Stream
 
@@ -872,6 +874,58 @@ Adapter 前直接拒绝。
 `X-Accel-Buffering: no`，但部署时仍需检查每一层代理/网关是否缓冲并配置其 flush
 策略。客户端断开会取消生产 Context；Host Shutdown 先 drain 在途请求，到达预算后
 强制关闭。可运行的 API 形态示例见 `httpserver/sse_example_test.go`。
+
+客户端使用 `httpserver.DialSecureSSE[Request, Event](ctx, address, cfg, secure, request)`，
+生成契约则使用 `Dial<Method>SSEV2`。`address` 是完整 HTTPS 路由；`secure` 是与
+Unary/WSS 共用的 `contract.SecureClientOptions`，服务凭证由 provider 提供。
+`SSEClientConfig` 包含固定 `System`/`Method`、`Stream`、正数
+`MaxRequestBodyBytes`/`MaxEventBytes` 和可选 `LastEventID`。例如：
+
+```go
+stream, err := httpserver.DialSecureSSE[StreamRequest, StreamEvent](
+    ctx, endpoint,
+    httpserver.SSEClientConfig{
+        System: "feed", Method: "Watch",
+        Stream: contract.StreamConfig{
+            MaxDuration: 10 * time.Minute, IdleTimeout: time.Minute,
+            CloseTimeout: time.Second, QueueSize: 4,
+        },
+        MaxRequestBodyBytes: 64 << 10, MaxEventBytes: 256 << 10,
+        LastEventID: cursor,
+    },
+    secure, request,
+)
+if err != nil {
+    return err
+}
+defer stream.Close()
+for {
+    event, err := stream.Recv(ctx)
+    if errors.Is(err, io.EOF) {
+        return nil
+    }
+    if err != nil {
+        return err
+    }
+    consume(event.Data, event.ID)
+}
+```
+
+`contract.ServerStream[T]` 只提供 `Recv/Close`；SSE 开流时只发送一次 JSON POST，
+没有 `Send/CloseSend`。V2 无 request 字段的方法不带 `request` 参数，生成器自动发送
+`{}`。WSS 保持 `contract.ClientStream[Send, Receive]` 的双向能力。
+开流前错误同步返回；流建立后的 `error` 事件只恢复稳定错误码，远端 message 不进错误链。
+逐次 `Recv` 的操作取消不关闭整条流，根取消或 `Close` 才关闭连接；客户端还限制
+最大时长、应用 idle、关闭等待和凭证有效期。注释心跳不延长应用 idle。
+
+解析器支持分行 JSON data、LF/CRLF/CR、注释和 opaque id；`MaxEventBytes` 限制包括
+注释在内的每个事件块；以 CR 派发时允许紧随其后的一个 LF framing 字节，派发不会等待
+该字节。无 id 的事件继承上一个 id，空 id 清除 cursor。只识别
+AppKit 的默认 message 与 error 事件，不实现浏览器 EventSource、自动重连或 replay。
+完整帧边界的 EOF 表示响应结束；未完成 data 帧或网络读取失败返回 `UNAVAILABLE`。
+由于 wire 协议没有独立的完成标记，完整帧之后的干净断流不能证明业务完成，业务应使用
+DTO 中的终态。共享一致性套件 `streamtest.VerifyServer` 覆盖 Local/SSE/WSS 的接收
+能力，`streamtest.Verify` 单独覆盖 Local/WSS 双向能力。
 
 然后：
 
@@ -1312,6 +1366,35 @@ client 只接受 HTTP(S)，拒绝 URL credentials 和所有重定向；TLS 至�
 验证证书。`Do` 不添加应用级自动重试，`ctx` 控制请求的取消/截止时间。span 不含
 目标 URL，指标只记录标准化 method、HTTP status class 和 outcome；response body
 由调用方关闭。此 API 不会注入契约 `callctx` 或服务凭证。
+
+重新生成的 V1/V2 Unary client、`NewSecureHTTPClient`、SSE POST 和 WSS 握手共用
+`outbound.InstrumentTransport` 的 trace 与低基数 RED 观测；既有构造签名、重试和安全
+语义保持不变。WSS 的 HTTP span 在 101 Upgrade 时结束，连接 body 保留双向能力，
+后续流生命周期、帧和字节由既有 Stream/Transport 指标记录。业务无需初始化 OTel SDK
+或手工为这些客户端埋点，exporter 仍由服务的 `telemetry` 配置统一启停。
+
+连接策略可由消费方自己的 YAML 配置字段解码为 `outbound.HTTPConfig`：
+
+```yaml
+upstream_http:
+  timeout: 0s
+  dial_timeout: 3s
+  tls_handshake_timeout: 3s
+  response_header_timeout: 10s
+  idle_conn_timeout: 90s
+  max_idle_conns: 100
+  max_idle_conns_per_host: 10
+  max_conns_per_host: 20
+```
+
+消费方配置结构用 `HTTP outbound.HTTPConfig` 配合 `koanf:"upstream_http"`，加载后调用
+`cfg.HTTP.HTTPClient()`，将结果传给生成客户端或 `SecureClientOptions.HTTPClient`。
+普通 outbound client 可将该标准 `*http.Transport` 和 `Timeout` 传给 `outbound.Options`。
+此 helper 只装配连接预算，不携带目标地址或凭证；信任根由组合根单独注入标准 transport。
+零值保留标准库 transport 默认值，负数拒绝。流式调用通常保持 `timeout: 0s`，由显式
+`Stream` 预算控制全流；非零 HTTP Timeout 对 Unary/SSE 覆盖整个响应 body，WSS dialer
+只将它应用于握手，升级后由 `Stream` 管理。响应头预算对 SSE
+同样约束等待首个 flush，需与服务端首帧/heartbeat 策略匹配。
 
 生成的 server `serve` 仍会把请求头里的 callctx 合并回 ctx，但在正常
 `App.Run` 严格模式下，它收到的已是信任边界清洗后的头。裸挂生成 handler

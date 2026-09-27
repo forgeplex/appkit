@@ -13,6 +13,8 @@ import (
 
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/callctx"
+	"github.com/forgeplex/appkit/internal/outboundstate"
+	"github.com/forgeplex/appkit/outbound"
 	"go.opentelemetry.io/otel/propagation"
 )
 
@@ -127,8 +129,9 @@ func NewSecureHTTPClient(base string, opts SecureClientOptions) (*http.Client, e
 	if config.RootCAs != nil {
 		config.RootCAs = config.RootCAs.Clone()
 	}
-	hc.Transport = &serviceTransport{base: transport, origin: origin, audience: opts.Audience, provider: opts.Credentials}
-	hc.CheckRedirect = func(*http.Request, []*http.Request) error {
+	hc.Transport = outbound.InstrumentTransport(&serviceTransport{base: transport, origin: origin, audience: opts.Audience, provider: opts.Credentials})
+	hc.CheckRedirect = func(request *http.Request, _ []*http.Request) error {
+		outboundstate.RefuseRedirect(request)
 		return apperr.PermissionDenied("secure contract redirects are forbidden")
 	}
 	return &hc, nil

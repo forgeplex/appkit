@@ -1,17 +1,17 @@
 # ADR-0048：出站客户端与配置驱动观测
 
-- 状态：Accepted（架构与配置语义已冻结；后续切片仍分别评审 Go API 名称/签名）
+- 状态：Accepted（架构与配置语义已冻结；实现 API 见 #100、#103、#105）
 - 日期：2026-09-25
-- 关联：[Epic #97](https://github.com/forgeplex/appkit/issues/97)、[Phase 0 #98](https://github.com/forgeplex/appkit/issues/98)、[已完成的宿主与流式 Epic #47](https://github.com/forgeplex/appkit/issues/47)
+- 关联：[Epic #97](https://github.com/forgeplex/appkit/issues/97)、[Phase 0 #98](https://github.com/forgeplex/appkit/issues/98)、[客户端接入与一致性 #105](https://github.com/forgeplex/appkit/issues/105)、[已完成的宿主与流式 Epic #47](https://github.com/forgeplex/appkit/issues/47)
 - 基线：`main@21b7eb80e2bc15972bbab78d60e88b077ea2fee9`，release `v0.9.9`
 
 本 ADR 是新能力的架构提案。它描述语义、边界和测试要求；具体 Go 类型/函数签名由后续实现 issue 冻结。ADR 合并前可修改，未接受前不得据此宣称客户端 API 稳定。
 
 ## 背景
 
-AppKit 已有契约代码生成的 Unary HTTP client、安全 `contract.NewSecureHTTPClient`、SSE 服务端 `POST + SSE` adapter、WSS 双向 client、`contract.ClientStream` 以及 Local/WSS streaming。SSE 远端 client 尚缺。流生命周期和 SSE/WSS Transport 已有自动 span/metric 埋点。
+Phase 0 基线已有契约代码生成的 Unary HTTP client、安全 `contract.NewSecureHTTPClient`、SSE 服务端 `POST + SSE` adapter、WSS 双向 client、`contract.ClientStream` 以及 Local/WSS streaming，当时尚缺 SSE 远端 client。流生命周期和 SSE/WSS Transport 已有自动 span/metric 埋点。
 
-Bootstrap 已从 YAML 加载服务配置并自动初始化 Telemetry；但 `telemetry.Config` 不含 exporter endpoint 或独立 signal 开关，trace/metric SDK 当前主要由 `OTEL_EXPORTER_OTLP_ENDPOINT` 是否存在来门控。业务服务不应各自构造 OTel provider，也不应为框架 client 重复埋点。
+Phase 0 基线的 Bootstrap 已从 YAML 加载服务配置并自动初始化 Telemetry；但 `telemetry.Config` 不含 exporter endpoint 或独立 signal 开关，trace/metric SDK 当时主要由 `OTEL_EXPORTER_OTLP_ENDPOINT` 是否存在来门控。业务服务不应各自构造 OTel provider，也不应为框架 client 重复埋点。
 
 AppKit 是共享 Go 框架：新增公开 API 必须纯加法；根包/tx 不能暴露第三方类型；既有导出结构体不能因追加字段破坏无键字面量调用方。AppKit 管通用传输、生命周期、安全和观测，不承接 Provider、Relay、Slack、Session、业务终态等应用语义。
 
@@ -118,3 +118,13 @@ Epic #97 出站客户端与配置驱动观测
 ```
 
 每个实现切片应由独立 issue 冻结 API 名称/签名、错误语义、配置字段和验收命令；本 ADR 已接受架构/配置语义，但新 client API 仍须经过对应实现切片的审查，并依照既有稳定性政策取得消费者与运行时证据后才能宣称稳定。
+
+## #105 实现接口与验收边界
+
+- 共享配置为 `outbound.HTTPConfig`，`HTTPClient()` 生成可独立复用的标准 transport；目标与凭证仍由消费方组合根拥有。字段对应 Timeout、DialTimeout、TLSHandshakeTimeout、ResponseHeaderTimeout、IdleConnTimeout 与连接池数量限制，零值保留标准库默认值，负数拒绝。WSS 的 HTTP Timeout 仅约束握手，SSE/Unary 则覆盖整个 response body。
+- 共享观测入口为 `outbound.InstrumentTransport(http.RoundTripper) http.RoundTripper`。重新生成的 Unary client 与 `NewSecureHTTPClient` 自动装配；SSE/WSS 复用 secure client。HTTP span/RED 不改变调用返回值或重试策略，101 保留双向 body 并在握手时结束 HTTP span。
+- `contract.ServerStream[T]` 只含 `Recv/Close`；`httpserver.DialSecureSSE[Request,Event]` 返回 `ServerStream[SSEEvent[Event]]`，配置为 `SSEClientConfig`。生成式 `Dial<Method>SSEV2` 保留 cursor，没有 request 字段时自动发送空 JSON 对象。既有 `ClientStream` 与 WSS 签名保持不变。
+- SSE 的最大时长/idle 在开流前开始计时，操作取消只影响本次 `Recv`，Close/根取消/凭证到期终止整个请求。首响应问题同步返回，in-band 错误只恢复稳定 code。解析器支持 UTF-8 BOM、三种换行、多行 data、注释与 opaque id；按 wire block 限制内存，未知 event name 拒绝。严格拒绝截断 data，不实现 EventSource 的重连与 replay。没有 wire end marker，因此完整帧边界后的干净 EOF 只表示响应结束。
+- `streamtest.VerifyServer` 对 Local/SSE/WSS 验证共同的接收语义；`Verify` 保持 Local/WSS 双向 conformance。fake OTLP collector 测试经 Bootstrap YAML 自动装配验证客户端 span 与 RED；TLS 集成测试锁定 WSS 升级、服务凭证、SSE cursor、解析限额、超时与取消。
+
+这些接口属于框架实现与回归范围；Streaming 仍按 ADR-0047 保持实验性。源码、本地/CI 验证与 PR 合并不构成发版、下游部署或业务验收证据。
