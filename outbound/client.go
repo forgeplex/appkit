@@ -2,7 +2,6 @@
 package outbound
 
 import (
-	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -10,11 +9,11 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/internal/metrics"
+	"github.com/forgeplex/appkit/internal/outboundstate"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -34,10 +33,6 @@ type Client struct {
 	http *http.Client
 }
 
-type requestStateKey struct{}
-
-type requestState struct{ redirectRefused atomic.Bool }
-
 // NewClient builds a client with TLS verification, HTTP(S)-only requests,
 // redirect refusal, and bounded telemetry. It adds no application-level retries;
 // standard library transport behavior is otherwise unchanged.
@@ -45,11 +40,25 @@ func NewClient(options Options) (*Client, error) {
 	if options.Timeout < 0 {
 		return nil, apperr.InvalidArgument("outbound HTTP timeout must not be negative")
 	}
-	base := options.Transport
+	transport, err := cloneTransport(options.Transport)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{http: &http.Client{
+		Transport: InstrumentTransport(transport),
+		Timeout:   options.Timeout,
+		CheckRedirect: func(request *http.Request, _ []*http.Request) error {
+			outboundstate.RefuseRedirect(request)
+			return apperr.PermissionDenied("outbound HTTP redirects are forbidden")
+		},
+	}}, nil
+}
+
+func cloneTransport(base *http.Transport) (*http.Transport, error) {
 	if base == nil {
 		var ok bool
 		base, ok = http.DefaultTransport.(*http.Transport)
-		if !ok {
+		if !ok || base == nil {
 			return nil, apperr.Internal(errors.New("default transport is not a standard HTTP transport"))
 		}
 	}
@@ -74,16 +83,10 @@ func NewClient(options Options) (*Client, error) {
 	if tlsConfig.MinVersion == 0 {
 		tlsConfig.MinVersion = tls.VersionTLS12
 	}
-	return &Client{http: &http.Client{
-		Transport: instrumentedTransport{base: transport},
-		Timeout:   options.Timeout,
-		CheckRedirect: func(request *http.Request, _ []*http.Request) error {
-			if state, ok := request.Context().Value(requestStateKey{}).(*requestState); ok {
-				state.redirectRefused.Store(true)
-			}
-			return apperr.PermissionDenied("outbound HTTP redirects are forbidden")
-		},
-	}}, nil
+	if tlsConfig.RootCAs != nil {
+		tlsConfig.RootCAs = tlsConfig.RootCAs.Clone()
+	}
+	return transport, nil
 }
 
 // Do performs one request. The request context controls cancellation and
@@ -97,8 +100,6 @@ func (c *Client) Do(request *http.Request) (*http.Response, error) {
 		u.User != nil || u.Opaque != "" || u.Fragment != "" {
 		return nil, apperr.InvalidArgument("outbound HTTP request requires an HTTP(S) URL without credentials or fragment")
 	}
-	state := &requestState{}
-	request = request.WithContext(context.WithValue(request.Context(), requestStateKey{}, state))
 	resp, err := c.http.Do(request)
 	if err != nil {
 		if apperr.Is(err, apperr.CodePermissionDenied) {
@@ -123,43 +124,81 @@ func (e safeTransportError) Unwrap() error { return e.cause }
 
 type instrumentedTransport struct{ base http.RoundTripper }
 
-func (t instrumentedTransport) CloseIdleConnections() {
+// InstrumentTransport adds bounded HTTP client spans and metrics without
+// changing the base transport's security, timeout or redirect policy. A nil
+// transport uses http.DefaultTransport; wrapping its own result is idempotent.
+// It propagates only W3C trace context, never baggage or incoming trace headers.
+// Ordinary spans end at response-body EOF/Close; an HTTP 101 span ends at the
+// handshake and leaves the upgraded bidirectional body unchanged.
+func InstrumentTransport(base http.RoundTripper) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if _, ok := base.(*instrumentedTransport); ok {
+		return base
+	}
+	return &instrumentedTransport{base: base}
+}
+
+func (t *instrumentedTransport) CloseIdleConnections() {
 	if closer, ok := t.base.(interface{ CloseIdleConnections() }); ok {
 		closer.CloseIdleConnections()
 	}
 }
 
-func (t instrumentedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+func (t *instrumentedTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request == nil {
+		return nil, apperr.InvalidArgument("outbound HTTP request is required")
+	}
 	method := normalizeMethod(request.Method)
 	ctx, span := otel.Tracer("github.com/forgeplex/appkit/outbound").Start(
 		request.Context(), "HTTP "+method, trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attribute.String("http.request.method", method)),
 	)
 	started := time.Now()
-	state, _ := request.Context().Value(requestStateKey{}).(*requestState)
+	state := &outboundstate.State{}
+	ctx = outboundstate.WithContext(ctx, state)
 	cloned := request.Clone(ctx)
 	if cloned.Header == nil {
 		cloned.Header = make(http.Header)
 	}
-	cloned.Header.Del("Traceparent")
-	cloned.Header.Del("Tracestate")
-	cloned.Header.Del("Baggage")
+	for name := range cloned.Header {
+		switch strings.ToLower(name) {
+		case "traceparent", "tracestate", "baggage":
+			delete(cloned.Header, name)
+		}
+	}
 	propagation.TraceContext{}.Inject(ctx, propagation.HeaderCarrier(cloned.Header))
 	response, err := t.base.RoundTrip(cloned)
 	statusClass := "other"
+	failedStatus := false
 	if response != nil {
-		statusClass = fmt.Sprintf("%dxx", response.StatusCode/100)
+		// Keep the actual request's sanitized headers, adding only observation
+		// state to an independent copy. CheckRedirect can then report refusal
+		// even when http.Client.Timeout hides the instrumented response body.
+		sent := response.Request
+		if sent == nil {
+			sent = cloned
+		}
+		response.Request = sent.WithContext(outboundstate.WithContext(sent.Context(), state))
+		failedStatus = response.StatusCode >= http.StatusBadRequest
+		if response.StatusCode >= 100 && response.StatusCode < 600 {
+			statusClass = fmt.Sprintf("%dxx", response.StatusCode/100)
+		}
 		span.SetAttributes(attribute.Int("http.response.status_code", response.StatusCode))
 	}
 	var finishOnce sync.Once
 	finish := func(callErr error) {
 		finishOnce.Do(func() {
-			if callErr == nil && state != nil && state.redirectRefused.Load() {
+			if callErr == nil && state.RedirectRefused.Load() {
 				callErr = apperr.PermissionDenied("outbound HTTP redirects are forbidden")
 			}
+			if callErr == nil && failedStatus {
+				callErr = errors.New("outbound HTTP response failed")
+			}
 			if callErr != nil {
-				span.RecordError(errors.New("outbound HTTP transport failed"))
-				span.SetStatus(codes.Error, "outbound HTTP transport failed")
+				span.RecordError(errors.New("outbound HTTP request failed"))
+				span.SetStatus(codes.Error, "outbound HTTP request failed")
 			}
 			metrics.HTTPClientCall(ctx, method, statusClass, callErr, started)
 			span.End()
@@ -167,7 +206,7 @@ func (t instrumentedTransport) RoundTrip(request *http.Request) (*http.Response,
 	}
 	if err != nil {
 		finish(err)
-	} else if response == nil || response.Body == nil {
+	} else if response == nil || response.Body == nil || response.StatusCode == http.StatusSwitchingProtocols {
 		finish(nil)
 	} else {
 		response.Body = &observedBody{ReadCloser: response.Body, finish: finish}
@@ -207,4 +246,4 @@ func normalizeMethod(method string) string {
 	}
 }
 
-var _ http.RoundTripper = instrumentedTransport{}
+var _ http.RoundTripper = (*instrumentedTransport)(nil)

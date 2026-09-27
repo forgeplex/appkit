@@ -15,6 +15,7 @@ import (
 	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
 	"github.com/forgeplex/appkit/httpserver"
+	"github.com/forgeplex/appkit/outbound"
 )
 
 // wrappedServiceV2 applies contract.Call to V2 Unary implementations.
@@ -48,7 +49,7 @@ func NewClientV2(base, caller string, hc *http.Client) *ClientV2 {
 		hc = &http.Client{}
 	}
 	inner := *hc
-	inner.Transport = callctx.Transport{Base: hc.Transport, Caller: caller}
+	inner.Transport = callctx.Transport{Base: outbound.InstrumentTransport(hc.Transport), Caller: caller}
 	return &ClientV2{base: strings.TrimSuffix(base, "/"), hc: &inner}
 }
 
@@ -120,11 +121,8 @@ func retryUnavailableV2[T any](ctx context.Context, fn func() (T, error)) (T, er
 	return value, err
 }
 
-// StreamReaderV2 is a receive-only view returned by generated Server Stream local openers.
-type StreamReaderV2[T any] interface {
-	Recv(context.Context) (T, error)
-	Close() error
-}
+// StreamReaderV2 preserves the generated receive-only API and shares the contract Server Stream capability.
+type StreamReaderV2[T any] interface{ contract.ServerStream[T] }
 
 type streamReaderV2[T any] struct {
 	inner contract.ClientStream[struct{}, T]
@@ -166,6 +164,20 @@ func OpenChatLocalV2(ctx context.Context, cfg contract.StreamConfig, svc Streami
 	return contract.OpenLocal[ChatRequestV2, ChatResponseV2](ctx, "greet", "Chat", cfg, func(ctx context.Context, peer contract.Stream[ChatResponseV2, ChatRequestV2]) error {
 		return svc.Chat(ctx, peer)
 	})
+}
+
+// DialWatchSSEV2 opens the secure remote receive-only Server Stream for /v2/watch.
+// cfg.LastEventID is the application-owned resume cursor; this client does not reconnect or replay.
+func DialWatchSSEV2(ctx context.Context, address string, cfg httpserver.SSEClientConfig, secure contract.SecureClientOptions, req WatchRequestV2) (contract.ServerStream[httpserver.SSEEvent[WatchResponseV2]], error) {
+	cfg.System, cfg.Method = "greet", "Watch"
+	return httpserver.DialSecureSSE[WatchRequestV2, WatchResponseV2](ctx, address, cfg, secure, req)
+}
+
+// DialTailSSEV2 opens the secure remote receive-only Server Stream for /v2/tail.
+// cfg.LastEventID is the application-owned resume cursor; this client does not reconnect or replay.
+func DialTailSSEV2(ctx context.Context, address string, cfg httpserver.SSEClientConfig, secure contract.SecureClientOptions) (contract.ServerStream[httpserver.SSEEvent[TailResponseV2]], error) {
+	cfg.System, cfg.Method = "greet", "Tail"
+	return httpserver.DialSecureSSE[struct{}, TailResponseV2](ctx, address, cfg, secure, struct{}{})
 }
 
 // DialChatWebSocketV2 opens the secure remote Bidi Stream for /v2/chat.

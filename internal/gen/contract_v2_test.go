@@ -52,6 +52,16 @@ func TestContractV2RenderAndOpenAPI(t *testing.T) {
 	if strings.Contains(service, "type Service interface") {
 		t.Fatal("V2 widened or replaced the existing V1 Service interface")
 	}
+	client := string(files["client_v2.gen.go"])
+	for _, want := range []string{
+		"DialWatchSSEV2(ctx context.Context, address string, cfg httpserver.SSEClientConfig, secure contract.SecureClientOptions, req WatchRequestV2) (contract.ServerStream[httpserver.SSEEvent[WatchResponseV2]], error)",
+		"DialTailSSEV2(ctx context.Context, address string, cfg httpserver.SSEClientConfig, secure contract.SecureClientOptions) (contract.ServerStream[httpserver.SSEEvent[TailResponseV2]], error)",
+		"httpserver.DialSecureSSE[struct{}, TailResponseV2](ctx, address, cfg, secure, struct{}{})",
+	} {
+		if !strings.Contains(client, want) {
+			t.Errorf("V2 client missing %q", want)
+		}
+	}
 	var openapi struct {
 		OpenAPI string `yaml:"openapi"`
 		Paths   map[string]struct {
@@ -92,7 +102,7 @@ func TestContractV2RenderAndOpenAPI(t *testing.T) {
 
 func TestContractV2RejectsGeneratedDeclarationCollisions(t *testing.T) {
 	base := string(mustRead(t, "testdata/contract_v2.yaml"))
-	for _, name := range []string{"Client", "NewHTTPHandler", "StreamSender", "OpenWatchLocal"} {
+	for _, name := range []string{"Client", "NewHTTPHandler", "StreamSender", "OpenWatchLocal", "DialWatchSSE", "DialTailSSE"} {
 		t.Run(name, func(t *testing.T) {
 			input := strings.ReplaceAll(base, "EventMeta", name)
 			_, err := RenderContractSource("collision-v2.yaml", []byte(input))
