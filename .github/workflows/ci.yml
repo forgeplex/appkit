@@ -12,22 +12,24 @@ permissions:
 jobs:
   ci:
     runs-on: arc-forgeplex-runner
-    services:
-      postgres:
-        image: postgres:18.6@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
-        env:
-          POSTGRES_PASSWORD: appkit
-          POSTGRES_DB: appkit_test
-        ports:
-          - 55499:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d appkit_test"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     env:
       TEST_DATABASE_URL: postgres://postgres:appkit@127.0.0.1:55499/appkit_test?sslmode=disable
     steps:
+      - name: Start disposable PostgreSQL 18
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="/usr/lib/postgresql/18/bin:$PATH" LD_LIBRARY_PATH=/opt/pg-deps
+          root=$(mktemp -d /tmp/webhook-db-test.XXXXXXXX)
+          echo "APPKIT_TEST_DB_ROOT=$root" >> "$GITHUB_ENV"
+          mkdir "$root/socket"
+          initdb -D "$root/data" --no-locale --encoding=UTF8 -U postgres --auth-local=trust --auth-host=scram-sha-256 --pwfile=<(echo appkit)
+          pg_ctl -D "$root/data" -l "$root/server.log" -o "-h 127.0.0.1 -p 55499 -k $root/socket -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.max=100000" -w start
+          createdb -h "$root/socket" -p 55499 -U postgres appkit_test
+          psql -X -v ON_ERROR_STOP=1 -h "$root/socket" -p 55499 -U postgres -d appkit_test -c 'CREATE EXTENSION pg_stat_statements'
+          echo "WEBHOOK_TEST_DATABASE_URL=postgresql:///appkit_test?host=$root/socket&port=55499&user=postgres&sslmode=disable" >> "$GITHUB_ENV"
+          echo "WEBHOOK_TEST_DISPOSABLE=1" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # apidiff 门禁需要完整历史与 tag
@@ -86,3 +88,10 @@ jobs:
             exit 1
           fi
           echo "lint module 相对 $base 无破坏性变更"
+
+      - name: Stop disposable PostgreSQL
+        if: ${{ always() && env.APPKIT_TEST_DB_ROOT != '' }}
+        run: |
+          if [[ -f "$APPKIT_TEST_DB_ROOT/data/postmaster.pid" ]]; then
+            LD_LIBRARY_PATH=/opt/pg-deps /usr/lib/postgresql/18/bin/pg_ctl -D "$APPKIT_TEST_DB_ROOT/data" -m fast -w stop
+          fi
