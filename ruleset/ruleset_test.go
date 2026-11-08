@@ -271,16 +271,16 @@ func TestDomainCI_隔离数据库满足域测试安全契约(t *testing.T) {
 	s := string(body)
 	for _, required := range []string{
 		"TEST_DATABASE_URL: postgres://postgres:appkit@127.0.0.1:55499/appkit_test?sslmode=disable",
-		"mktemp -d /tmp/webhook-db-test.XXXXXXXX",
+		"/tmp/webhook-db-test\\.[A-Za-z0-9]{8}/socket",
 		"WEBHOOK_TEST_DATABASE_URL=postgresql:///appkit_test?host=",
 		"WEBHOOK_TEST_DISPOSABLE=1",
-		"--publish 127.0.0.1:55499:5432",
-		"--tmpfs /var/lib/postgresql:rw,noexec,nosuid,size=512m",
-		"shared_preload_libraries=pg_stat_statements",
+		"SHOW listen_addresses",
+		"== 127.0.0.1",
+		"SHOW data_directory",
+		"== /arc-data/db",
+		"$2 == \"/arc-data\" && $3 == \"tmpfs\"",
+		"nosuid noexec size=524288k",
 		"CREATE EXTENSION pg_stat_statements",
-		"if: ${{ always() }}",
-		"unlink -- \"$entry\"",
-		"rmdir -- \"$APPKIT_TEST_DB_ROOT/socket\" \"$APPKIT_TEST_DB_ROOT\"",
 	} {
 		if !strings.Contains(s, required) {
 			t.Errorf("domain-ci.yml 缺少数据库隔离条件 %q", required)

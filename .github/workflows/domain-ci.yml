@@ -30,14 +30,21 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="/usr/lib/postgresql/18/bin:$PATH" LD_LIBRARY_PATH=/opt/pg-deps
-          root=$(mktemp -d /tmp/webhook-db-test.XXXXXXXX)
-          echo "APPKIT_TEST_DB_ROOT=$root" >> "$GITHUB_ENV"
-          mkdir "$root/socket"
-          initdb -D "$root/data" --no-locale --encoding=UTF8 -U postgres --auth-local=trust --auth-host=scram-sha-256 --pwfile=<(echo appkit)
-          pg_ctl -D "$root/data" -l "$root/server.log" -o "-h 127.0.0.1 -p 55499 -k $root/socket -c shared_preload_libraries=pg_stat_statements -c pg_stat_statements.max=100000" -w start
-          createdb -h "$root/socket" -p 55499 -U postgres appkit_test
-          psql -X -v ON_ERROR_STOP=1 -h "$root/socket" -p 55499 -U postgres -d appkit_test -c 'CREATE EXTENSION pg_stat_statements'
-          echo "WEBHOOK_TEST_DATABASE_URL=postgresql:///appkit_test?host=$root/socket&port=55499&user=postgres&sslmode=disable" >> "$GITHUB_ENV"
+          touch /tmp/arc-start-postgres
+          for ((attempt=0; attempt<60; attempt++)); do
+            pg_isready -h 127.0.0.1 -p 55499 -U postgres && break
+            sleep 1
+          done
+          socket=$(cat /tmp/arc-postgres-socket)
+          [[ "$socket" =~ ^/tmp/webhook-db-test\.[A-Za-z0-9]{8}/socket$ ]]
+          export PGHOST="$socket" PGPORT=55499 PGUSER=postgres
+          [[ $(psql -XAtd postgres -c 'SHOW listen_addresses') == 127.0.0.1 ]]
+          [[ $(psql -XAtd postgres -c 'SHOW data_directory') == /arc-data/db ]]
+          mount=$(psql -XAtd postgres -c "SELECT pg_read_file('/proc/self/mounts')" | awk '$2 == "/arc-data" && $3 == "tmpfs" {print $4}')
+          for flag in nosuid noexec size=524288k; do [[ ",$mount," == *",$flag,"* ]]; done
+          createdb appkit_test
+          psql -X -v ON_ERROR_STOP=1 -d appkit_test -c 'CREATE EXTENSION pg_stat_statements'
+          echo "WEBHOOK_TEST_DATABASE_URL=postgresql:///appkit_test?host=$socket&port=55499&user=postgres&sslmode=disable" >> "$GITHUB_ENV"
           echo "WEBHOOK_TEST_DISPOSABLE=1" >> "$GITHUB_ENV"
 
       - name: gofmt 检查
@@ -110,10 +117,3 @@ jobs:
         run: |
           go mod tidy
           git diff --exit-code go.mod go.sum
-
-      - name: Stop disposable PostgreSQL
-        if: ${{ always() && env.APPKIT_TEST_DB_ROOT != '' }}
-        run: |
-          if [[ -f "$APPKIT_TEST_DB_ROOT/data/postmaster.pid" ]]; then
-            LD_LIBRARY_PATH=/opt/pg-deps /usr/lib/postgresql/18/bin/pg_ctl -D "$APPKIT_TEST_DB_ROOT/data" -m fast -w stop
-          fi
