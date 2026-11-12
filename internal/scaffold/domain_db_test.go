@@ -2,13 +2,21 @@ package scaffold
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 
+	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/internal/dbtest"
+	"github.com/forgeplex/appkit/pgmigrate"
+	"github.com/forgeplex/appkit/pgtx"
 )
 
 // 脚手架声明的 sqlc NUMERIC override 必须真能过 pgx。
@@ -92,5 +100,61 @@ func roundTripDecimal(t *testing.T) {
 	}
 	if maybe != nil {
 		t.Fatalf("NULL 应扫描为 nil *decimal.Decimal，实际 %v", *maybe)
+	}
+}
+
+// 租户形态的生成物必须自身通过严格隔离校验（pgtx.VerifyTenantIsolation）。
+//
+// 这条用例把三件各自独立演进的东西锁在一起，任何一件单独改动都会让它变红：
+// 库函数写出去的策略与函数文本（校验要认）、基础迁移建的基础设施表（校验的
+// 免声明清单要覆盖）、样例业务表（不能是一张没声明的无租户表）。golden 只锁
+// 文本，这里把生成的迁移真应用到库里再校验。
+func TestDomainTenantMigrationsPassStrictIsolation(t *testing.T) {
+	pool := dbtest.Pool(t)
+	ctx := context.Background()
+	role := pgx.Identifier{fmt.Sprintf("scaffold_iso_%d", time.Now().UnixNano())}.Sanitize()
+	if _, err := pool.Exec(ctx, "CREATE ROLE "+role+" NOLOGIN NOBYPASSRLS"); err != nil {
+		t.Fatalf("建角色: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.WithoutCancel(ctx), "DROP ROLE IF EXISTS "+role) })
+
+	for _, mode := range []struct {
+		name        string
+		partitioned bool
+	}{
+		{name: "租户域"},
+		{name: "分区加行级", partitioned: true},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			// 域名即 schema 名（带前缀形态的迁移里写死了它），取一个不会撞的。
+			domain := fmt.Sprintf("iso%d", time.Now().UnixNano())
+			schema := domain
+			if mode.partitioned {
+				schema = domain + "_p1" // 分区 schema 由组合根映射决定，与域名无关
+			}
+			dir := filepath.Join(t.TempDir(), domain)
+			if err := Domain(Options{Name: domain, Dir: dir, Tenant: true, Partitioned: mode.partitioned}, nil); err != nil {
+				t.Fatalf("Domain: %v", err)
+			}
+			t.Cleanup(func() {
+				_, _ = pool.Exec(context.WithoutCancel(ctx),
+					"DROP SCHEMA IF EXISTS "+pgx.Identifier{schema}.Sanitize()+" CASCADE")
+			})
+			if err := pgmigrate.Runner(pool)(ctx, []appkit.MigrationSet{{
+				Schema: schema, FS: os.DirFS(filepath.Join(dir, "db", "migrations")), Module: domain,
+			}}); err != nil {
+				t.Fatalf("应用生成的迁移: %v", err)
+			}
+			err := pool.AcquireFunc(ctx, func(c *pgxpool.Conn) error {
+				defer func() { _, _ = c.Exec(ctx, "RESET ROLE") }()
+				if _, err := c.Exec(ctx, "SET ROLE "+role); err != nil {
+					return err
+				}
+				return pgtx.VerifyTenantIsolation(ctx, c, schema)
+			})
+			if err != nil {
+				t.Fatalf("生成物应通过严格隔离校验，实际：\n%v", err)
+			}
+		})
 	}
 }

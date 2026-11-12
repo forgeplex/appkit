@@ -58,11 +58,11 @@ func TestTenantPolicySQLGolden(t *testing.T) {
 		`ALTER TABLE "files"."documents" FORCE ROW LEVEL SECURITY;`,
 		`DROP POLICY IF EXISTS tenant_isolation ON "files"."documents";`,
 		`CREATE POLICY tenant_isolation ON "files"."documents"`,
-		`USING (tenant_id = "files".appkit_current_tenant())`,
-		`WITH CHECK (tenant_id = "files".appkit_current_tenant())`,
+		`USING (tenant_id = (SELECT "files".appkit_current_tenant()))`,
+		`WITH CHECK (tenant_id = (SELECT "files".appkit_current_tenant()))`,
 		`DROP POLICY IF EXISTS tenant_isolation_read_all ON "files"."documents";`,
 		`CREATE POLICY tenant_isolation_read_all ON "files"."documents" FOR SELECT`,
-		`USING ("files".appkit_read_all_tenants())`,
+		`USING ((SELECT "files".appkit_read_all_tenants()))`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("TenantPolicySQL 缺少 %q：\n%s", want, got)
@@ -72,9 +72,9 @@ func TestTenantPolicySQLGolden(t *testing.T) {
 	for _, want := range []string{
 		`ALTER TABLE "documents" FORCE ROW LEVEL SECURITY;`,
 		`CREATE POLICY tenant_isolation ON "documents"`,
-		`USING (tenant_id = appkit_current_tenant())`,
+		`USING (tenant_id = (SELECT appkit_current_tenant()))`,
 		`CREATE POLICY tenant_isolation_read_all ON "documents" FOR SELECT`,
-		`USING (appkit_read_all_tenants())`,
+		`USING ((SELECT appkit_read_all_tenants()))`,
 	} {
 		if !strings.Contains(bare, want) {
 			t.Errorf("TenantPolicySQLBare 缺少 %q：\n%s", want, bare)

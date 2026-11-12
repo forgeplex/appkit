@@ -609,10 +609,20 @@ tenant 用无前缀的 `TenantScopeSQLBare` / `TenantPolicySQLBare`，逐分区�
 3. **RLS 策略**（`pgtx.TenantPolicySQL`）：ENABLE + **FORCE** + 隔离策略
    （USING/WITH CHECK 都比对 tenant_id）+ 读全部策略（见 4）。FORCE 必须有：
    应用角色通常就是表主，不 FORCE 则 RLS 对它是装饰；WITH CHECK 拦住「把
-   别家的 tenant_id 写进去」。启动期 `pgtx.VerifyTenantRLS` 校验完整性：有
-   tenant_id 列的表必须四件齐，且连接角色不得 superuser/BYPASSRLS
-   （否则 RLS 静默不生效），缺一样拒绝启动、点名表并附修复 SQL。输出可
-   重复应用（策略先 DROP IF EXISTS）：升级后在新迁移里再调一次即刷新。
+   别家的 tenant_id 写进去」。策略里的函数调用包在标量子查询里
+   （`tenant_id = (SELECT f())`）：整条语句只求值一次，而不是在逐行过滤的
+   计划里逐行调 plpgsql。输出可重复应用（策略先 DROP IF EXISTS）：升级后
+   在新迁移里再调一次即刷新。
+
+   启动期校验分两档。`pgtx.VerifyTenantRLS` 按名点检：有 tenant_id 列的表
+   必须四件齐，且连接角色不得 superuser/BYPASSRLS（否则 RLS 静默不生效），
+   缺一样拒绝启动、点名表并附修复 SQL。`pgtx.VerifyTenantIsolation` 是严格
+   形态，另外校验按名点检看不见的三件事：策略与上下文函数的**定义**必须是
+   库函数的输出（同名策略或函数被改成恒真，点名拒绝）；租户表上不得另挂
+   PERMISSIVE 策略（同类策略取并集，多一条就是放宽）；没有 tenant_id 列的
+   表必须经 `pgtx.TenantExempt` 显式豁免——「故意不隔离」与「忘了加列」
+   不再长得一样，与 `MountPublic` 是同一个道理。两种策略写法（裸调用 /
+   子查询包裹）严格校验都认，存量域切过去不需要补迁移。
 4. **读全部模式**（`tx.WithReadAllTenants`）：跨租户的管理面读路径——运营看
    全部商户的订单、全局搜索、总览看板——在用例里过了跨租户权限码之后打
    标记再 `Do`，事务落第二个 GUC `app.tenant_scope=all`，策略
@@ -694,7 +704,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 分区域域的 schema 由调用方确定 | 迁移/查询无前缀 + 事务级 `SET LOCAL search_path`（`pgtx.NewRouted` 按 `callctx.Meta.Partition` 查组合根注入的映射）；查询必须经 `tx.Do`，事务外落默认 search_path 即「表不存在」报错 | ★ 运行时级：路由失败（查无分区）即回滚 422，无法静默落到错误分区 |
 | 分区键与业务租户不共用一个字段 | `callctx.Meta.Partition` 与 `Meta.TenantID` 各自一个字段、各自的头与事件 meta 键；分区路由只读前者、RLS 只读后者。此前共用 TenantID 的判例：rbac 分区经事件 meta 被 email 当业务租户查询 | ▲ 具名字段降低误用；两者仍是 string，编译器不保证业务赋值正确，存量域须迁移并做回归 |
 | 分区域域的 SQL 无前缀纪律 | `partitioned: true` 时 archcheck 前缀规则翻转（任何 schema 前缀违规，无 DB 即拦）；sqlc 编译器兜底——带前缀与无前缀两个世界各自封闭，混写双向都是编译错误 | ▲ CI 级 + ★ 编译器级 |
-| 租户域跨租户泄漏 | RLS（ENABLE+FORCE+隔离策略+读全部策略，`pgtx.TenantPolicySQL`）+ 事务级 GUC（`pgtx.NewTenant` / `NewRoutedTenant` 的 Do）；Setup 期 `pgtx.VerifyTenantRLS` 校验完整性（缺任一件/角色 superuser 或 BYPASSRLS 即拒启，点名表并附修复 SQL） | ★ 运行时级：漏写 WHERE 只会查不到行/写入被拒，且缺件启动即暴露 |
+| 租户域跨租户泄漏 | RLS（ENABLE+FORCE+隔离策略+读全部策略，`pgtx.TenantPolicySQL`）+ 事务级 GUC（`pgtx.NewTenant` / `NewRoutedTenant` 的 Do）；Setup 期校验二选一：`pgtx.VerifyTenantRLS` 按名点检（缺任一件/角色 superuser 或 BYPASSRLS 即拒启，点名表并附修复 SQL），`pgtx.VerifyTenantIsolation` 另校验策略与上下文函数的定义、拒绝额外的 PERMISSIVE 策略、要求无 tenant_id 的表经 `pgtx.TenantExempt` 显式豁免 | ★ 存储级，但只对「带 tenant_id 且策略未被改动」的表成立：漏写 WHERE 只会查不到行/写入被拒。启动守卫按档标注——**按名点检是 ▲**：同名策略被改成恒真、旁边另挂一条 PERMISSIVE 策略、新建一张没有 tenant_id 的表，它都放行；严格校验把这三件变成启动即拒（★ 装配期）。脚手架生成物目前仍调用按名点检：模板的 Go 代码只能用已发布版本里的 API（`TestSchemaToolScaffoldDatabaseAdoption` 拿已发布依赖编译生成物），切换是发版之后的一行改动，在那之前新域要手工换。两档都只在启动期看一眼，启动之后再改策略要到下次启动才发现；视图不在校验视野内 |
 | 跨租户读只能是显式、只读、不传播 | `tx.WithReadAllTenants` 是进程内 ctx 标记（不进 callctx：防火墙剥掉、事件不带）；落成第二个 GUC `app.tenant_scope`，与租户值那条通道（令牌 tid）分离；策略只对 SELECT 放开，写入的 WITH CHECK 不变；标记须在最外层 Do 之前打，嵌套内切换报错 | ★ 存储级：写全部模式不存在；「谁能打标记」归 `reg.Require` 跨租户码 + 用例纪律（约定级） |
 | 分区与租户身份只能来自已验证凭证 | 严格 HTTP 边界先清除 ctx partition/tenant 与 unsigned 头；MultiIssuer 从签发方配置重建 Partition，ServiceVerifier 从授权后的签名委托重建范围 | ▲ 中间件级：标准 bootstrap 可执行；自写受信 Middleware 仍可错误地授予权限 |
 | 嵌套事务不改变外层隔离范围 | `pgtx.Do` 绑定 tenant 模式、tenant ID、read-all、实际 schema 与具体事务句柄，内层重绑或无法验证的 raw pgx.Tx 在 savepoint 前拒绝 | ★ 运行时守卫：同范围嵌套保留，错误可由外层处理；不是阻止受信代码直接执行 SET LOCAL 的 SQL 沙箱 |
