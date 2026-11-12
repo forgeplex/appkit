@@ -225,7 +225,7 @@ appkit new domain docs -tenant -dir docs
    `pgtx.VerifyTenantRLS` 点名拒绝（module.go 的 Setup，错误信息附修复 SQL）。
    输出可重复应用：升级 appkit 后在新迁移里对每张租户表再调一次
    `TenantScopeSQL` + `TenantPolicySQL` 即刷新（旧形态只有隔离策略的表，
-   verify 会点名要求补）。
+   verify 会点名要求补）。策略**原样照抄，不手改**——见下面的严格校验。
 4. **角色要求**：连接角色必须是**非 superuser 且不带 BYPASSRLS**——否则 RLS
    静默不生效，verify 同样会拦。一条 SQL 的事：
 
@@ -234,6 +234,56 @@ appkit new domain docs -tenant -dir docs
    GRANT USAGE ON SCHEMA docs TO docs_app;
    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA docs TO docs_app;
    ```
+
+**严格校验（推荐）**：`VerifyTenantRLS` 只按策略名点检、只看带 `tenant_id`
+列的表。同名策略被改成恒真、旁边另挂一条 PERMISSIVE 策略（同类策略取并集，
+多一条就是放宽）、域里新建一张没有 `tenant_id` 的表——这三件它都放行。
+`pgtx.VerifyTenantIsolation` 把它们变成启动即拒。生成物的 module.go 目前调用
+的是前者，把那一行换掉即可：
+
+```go
+// internal/module/module.go 的 Setup
+if err := pgtx.VerifyTenantIsolation(ctx, m.opts.Pool, Schema,
+    // 全部租户共用、故意不带 tenant_id 的表在这里显式列出。
+    pgtx.TenantExempt("rates", "providers"),
+); err != nil {
+    return err
+}
+```
+
+它比按名点检多校验四件事：
+
+- **覆盖面**：schema 里每张表要么带 `tenant_id` 并挂全策略，要么列在
+  `TenantExempt` 里。没有 `tenant_id` 的表不受 RLS 约束、任何查询都读得到
+  全部行，所以「故意不隔离」必须写出来，否则与「忘了加列」无从分辨。appkit
+  的基础设施表（outbox / inbox / 幂等 / 审计 / 迁移历史）不必列——按表名加
+  核心列的结构识别，域自己建的同名表（比如一张装用户消息的 `inbox`）不算，
+  照常要列；带 `tenant_id` 的表不能豁免；清单里出现不存在的表名同样报错。
+- **策略定义**：两条策略必须是 `TenantPolicySQL` 的输出——命令、PERMISSIVE、
+  TO PUBLIC、表达式、引用的函数就是本 schema 的上下文函数（按目录里的 OID
+  认，不按名字认）。
+- **没有额外的宽策略**：租户表上除这两条外不得再有 PERMISSIVE 策略；要额外
+  收紧就建 RESTRICTIVE 策略，它只会收紧，允许。
+- **上下文函数的定义**：`appkit_current_tenant()` / `appkit_read_all_tenants()`
+  必须是 `TenantScopeSQL` 的输出。
+
+存量域切过去**不需要补迁移**：v0.9.x 生成的裸调用写法（`tenant_id = f()`）
+与当前的子查询包裹写法（`tenant_id = (SELECT f())`）都认，要做的只是把无
+租户的业务表列进 `TenantExempt`——第一次启动的报错会把它们逐张点出来。想
+顺手拿到子查询包裹的好处（策略条件落成逐行过滤时不再逐行调 plpgsql），
+在新迁移里对每张租户表重跑一次 `TenantPolicySQL`。
+
+唯一认可的手写改动：某张表不该参与读全部模式（凭据、密文，连平台运营也
+不该跨租户读），把它的读全部策略写成恒假——这是收紧，严格校验放行：
+
+```sql
+DROP POLICY IF EXISTS tenant_isolation_read_all ON "docs"."credentials";
+CREATE POLICY tenant_isolation_read_all ON "docs"."credentials" FOR SELECT
+    USING (false);
+```
+
+边界：两个校验都只在启动期看一眼目录，启动之后再改策略要到下次启动才
+发现；原生分区表的父表与每个分区各自需要策略；视图不在校验视野内。
 
 **嵌套事务的范围固定**：最外层 `pgtx.Do` 确定 tenant 模式、tenant ID、
 read-all 与实际路由 schema，内层只能沿用同一范围和原 callback ctx。
@@ -281,7 +331,8 @@ appkit new domain order -partitioned -tenant -dir order
 `Meta.TenantID`）。装配用 `pgtx.NewRoutedTenant(pool, route)`：每次 `Do` 先
 `SET LOCAL search_path` 到分区，再落租户 GUC；迁移全无前缀，租户 DDL 用
 `pgtx.TenantScopeSQLBare` / `TenantPolicySQLBare`（生成物已就位）；Setup 期
-逐分区 `VerifyTenantRLS`。运营人员是分区内 `tenant_id = platform` 的普通
+逐分区 `VerifyTenantRLS`（严格形态 `VerifyTenantIsolation` 同样逐分区调，
+用法见 §3.2）。运营人员是分区内 `tenant_id = platform` 的普通
 用户，看本平台全部商户走 §3.2 的读全部模式——「全部」的边界是 schema，
 平台 a 的运营在任何模式下都碰不到平台 b 的表。
 

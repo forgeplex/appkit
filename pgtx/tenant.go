@@ -48,26 +48,46 @@ func TenantScopeSQLBare() string {
 	return tenantScopeSQL("")
 }
 
+// 两个上下文函数的名字与函数体。函数体是 $$ 之间的原文，也就是落进
+// pg_proc.prosrc 的那段文本：VerifyTenantIsolation 按它比对目录里的定义——
+// 函数被改成恒真/恒空，策略文本再规范也只是装饰。
+//
+// 已发布过的函数体必须永远留在 accepted* 列表里：域仓库的迁移是静态文本，
+// 升级 appkit 不会重写已应用的函数。改函数体 = 往列表里追加新版本，绝不是
+// 替换旧版本，否则存量域的严格校验会在升级那一刻集体变红。
+const (
+	fnCurrentTenant  = "appkit_current_tenant"
+	fnReadAllTenants = "appkit_read_all_tenants"
+
+	readAllTenantsBody = "\n" +
+		"    SELECT coalesce(current_setting('" + tenantScopeGUC + "', true), '') = 'all'\n"
+
+	currentTenantBody = "\n" +
+		"DECLARE\n    v text := nullif(current_setting('" + tenantGUC + "', true), '');\n" +
+		"BEGIN\n" +
+		"    IF v IS NULL THEN\n" +
+		"        IF coalesce(current_setting('" + tenantScopeGUC + "', true), '') = 'all' THEN\n" +
+		"            RETURN NULL;\n" +
+		"        END IF;\n" +
+		"        RAISE EXCEPTION '" + tenantGUC + " 未设置——租户域的业务查询必须经 pgtx.NewTenant 的 Do，且 ctx 带租户身份（authn 从令牌 tid 焊入 callctx）'\n" +
+		"            USING ERRCODE = '42501';\n" +
+		"    END IF;\n" +
+		"    RETURN v;\n" +
+		"END;\n"
+)
+
+var (
+	acceptedReadAllTenantsBodies = []string{readAllTenantsBody} // v0.9.0 起
+	acceptedCurrentTenantBodies  = []string{currentTenantBody}  // v0.9.0 起
+)
+
 func tenantScopeSQL(prefix string) string {
 	var b strings.Builder
 	b.WriteString("-- 租户上下文函数：RLS 策略据此取当前租户与读全部模式（appkit pgtx.TenantScopeSQL 生成）。\n")
-	fmt.Fprintf(&b, "CREATE OR REPLACE FUNCTION %sappkit_read_all_tenants() RETURNS boolean\n", prefix)
-	b.WriteString("LANGUAGE sql STABLE AS $$\n")
-	b.WriteString("    SELECT coalesce(current_setting('" + tenantScopeGUC + "', true), '') = 'all'\n")
-	b.WriteString("$$;\n")
-	fmt.Fprintf(&b, "CREATE OR REPLACE FUNCTION %sappkit_current_tenant() RETURNS text\n", prefix)
-	b.WriteString("LANGUAGE plpgsql STABLE AS $$\n")
-	b.WriteString("DECLARE\n    v text := nullif(current_setting('" + tenantGUC + "', true), '');\n")
-	b.WriteString("BEGIN\n")
-	b.WriteString("    IF v IS NULL THEN\n")
-	b.WriteString("        IF coalesce(current_setting('" + tenantScopeGUC + "', true), '') = 'all' THEN\n")
-	b.WriteString("            RETURN NULL;\n")
-	b.WriteString("        END IF;\n")
-	b.WriteString("        RAISE EXCEPTION '" + tenantGUC + " 未设置——租户域的业务查询必须经 pgtx.NewTenant 的 Do，且 ctx 带租户身份（authn 从令牌 tid 焊入 callctx）'\n")
-	b.WriteString("            USING ERRCODE = '42501';\n")
-	b.WriteString("    END IF;\n")
-	b.WriteString("    RETURN v;\n")
-	b.WriteString("END;\n$$;\n")
+	fmt.Fprintf(&b, "CREATE OR REPLACE FUNCTION %s%s() RETURNS boolean\n", prefix, fnReadAllTenants)
+	b.WriteString("LANGUAGE sql STABLE AS $$" + readAllTenantsBody + "$$;\n")
+	fmt.Fprintf(&b, "CREATE OR REPLACE FUNCTION %s%s() RETURNS text\n", prefix, fnCurrentTenant)
+	b.WriteString("LANGUAGE plpgsql STABLE AS $$" + currentTenantBody + "$$;\n")
 	return b.String()
 }
 
@@ -81,6 +101,12 @@ func tenantScopeSQL(prefix string) string {
 //   - tenant_isolation_read_all 策略：只对 SELECT、只在读全部模式
 //     （tx.WithReadAllTenants）放开全部行。同类策略取并集，所以写路径
 //     不受它影响——写永远只能落当前租户。
+//
+// 策略里的函数调用包在标量子查询里（(SELECT f())）：planner 把它提成
+// InitPlan，整条语句只求值一次；裸写 tenant_id = f() 时，凡是策略条件
+// 落成逐行过滤的计划（全表扫描、按别的索引扫描）都会逐行调一次 plpgsql。
+// 两种写法语义相同，旧写法的存量表不必为此补迁移，VerifyTenantIsolation
+// 两种都认。
 //
 // 输出可重复应用（策略先 DROP IF EXISTS 再建）：升级 appkit 后在新迁移
 // 里对每张租户表再调一次即可。迁移文件内要跨租户回填数据时，把本函数
@@ -103,14 +129,15 @@ func tenantPolicySQL(prefix, table string) string {
 	b.WriteString("-- 可重复应用：升级 appkit 后在新迁移里再调一次即刷新策略。\n")
 	fmt.Fprintf(&b, "ALTER TABLE %s ENABLE ROW LEVEL SECURITY;\n", tbl)
 	fmt.Fprintf(&b, "ALTER TABLE %s FORCE ROW LEVEL SECURITY;\n", tbl)
+	b.WriteString("-- 函数包在 (SELECT …) 里：整条语句只求值一次，而不是逐行调用。\n")
 	fmt.Fprintf(&b, "DROP POLICY IF EXISTS %s ON %s;\n", policyIsolation, tbl)
 	fmt.Fprintf(&b, "CREATE POLICY %s ON %s\n", policyIsolation, tbl)
-	fmt.Fprintf(&b, "    USING (tenant_id = %sappkit_current_tenant())\n", prefix)
-	fmt.Fprintf(&b, "    WITH CHECK (tenant_id = %sappkit_current_tenant());\n", prefix)
+	fmt.Fprintf(&b, "    USING (tenant_id = (SELECT %s%s()))\n", prefix, fnCurrentTenant)
+	fmt.Fprintf(&b, "    WITH CHECK (tenant_id = (SELECT %s%s()));\n", prefix, fnCurrentTenant)
 	b.WriteString("-- 读全部模式（tx.WithReadAllTenants）只放开 SELECT；写入仍走上面的策略，只能落当前租户。\n")
 	fmt.Fprintf(&b, "DROP POLICY IF EXISTS %s ON %s;\n", policyReadAll, tbl)
 	fmt.Fprintf(&b, "CREATE POLICY %s ON %s FOR SELECT\n", policyReadAll, tbl)
-	fmt.Fprintf(&b, "    USING (%sappkit_read_all_tenants());\n", prefix)
+	fmt.Fprintf(&b, "    USING ((SELECT %s%s()));\n", prefix, fnReadAllTenants)
 	return b.String()
 }
 
@@ -135,6 +162,12 @@ func quoteIdent(name string) string {
 // 基础设施表（outbox/idem/audit）没有 tenant_id 列，天然不在校验视野。
 // 一个租户表都没有时是 no-op——刚生成还没写业务表的域不受角色约束打搅。
 // 「分区 + 行级」的域对每个分区 schema 各调一次。
+//
+// 本函数只按策略名点检、只看带 tenant_id 列的普通表：同名策略被改写、
+// 旁边另挂一条 PERMISSIVE 策略、域里新增一张没有 tenant_id 的表，都在
+// 它的视野之外。新代码用 VerifyTenantIsolation——校验策略与上下文函数的
+// 定义、拒绝额外的宽策略、要求无租户表显式豁免。本函数为存量域保留，
+// 行为不变。
 func VerifyTenantRLS(ctx context.Context, db DB, schema string) error {
 	if !schemaRe.MatchString(schema) {
 		return fmt.Errorf("pgtx: VerifyTenantRLS 的 schema 名 %q 不合法", schema)
@@ -191,20 +224,12 @@ ORDER BY c.relname`
 		return nil
 	}
 
-	var bypass bool
-	if err := db.QueryRow(ctx,
-		"SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user").Scan(&bypass); err != nil {
-		return fmt.Errorf("pgtx: 查连接角色的 RLS 豁免: %w", err)
+	problem, err := bypassRoleProblem(ctx, db, schema)
+	if err != nil {
+		return err
 	}
-	if bypass {
-		var role string
-		_ = db.QueryRow(ctx, "SELECT current_user").Scan(&role)
-		problems = append(problems, fmt.Sprintf(
-			"连接角色 %s 是 superuser 或 BYPASSRLS——RLS 对它静默不生效，行级隔离只是装饰。"+
-				"给应用配普通角色（CREATE ROLE <app> LOGIN PASSWORD '…'; GRANT USAGE ON SCHEMA %s TO <app>; "+
-				"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA %s TO <app>），"+
-				"迁移仍可用高权限角色跑",
-			role, schema, schema))
+	if problem != "" {
+		problems = append(problems, problem)
 	}
 	if len(problems) > 0 {
 		return errors.New("pgtx: 租户域 " + schema + " 的行级隔离不完整：\n  " + strings.Join(problems, "\n  "))

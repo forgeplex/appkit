@@ -245,12 +245,13 @@ CREATE TABLE sd_test.documents (id text PRIMARY KEY, tenant_id text NOT NULL);
 		"ALTER TABLE sd_test.documents ENABLE ROW LEVEL SECURITY;",
 		"ALTER TABLE sd_test.documents FORCE ROW LEVEL SECURITY;",
 		"CREATE POLICY tenant_isolation ON sd_test.documents",
-		// 表达式是 pg_policies 的原文（含 Postgres 自己加的外层括号）。
-		"USING ((tenant_id = sd_test.appkit_current_tenant()))",
-		"WITH CHECK ((tenant_id = sd_test.appkit_current_tenant()))",
+		// 表达式是 pg_policies 的原文（含 Postgres 自己加的外层括号、标量
+		// 子查询的空格与列别名）。
+		"USING ((tenant_id = ( SELECT sd_test.appkit_current_tenant() AS appkit_current_tenant)))",
+		"WITH CHECK ((tenant_id = ( SELECT sd_test.appkit_current_tenant() AS appkit_current_tenant)))",
 		// 读全部策略只限 SELECT：FOR 子句必须渲染出来，否则回放会放开写。
 		"CREATE POLICY tenant_isolation_read_all ON sd_test.documents FOR SELECT",
-		"USING (sd_test.appkit_read_all_tenants())",
+		"USING (( SELECT sd_test.appkit_read_all_tenants() AS appkit_read_all_tenants))",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Errorf("渲染缺 %q：\n%s", want, sql)

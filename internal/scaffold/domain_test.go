@@ -417,6 +417,9 @@ func TestDomainTenantScaffold(t *testing.T) {
 			`ALTER TABLE "crm"."notes" FORCE ROW LEVEL SECURITY`,
 			`CREATE POLICY tenant_isolation ON "crm"."notes"`,
 			`CREATE POLICY tenant_isolation_read_all ON "crm"."notes" FOR SELECT`,
+			// 函数包在子查询里：整条语句只求值一次，不逐行调 plpgsql。
+			`USING (tenant_id = (SELECT "crm".appkit_current_tenant()))`,
+			`USING ((SELECT "crm".appkit_read_all_tenants()))`,
 			// 教学注释必须点到 verify——建真表照抄的读者得知道漏挂的后果。
 			"VerifyTenantRLS",
 		)
@@ -473,7 +476,8 @@ func TestDomainPartitionedTenantScaffold(t *testing.T) {
 			`ALTER TABLE "notes" FORCE ROW LEVEL SECURITY`,
 			`CREATE POLICY tenant_isolation ON "notes"`,
 			`CREATE POLICY tenant_isolation_read_all ON "notes" FOR SELECT`,
-			"USING (appkit_read_all_tenants())")
+			"USING (tenant_id = (SELECT appkit_current_tenant()))",
+			"USING ((SELECT appkit_read_all_tenants()))")
 		for _, f := range []string{base, demo} {
 			if strings.Contains(f, "CREATE SCHEMA") || strings.Contains(f, `"order".`) {
 				t.Errorf("双层形态的迁移不得出现定死的 schema：\n%s", f)
