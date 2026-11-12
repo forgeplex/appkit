@@ -27,7 +27,8 @@ type isolationConfig struct {
 // 决定而不是剩余状态。
 //
 // appkit 自己的基础设施表（outbox、inbox、idempotency_keys、audit_log、
-// schema_migrations）不必列。带 tenant_id 列的表不能豁免，清单里出现不
+// schema_migrations）不必列——按表名加核心列的结构识别，同名但结构不同
+// 的业务表不算，照常要列。带 tenant_id 列的表不能豁免，清单里出现不
 // 存在的表名同样报错——清单必须与 schema 一致，否则它迟早变成没人敢删的
 // 历史遗留。经父表策略间接隔离的子表（没有自己的 tenant_id 列）也列在
 // 这里，隔离由它自己的策略负责，本校验不替它背书。
@@ -35,23 +36,80 @@ func TenantExempt(tables ...string) IsolationOption {
 	return func(c *isolationConfig) { c.exempt = append(c.exempt, tables...) }
 }
 
-// infraTables 是 appkit 自己建的基础设施表：relay、claim、迁移 runner 都
-// 不带租户身份，这些表没有 tenant_id 列，天然不按租户隔离。与
-// internal/schemadoc 的 frameworkTables 是同一份清单。
-var infraTables = map[string]bool{
-	"outbox":            true,
-	"inbox":             true,
-	"idempotency_keys":  true,
-	"audit_log":         true,
-	"schema_migrations": true,
+// infraTables 是 appkit 自己建的基础设施表及其核心列（列名 → format_type
+// 的类型名）：relay、claim、迁移 runner 都不带租户身份，这些表没有
+// tenant_id 列，天然不按租户隔离，不必逐域声明豁免。
+//
+// 只按表名认是不够的：没用审计的域自己建一张 audit_log、消息类的域建一张
+// inbox，名字相同、装的却是租户数据。所以认的是「表名 + 核心列齐全且
+// 类型相符」——核心列取自 v0.1.0 以来每个版本都有的那些，后来追加的列
+// （outbox.claim_token、schema_migrations.checksum）不在其内，新旧版本
+// 建出来的表都认；同名但结构不符的表不算基础设施表，照常要求显式豁免。
+//
+// 本包不能 import outbox / idem / audit / pgmigrate（它们依赖本包），所以
+// 这里是它们 DDL 的一份摘要；真库用例把库函数的真实 DDL 建出来过一遍
+// 校验，摘要与 DDL 脱节时用例变红。清单与 internal/schemadoc 的
+// frameworkTables 是同一份。
+var infraTables = map[string]map[string]string{
+	"outbox": {
+		"id": "uuid", "topic": "text", "payload": "jsonb", "meta": "jsonb",
+		"attempts": "integer", "next_attempt_at": pgTimestamptz, "claimed_until": pgTimestamptz,
+		"failed_at": pgTimestamptz, "last_error": "text", "created_at": pgTimestamptz,
+		"published_at": pgTimestamptz,
+	},
+	"inbox": {
+		"consumer": "text", "event_id": "uuid", "topic": "text", "processed_at": pgTimestamptz,
+	},
+	"idempotency_keys": {
+		"key": "text", "payload_hash": "bytea", "owner_token": "uuid", "state": "text",
+		"status": "integer", "headers": "jsonb", "body": "bytea",
+		"created_at": pgTimestamptz, "completed_at": pgTimestamptz,
+	},
+	"audit_log": {
+		"id": "bigint", "at": pgTimestamptz, "actor": "text", "action": "text",
+		"entity": "text", "entity_id": "text", "before": "jsonb", "after": "jsonb", "meta": "jsonb",
+	},
+	"schema_migrations": {
+		"version": "text", "applied_at": pgTimestamptz,
+	},
+}
+
+// pgTimestamptz 是 format_type 对 timestamptz 的写法。
+const pgTimestamptz = "timestamp with time zone"
+
+// infraMismatch 报告与基础设施表同名的 rel 哪里不是它；结构相符时返回空串。
+// 只在 rel.name 是基础设施表名时有意义。
+func infraMismatch(rel isolationRelation) string {
+	if rel.kind != relKindTable {
+		return "不是普通表"
+	}
+	core := infraTables[rel.name]
+	var missing, wrong []string
+	for _, col := range slices.Sorted(maps.Keys(core)) {
+		switch got, ok := rel.columns[col]; {
+		case !ok:
+			missing = append(missing, col)
+		case got != core[col]:
+			wrong = append(wrong, fmt.Sprintf("%s 是 %s（应为 %s）", col, got, core[col]))
+		}
+	}
+	var parts []string
+	if len(missing) > 0 {
+		parts = append(parts, "缺列 "+strings.Join(missing, "、"))
+	}
+	if len(wrong) > 0 {
+		parts = append(parts, "列类型不符："+strings.Join(wrong, "、"))
+	}
+	return strings.Join(parts, "；")
 }
 
 // VerifyTenantIsolation 在 Setup 期校验租户域的行级隔离既完整又没被改松，
 // 是 VerifyTenantRLS 的严格形态。逐项校验，一次报全：
 //
 //   - 覆盖面：schema 里每张表（普通表、分区表、物化视图）要么带 tenant_id
-//     列并挂全策略，要么是基础设施表，要么在 TenantExempt 里显式豁免。
-//     没有 tenant_id 又没声明的表拒绝启动——「忘了加列」不再是静默的不隔离；
+//     列并挂全策略，要么是 appkit 的基础设施表（按表名加核心列结构识别，
+//     同名的业务表不算），要么在 TenantExempt 里显式豁免。没有 tenant_id
+//     又没声明的表拒绝启动——「忘了加列」不再是静默的不隔离；
 //   - 策略定义：tenant_isolation / tenant_isolation_read_all 不只要存在，
 //     还必须是 TenantPolicySQL 生成的形态（命令、PERMISSIVE、TO PUBLIC、
 //     USING / WITH CHECK 表达式、引用的函数就是本 schema 的上下文函数）。
@@ -120,11 +178,18 @@ func VerifyTenantIsolation(ctx context.Context, db DB, schema string, opts ...Is
 		case rel.hasTenant:
 			tenantTables++
 			problems = append(problems, tenantTableProblems(rel, policies[rel.name], fns)...)
-		case infraTables[rel.name] || exempt[rel.name]:
-		default:
+		case exempt[rel.name]:
+		case infraTables[rel.name] == nil:
 			problems = append(problems, fmt.Sprintf(
 				"%s：没有 tenant_id 列，也不在豁免清单里——全部租户共用的表在 pgtx.TenantExempt 里显式列出；属于租户的表补 tenant_id 列并用 pgtx.TenantPolicySQL 挂策略",
 				rel.name))
+		default:
+			// 与基础设施表同名：结构相符才免声明。
+			if mismatch := infraMismatch(rel); mismatch != "" {
+				problems = append(problems, fmt.Sprintf(
+					"%s：与 appkit 的基础设施表同名，但结构不是它（%s）——不能按基础设施表免声明。全部租户共用就在 pgtx.TenantExempt 里显式列出；属于租户的表补 tenant_id 列并用 pgtx.TenantPolicySQL 挂策略",
+					rel.name, mismatch))
+			}
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(exempt)) {
@@ -157,6 +222,7 @@ func VerifyTenantIsolation(ctx context.Context, db DB, schema string, opts ...Is
 
 // pg_class.relkind 与 pg_policy.polcmd 的取值。
 const (
+	relKindTable   = "r"
 	relKindMatview = "m"
 	polCmdAll      = "*"
 	polCmdSelect   = "r"
@@ -164,7 +230,8 @@ const (
 
 type isolationRelation struct {
 	name      string
-	kind      string // r 普通表 / p 分区表 / m 物化视图
+	kind      string            // r 普通表 / p 分区表 / m 物化视图
+	columns   map[string]string // 列名 → format_type 的类型名
 	enabled   bool
 	forced    bool
 	hasTenant bool
@@ -183,9 +250,12 @@ type isolationPolicy struct {
 func loadIsolationRelations(ctx context.Context, db DB, schema string) ([]isolationRelation, error) {
 	const q = `
 SELECT c.relname, c.relkind::text, c.relrowsecurity, c.relforcerowsecurity,
-       EXISTS (SELECT 1 FROM pg_attribute a
-               WHERE a.attrelid = c.oid AND a.attname = 'tenant_id'
-                 AND a.attnum > 0 AND NOT a.attisdropped)
+       ARRAY(SELECT a.attname::text FROM pg_attribute a
+             WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+             ORDER BY a.attnum),
+       ARRAY(SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a
+             WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped
+             ORDER BY a.attnum)
 FROM pg_class c
 JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'm')
@@ -198,9 +268,15 @@ ORDER BY c.relname`
 	var out []isolationRelation
 	for rows.Next() {
 		var r isolationRelation
-		if err := rows.Scan(&r.name, &r.kind, &r.enabled, &r.forced, &r.hasTenant); err != nil {
+		var names, types []string
+		if err := rows.Scan(&r.name, &r.kind, &r.enabled, &r.forced, &names, &types); err != nil {
 			return nil, fmt.Errorf("pgtx: 读取 schema %s 的表: %w", schema, err)
 		}
+		r.columns = make(map[string]string, len(names))
+		for i, name := range names {
+			r.columns[name] = types[i]
+		}
+		_, r.hasTenant = r.columns["tenant_id"]
 		out = append(out, r)
 	}
 	if err := rows.Err(); err != nil {

@@ -256,8 +256,9 @@ if err := pgtx.VerifyTenantIsolation(ctx, m.opts.Pool, Schema,
 - **覆盖面**：schema 里每张表要么带 `tenant_id` 并挂全策略，要么列在
   `TenantExempt` 里。没有 `tenant_id` 的表不受 RLS 约束、任何查询都读得到
   全部行，所以「故意不隔离」必须写出来，否则与「忘了加列」无从分辨。appkit
-  的基础设施表（outbox / inbox / 幂等 / 审计 / 迁移历史）不必列；带
-  `tenant_id` 的表不能豁免；清单里出现不存在的表名同样报错。
+  的基础设施表（outbox / inbox / 幂等 / 审计 / 迁移历史）不必列——按表名加
+  核心列的结构识别，域自己建的同名表（比如一张装用户消息的 `inbox`）不算，
+  照常要列；带 `tenant_id` 的表不能豁免；清单里出现不存在的表名同样报错。
 - **策略定义**：两条策略必须是 `TenantPolicySQL` 的输出——命令、PERMISSIVE、
   TO PUBLIC、表达式、引用的函数就是本 schema 的上下文函数（按目录里的 OID
   认，不按名字认）。

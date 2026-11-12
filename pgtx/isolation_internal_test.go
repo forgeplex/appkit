@@ -116,3 +116,41 @@ func TestShowExpr(t *testing.T) {
 		t.Errorf("过长的表达式应按字符截断并加省略号，实际 %d 个字符", len([]rune(got)))
 	}
 }
+
+// 与基础设施表同名不等于是它：认的是核心列齐全且类型相符。追加的列不影响
+// 识别（框架升级是加列），缺列、类型不符、不是普通表都不算。
+func TestInfraMismatch(t *testing.T) {
+	t.Parallel()
+	inbox := func(mutate func(cols map[string]string)) isolationRelation {
+		cols := map[string]string{
+			"consumer": "text", "event_id": "uuid", "topic": "text", "processed_at": pgTimestamptz,
+		}
+		if mutate != nil {
+			mutate(cols)
+		}
+		return isolationRelation{name: "inbox", kind: relKindTable, columns: cols}
+	}
+	if got := infraMismatch(inbox(nil)); got != "" {
+		t.Errorf("核心列齐全应认作基础设施表，实际 %q", got)
+	}
+	if got := infraMismatch(inbox(func(c map[string]string) { c["trace_id"] = "text" })); got != "" {
+		t.Errorf("多出追加的列不影响识别，实际 %q", got)
+	}
+	if got := infraMismatch(inbox(func(c map[string]string) { delete(c, "consumer"); delete(c, "event_id") })); got != "缺列 consumer、event_id" {
+		t.Errorf("缺列应按列名排序点名，实际 %q", got)
+	}
+	if got := infraMismatch(inbox(func(c map[string]string) { c["event_id"] = "text" })); got != "列类型不符：event_id 是 text（应为 uuid）" {
+		t.Errorf("类型不符应点名，实际 %q", got)
+	}
+	view := inbox(nil)
+	view.kind = relKindMatview
+	if got := infraMismatch(view); got != "不是普通表" {
+		t.Errorf("物化视图不算基础设施表，实际 %q", got)
+	}
+	// 每张基础设施表都得有核心列摘要，空摘要等于按名豁免。
+	for name, core := range infraTables {
+		if len(core) < 2 {
+			t.Errorf("%s 的核心列摘要过少（%d 列），起不到识别作用", name, len(core))
+		}
+	}
+}

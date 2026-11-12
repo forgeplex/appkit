@@ -5,12 +5,18 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/forgeplex/appkit"
+	"github.com/forgeplex/appkit/audit"
+	"github.com/forgeplex/appkit/idem"
 	"github.com/forgeplex/appkit/internal/dbtest"
+	"github.com/forgeplex/appkit/outbox"
+	"github.com/forgeplex/appkit/pgmigrate"
 	"github.com/forgeplex/appkit/pgtx"
 )
 
@@ -127,8 +133,10 @@ func TestVerifyTenantIsolation(t *testing.T) {
 		base dbtest.Migration
 		// alter 在 base 之后执行，模拟「后来者」对隔离的改动。
 		alter func(schema string) string
-		opts  []pgtx.IsolationOption
-		want  []string // 报错必须包含；为空表示应通过
+		// prepare 在 alter 之后执行，给不是一段 SQL 的准备动作用。
+		prepare func(t *testing.T, pool *pgxpool.Pool, schema string)
+		opts    []pgtx.IsolationOption
+		want    []string // 报错必须包含；为空表示应通过
 		// legacyBlind 标记 VerifyTenantRLS 看不见的改写：结构齐全、名字都对，
 		// 只是定义被改松了。两个函数在同一个用例上的差别，就是严格校验存在的理由。
 		legacyBlind bool
@@ -253,8 +261,54 @@ CREATE POLICY tenant_isolation_read_all ON %[1]s.documents USING (%[1]s.appkit_r
 			opts:  []pgtx.IsolationOption{pgtx.TenantExempt("rates")},
 		},
 		{
-			name:  "基础设施表不必声明",
-			alter: ddl(`CREATE TABLE %[1]s.outbox (id int); CREATE TABLE %[1]s.inbox (id int); CREATE TABLE %[1]s.idempotency_keys (id int); CREATE TABLE %[1]s.audit_log (id int); CREATE TABLE %[1]s.schema_migrations (id int);`),
+			// 库函数的真实 DDL 与 pgmigrate 真建出来的历史表：校验里那份「核心列」
+			// 摘要与它们脱节时，这条用例变红。
+			name: "基础设施表不必声明",
+			alter: func(schema string) string {
+				return outbox.MigrationSQL(schema) + idem.MigrationSQL(schema) + audit.MigrationSQL(schema)
+			},
+			prepare: func(t *testing.T, pool *pgxpool.Pool, schema string) {
+				err := pgmigrate.Runner(pool)(context.Background(),
+					[]appkit.MigrationSet{{Schema: schema, FS: fstest.MapFS{}, Module: "isolation-test"}})
+				if err != nil {
+					t.Fatalf("建迁移历史表: %v", err)
+				}
+			},
+		},
+		{
+			// v0.1.0 的建表原文：outbox 还没有 claim_token，历史表还没有 checksum。
+			name: "最早版本建出来的基础设施表也认",
+			alter: ddl(`CREATE TABLE %[1]s.outbox (
+    id uuid PRIMARY KEY, topic text NOT NULL, payload jsonb NOT NULL, meta jsonb,
+    attempts int NOT NULL DEFAULT 0, next_attempt_at timestamptz NOT NULL DEFAULT now(),
+    claimed_until timestamptz, failed_at timestamptz, last_error text,
+    created_at timestamptz NOT NULL DEFAULT now(), published_at timestamptz);
+CREATE TABLE %[1]s.inbox (
+    consumer text NOT NULL, event_id uuid NOT NULL, topic text NOT NULL,
+    processed_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (consumer, event_id));
+CREATE TABLE %[1]s.schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now());`),
+		},
+		{
+			name:  "同名的业务表不算基础设施表",
+			alter: ddl(`CREATE TABLE %[1]s.inbox (id text PRIMARY KEY, subject text, body text);`),
+			want: []string{"inbox：与 appkit 的基础设施表同名，但结构不是它",
+				"缺列 consumer、event_id、processed_at、topic"},
+		},
+		{
+			name:  "同名且列名齐全但类型不符",
+			alter: ddl(`CREATE TABLE %[1]s.schema_migrations (version int PRIMARY KEY, applied_at timestamptz);`),
+			want: []string{"schema_migrations：与 appkit 的基础设施表同名，但结构不是它",
+				"列类型不符：version 是 integer（应为 text）"},
+		},
+		{
+			name:  "同名的物化视图不算基础设施表",
+			alter: ddl(`CREATE MATERIALIZED VIEW %[1]s.audit_log AS SELECT id, body FROM %[1]s.documents;`),
+			want:  []string{"audit_log：与 appkit 的基础设施表同名，但结构不是它（不是普通表）"},
+		},
+		{
+			name:  "同名的业务表照常可以显式豁免",
+			alter: ddl(`CREATE TABLE %[1]s.inbox (id text PRIMARY KEY, subject text, body text);`),
+			opts:  []pgtx.IsolationOption{pgtx.TenantExempt("inbox")},
 		},
 		{
 			name: "豁免清单过期",
@@ -288,6 +342,9 @@ CREATE TABLE %[1]s.events_2026 PARTITION OF %[1]s.events FOR VALUES FROM ('2026-
 				if _, err := pool.Exec(ctx, tc.alter(schema)); err != nil {
 					t.Fatalf("应用改动: %v", err)
 				}
+			}
+			if tc.prepare != nil {
+				tc.prepare(t, pool, schema)
 			}
 			err := verifyIsolationAs(t, pool, role, "", schema, tc.opts...)
 			if len(tc.want) == 0 {
