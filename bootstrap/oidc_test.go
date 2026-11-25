@@ -354,3 +354,44 @@ security:
 		t.Fatalf("Core /core-me status = %d, want 204", resp.StatusCode)
 	}
 }
+
+func TestDeclarativeOIDCRejectsLoopbackHTTPOutsideDev(t *testing.T) {
+	writeCfg := func(env string) string {
+		p := filepath.Join(t.TempDir(), env+".yaml")
+		body := "env: " + env + `
+security:
+  mode: user_facing
+  oidc:
+    realms:
+      - issuer: http://127.0.0.1:8081/
+        audience: https://api.example.com
+        partition: demo
+`
+		if err := os.WriteFile(p, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	for _, env := range []string{"prod", "staging"} {
+		t.Run("reject/"+env, func(t *testing.T) {
+			err := Run(context.Background(), Options{
+				Service: "bpoidcenv",
+				Modules: func(Deps) ([]appkit.Module, error) { return nil, nil },
+			}, RunOptions{ConfigFile: writeCfg(env)})
+			if err == nil || !strings.Contains(err.Error(), "必须使用 https") {
+				t.Fatalf("env=%s 应拒绝明文 http JWKS，实际 %v", env, err)
+			}
+		})
+	}
+
+	t.Run("accept/dev", func(t *testing.T) {
+		err := Run(context.Background(), Options{
+			Service: "bpoidcenv",
+			Modules: func(Deps) ([]appkit.Module, error) { return nil, nil },
+		}, RunOptions{ConfigFile: writeCfg("dev")})
+		if err == nil || !strings.Contains(err.Error(), "未配置 database.url") {
+			t.Fatalf("env=dev 应允许 loopback http JWKS 并继续到 database.url 检查，实际 %v", err)
+		}
+	})
+}

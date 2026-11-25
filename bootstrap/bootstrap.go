@@ -249,7 +249,7 @@ func RunWithSecurity(ctx context.Context, o Options, r RunOptions, security Secu
 		if security.UserVerifier != nil {
 			return fmt.Errorf("%s: security.oidc 与 SecurityOptions.UserVerifier 不能同时配置", o.Service)
 		}
-		security.UserVerifier, err = securityConfig.Security.OIDC.verifier()
+		security.UserVerifier, err = securityConfig.Security.OIDC.verifier(base.Env)
 		if err != nil {
 			return fmt.Errorf("%s: security.oidc 配置无效: %w", o.Service, err)
 		}

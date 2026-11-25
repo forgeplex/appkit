@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -186,7 +187,16 @@ func NewOIDCVerifier(o OIDCVerifierOptions) (*OIDCVerifier, error) {
 				jwksURL = strings.TrimRight(iss, "/") + "/.well-known/jwks.json"
 			}
 			parsed, err := url.Parse(jwksURL)
-			if err != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Host == "" {
+			if err != nil || parsed.Host == "" || parsed.User != nil {
+				return nil, fmt.Errorf("authn: OIDC Realm %q jwks_url %q 无效", iss, jwksURL)
+			}
+			switch parsed.Scheme {
+			case "https":
+			case "http":
+				if !isLoopbackJWKSHost(parsed.Hostname()) {
+					return nil, fmt.Errorf("authn: OIDC Realm %q jwks_url %q 必须使用 https（非 loopback 禁止明文 http）", iss, jwksURL)
+				}
+			default:
 				return nil, fmt.Errorf("authn: OIDC Realm %q jwks_url %q 无效", iss, jwksURL)
 			}
 			rv.jwksURL = parsed.String()
@@ -358,10 +368,32 @@ func (v *OIDCVerifier) Verify(ctx context.Context, raw string) (appkit.Actor, st
 		TenantID: claims.OrgID,
 		Perms:    slices.Clone(claims.Permissions),
 	}
-	if claims.AuthTime != nil && *claims.AuthTime > 0 && v.isStepUp(claims.AMR, claims.ACR) {
-		actor.StepUpAt = time.Unix(*claims.AuthTime, 0)
+	now := v.now()
+	if claims.AuthTime != nil {
+		if *claims.AuthTime <= 0 {
+			return appkit.Actor{}, "", errors.New("token auth_time must be positive")
+		}
+		authTime := time.Unix(*claims.AuthTime, 0)
+		if authTime.After(now.Add(v.skew)) {
+			return appkit.Actor{}, "", errors.New("token auth_time cannot be in the future")
+		}
+		if v.isStepUp(claims.AMR, claims.ACR) {
+			if authTime.After(now) {
+				authTime = now
+			}
+			actor.StepUpAt = authTime
+		}
 	}
 	return actor, matched.partition, nil
+}
+
+func isLoopbackJWKSHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	host, _, _ = strings.Cut(host, "%")
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func isMachineGrant(gty string) bool {

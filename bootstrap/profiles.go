@@ -190,7 +190,7 @@ func NewCore(ctx context.Context, options ProfileOptions) (*Core, error) {
 		if security.UserVerifier != nil {
 			return nil, fmt.Errorf("%s: security.oidc 与 SecurityOptions.UserVerifier 不能同时配置", options.Service)
 		}
-		security.UserVerifier, err = securityConfig.Security.OIDC.verifier()
+		security.UserVerifier, err = securityConfig.Security.OIDC.verifier(base.Env)
 		if err != nil {
 			return nil, fmt.Errorf("%s: security.oidc 配置无效: %w", options.Service, err)
 		}

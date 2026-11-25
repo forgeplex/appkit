@@ -1,6 +1,7 @@
 package authn
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -10,7 +11,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -23,6 +26,7 @@ import (
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
 	"github.com/forgeplex/appkit/callctx"
+	"github.com/forgeplex/appkit/httpserver"
 )
 
 func oidcSignWithHeader(t *testing.T, method jwt.SigningMethod, key any, kid, typ string, claims jwt.MapClaims) string {
@@ -595,6 +599,269 @@ func TestOIDCServiceMiddlewareMixedAndHeaderConflicts(t *testing.T) {
 				if rec.Code != 401 {
 					t.Fatalf("scope conflict accepted %+v: %d", badScope, rec.Code)
 				}
+			}
+		})
+	}
+}
+
+func TestOIDCVerifierRejectsNonLoopbackHTTPJWKS(t *testing.T) {
+	rejected := []struct {
+		name  string
+		realm OIDCRealm
+	}{
+		{
+			name: "explicit-public-http",
+			realm: OIDCRealm{
+				Issuer:   "https://sso.example.com/",
+				Audience: "https://api.psp.example.com",
+				JWKSURL:  "http://sso.example.com/.well-known/jwks.json",
+			},
+		},
+		{
+			name: "derived-public-http",
+			realm: OIDCRealm{
+				Issuer:   "http://sso.example.com/",
+				Audience: "https://api.psp.example.com",
+			},
+		},
+		{
+			name: "private-network-http",
+			realm: OIDCRealm{
+				Issuer:   "https://sso.example.com/",
+				Audience: "https://api.psp.example.com",
+				JWKSURL:  "http://10.0.0.5:8081/.well-known/jwks.json",
+			},
+		},
+		{
+			name: "userinfo-in-https-jwks",
+			realm: OIDCRealm{
+				Issuer:   "https://sso.example.com/",
+				Audience: "https://api.psp.example.com",
+				JWKSURL:  "https://user:pass@sso.example.com/.well-known/jwks.json",
+			},
+		},
+	}
+	for _, tc := range rejected {
+		t.Run("reject/"+tc.name, func(t *testing.T) {
+			if _, err := NewOIDCVerifier(OIDCVerifierOptions{Realms: []OIDCRealm{tc.realm}}); err == nil {
+				t.Fatalf("expected error for %+v", tc.realm)
+			}
+		})
+	}
+
+	accepted := []struct {
+		name  string
+		realm OIDCRealm
+	}{
+		{
+			name: "loopback-ipv4",
+			realm: OIDCRealm{
+				Issuer:   "http://127.0.0.1:8081/",
+				Audience: "https://api.psp.example.com",
+				JWKSURL:  "http://127.0.0.1:8081/.well-known/jwks.json",
+			},
+		},
+		{
+			name: "loopback-ipv6",
+			realm: OIDCRealm{
+				Issuer:   "https://demo.sso.example.com/",
+				Audience: "https://api.psp.example.com",
+				JWKSURL:  "http://[::1]:8081/.well-known/jwks.json",
+			},
+		},
+		{
+			name: "loopback-localhost",
+			realm: OIDCRealm{
+				Issuer:   "https://demo.sso.example.com/",
+				Audience: "https://api.psp.example.com",
+				JWKSURL:  "http://localhost:8081/.well-known/jwks.json",
+			},
+		},
+		{
+			name: "https-public",
+			realm: OIDCRealm{
+				Issuer:   "https://sso.example.com/",
+				Audience: "https://api.psp.example.com",
+				JWKSURL:  "https://sso.example.com/.well-known/jwks.json",
+			},
+		},
+	}
+	for _, tc := range accepted {
+		t.Run("accept/"+tc.name, func(t *testing.T) {
+			if _, err := NewOIDCVerifier(OIDCVerifierOptions{Realms: []OIDCRealm{tc.realm}}); err != nil {
+				t.Fatalf("unexpected error for %+v: %v", tc.realm, err)
+			}
+		})
+	}
+}
+
+func TestOIDCStepUpAuthTimeAndChallengeEnforcement(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixedNow := time.Unix(1_760_000_000, 0)
+	vUnit, err := NewOIDCVerifier(OIDCVerifierOptions{
+		Realms: []OIDCRealm{{
+			Issuer:     "https://demo.sso.example.com/",
+			Audience:   "https://api.psp.example.com",
+			Partition:  "demo",
+			StaticKeys: map[string]crypto.PublicKey{"k-ed": pub},
+		}},
+		ClockSkew: 5 * time.Second,
+		now:       func() time.Time { return fixedNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signAuthTime := func(baseTime time.Time, authTime int64, amr []string) string {
+		claims := jwt.MapClaims{
+			"iss":         "https://demo.sso.example.com/",
+			"sub":         "user-1",
+			"aud":         "https://api.psp.example.com",
+			"org_id":      "org-1",
+			"permissions": []string{"fixture:read", "fixture:sensitive"},
+			"auth_time":   authTime,
+			"exp":         baseTime.Add(time.Hour).Unix(),
+		}
+		if len(amr) > 0 {
+			claims["amr"] = amr
+		}
+		return oidcSign(t, priv, claims)
+	}
+
+	if _, _, err := vUnit.Verify(t.Context(), signAuthTime(fixedNow, fixedNow.Add(10*time.Second).Unix(), []string{"mfa"})); err == nil {
+		t.Fatal("expected future auth_time beyond skew to be rejected")
+	}
+	if _, _, err := vUnit.Verify(t.Context(), signAuthTime(fixedNow, 0, []string{"mfa"})); err == nil {
+		t.Fatal("expected non-positive auth_time to be rejected")
+	}
+	actorSkew, _, err := vUnit.Verify(t.Context(), signAuthTime(fixedNow, fixedNow.Add(3*time.Second).Unix(), []string{"mfa"}))
+	if err != nil {
+		t.Fatalf("auth_time within skew rejected: %v", err)
+	}
+	if !actorSkew.StepUpAt.Equal(fixedNow) {
+		t.Fatalf("StepUpAt = %v, want clamped %v", actorSkew.StepUpAt, fixedNow)
+	}
+
+	// End-to-end Challenge route check against appkit.Registry.Require.
+	verifier, err := NewOIDCVerifier(OIDCVerifierOptions{
+		Realms: []OIDCRealm{{
+			Issuer:     "https://demo.sso.example.com/",
+			Audience:   "https://api.psp.example.com",
+			Partition:  "demo",
+			StaticKeys: map[string]crypto.PublicKey{"k-ed": pub},
+		}},
+		ClockSkew: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	okHandler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	module := appkit.ModuleFunc("challenge-fixture", func(reg *appkit.Registry) error {
+		reg.Permissions(
+			appkit.PermissionDecl{Code: "fixture:read"},
+			appkit.PermissionDecl{Code: "fixture:sensitive", Challenge: true},
+		)
+		reg.MountPermission("GET /normal", "fixture:read", okHandler)
+		reg.MountPermission("GET /challenge", "fixture:sensitive", okHandler)
+		return nil
+	})
+	listening := make(chan string, 1)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	app := appkit.New(
+		[]appkit.Module{module},
+		appkit.Security(appkit.SecurityUserFacing),
+		appkit.HTTPAddr("127.0.0.1:0"),
+		appkit.Logger(log),
+		appkit.ShutdownTimeout(2*time.Second),
+		appkit.Middleware(httpserver.Base(log)...),
+		appkit.Middleware(verifier.Middleware),
+		appkit.HTTPServer(func(s *http.Server) {
+			s.BaseContext = func(ln net.Listener) context.Context {
+				listening <- "http://" + ln.Addr().String()
+				return context.Background()
+			}
+		}),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- app.Run(ctx) }()
+	finished := false
+	t.Cleanup(func() {
+		cancel()
+		if finished {
+			return
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("App shutdown: %v", err)
+			}
+		case <-time.After(4 * time.Second):
+			t.Error("App did not stop within shutdown budget")
+		}
+	})
+
+	var baseURL string
+	select {
+	case baseURL = <-listening:
+	case err := <-done:
+		finished = true
+		t.Fatalf("App failed before listening: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("App did not start within budget")
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	now := time.Now()
+	doReq := func(path, raw string) (int, string) {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, baseURL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+raw)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		code := ""
+		if len(body) > 0 {
+			code = apperr.FromProblem(resp.StatusCode, body).Code()
+		}
+		return resp.StatusCode, code
+	}
+
+	freshMFA := signAuthTime(now, now.Add(-time.Minute).Unix(), []string{"pwd", "mfa"})
+	futureMFA := signAuthTime(now, now.Add(2*time.Minute).Unix(), []string{"mfa"})
+	staleMFA := signAuthTime(now, now.Add(-10*time.Minute).Unix(), []string{"mfa"})
+	freshPwdOnly := signAuthTime(now, now.Add(-time.Minute).Unix(), []string{"pwd"})
+
+	for _, tc := range []struct {
+		name     string
+		path     string
+		token    string
+		wantCode int
+		wantErr  string
+	}{
+		{"fresh-mfa-normal", "/normal", freshMFA, http.StatusNoContent, ""},
+		{"fresh-mfa-challenge", "/challenge", freshMFA, http.StatusNoContent, ""},
+		{"future-auth-time-normal", "/normal", futureMFA, http.StatusUnauthorized, apperr.CodeUnauthenticated},
+		{"future-auth-time-challenge", "/challenge", futureMFA, http.StatusUnauthorized, apperr.CodeUnauthenticated},
+		{"stale-mfa-normal", "/normal", staleMFA, http.StatusNoContent, ""},
+		{"stale-mfa-challenge", "/challenge", staleMFA, http.StatusForbidden, apperr.CodeStepUpRequired},
+		{"no-mfa-amr-normal", "/normal", freshPwdOnly, http.StatusNoContent, ""},
+		{"no-mfa-amr-challenge", "/challenge", freshPwdOnly, http.StatusForbidden, apperr.CodeStepUpRequired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, errCode := doReq(tc.path, tc.token)
+			if status != tc.wantCode || (tc.wantErr != "" && errCode != tc.wantErr) {
+				t.Fatalf("status=%d (want %d), code=%q (want %q)", status, tc.wantCode, errCode, tc.wantErr)
 			}
 		})
 	}

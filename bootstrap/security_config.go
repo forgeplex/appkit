@@ -7,6 +7,8 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 	"time"
@@ -148,9 +150,19 @@ type oidcRealmConfig struct {
 	RequireOrg bool   `koanf:"require_org"`
 }
 
-func (c oidcVerifierConfig) verifier() (*authn.OIDCVerifier, error) {
+func (c oidcVerifierConfig) verifier(env string) (*authn.OIDCVerifier, error) {
 	realms := make([]authn.OIDCRealm, 0, len(c.Realms))
 	for _, r := range c.Realms {
+		if env != "dev" {
+			rawURL := strings.TrimSpace(r.JWKSURL)
+			if rawURL == "" {
+				rawURL = strings.TrimRight(strings.TrimSpace(r.Issuer), "/") + "/.well-known/jwks.json"
+			}
+			parsed, err := url.Parse(rawURL)
+			if err != nil || parsed.Host == "" || parsed.Scheme != "https" {
+				return nil, fmt.Errorf("非 dev 环境（env=%s）下 security.oidc.realms[] 的 JWKS 地址 %q 必须使用 https", env, rawURL)
+			}
+		}
 		realms = append(realms, authn.OIDCRealm{
 			Issuer:     r.Issuer,
 			Audience:   r.Audience,
