@@ -2,6 +2,19 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.10.0（2026-11-25）
+
+v0.10.0 — nested contract submodules, in-process contracts, and outbound client foundation
+
+This minor release adds first-class support for single-repo nested `contract/go.mod` submodules and in-process contract generation, alongside controlled outbound HTTP clients, YAML-configured telemetry exporters, and shared ARC CI runner updates since `v0.9.9`.
+
+- Support single-repo nested `contract/go.mod` submodules across `archcheck`, `appkit dev`, and reusable `domain-ci.yml`: allow `github.com/forgeplex/<repo>/contract` imports/requires while keeping `contract/go.mod` isolated from root domain packages, `pgx`, and `gin`.
+- Update `.go-arch-lint.yml` template (`ruleset`) from `workdir: internal` to repository-root analysis with `root` and `contract` components (reserving `contract` and `root` domain names) so nested `*/contract` submodules pass `go-arch-lint` cleanly.
+- Add optional `mode: inprocess` to V1 `contract.yaml` code generation (`appkit gen contract`), generating only `service.gen.go` and `wrap.gen.go` without unused HTTP client/server/OpenAPI artifacts, checking for unexpected RPC files on `-check`, and preserving upgrade compatibility (`inprocess -> full`).
+- Add controlled outbound HTTP client foundation and streaming conformance/acceptance coverage (`#97`, `#99`, `#103`, `#106`), YAML-configured OTLP telemetry exporters (`#101`), dependency updates, and ARC CI PostgreSQL runner checks.
+
+Migration note: After upgrading to `v0.10.0`, run `appkit sync` in downstream domain repositories to refresh `.go-arch-lint.yml` (which moves from `workdir: internal` to repository root with `root` and `contract` components) and `.github/workflows/ci.yml`.
+
 ## v0.9.9（2026-09-25）
 
 v0.9.9 — stability policy candidate and documentation corrections
