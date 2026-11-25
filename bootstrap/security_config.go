@@ -128,3 +128,42 @@ func servicePublicKey(raw string) (ed25519.PublicKey, error) {
 	}
 	return ed25519.PublicKey(pub), nil
 }
+
+// oidcVerifierConfig 描述声明式的安全用户身份配置（security.oidc），
+// 面向 forgeplex/sso 多 Realm JWKS 验签。列表结构避免 koanf 把 issuer URL
+// 里的点号拆成嵌套路径。
+type oidcVerifierConfig struct {
+	CacheTTL   time.Duration     `koanf:"cache_ttl"`
+	MinRefresh time.Duration     `koanf:"min_refresh"`
+	ClockSkew  time.Duration     `koanf:"clock_skew"`
+	StepUpACRs []string          `koanf:"step_up_acrs"`
+	Realms     []oidcRealmConfig `koanf:"realms"`
+}
+
+type oidcRealmConfig struct {
+	Issuer     string `koanf:"issuer"`
+	Audience   string `koanf:"audience"`
+	Partition  string `koanf:"partition"`
+	JWKSURL    string `koanf:"jwks_url"`
+	RequireOrg bool   `koanf:"require_org"`
+}
+
+func (c oidcVerifierConfig) verifier() (*authn.OIDCVerifier, error) {
+	realms := make([]authn.OIDCRealm, 0, len(c.Realms))
+	for _, r := range c.Realms {
+		realms = append(realms, authn.OIDCRealm{
+			Issuer:     r.Issuer,
+			Audience:   r.Audience,
+			Partition:  r.Partition,
+			JWKSURL:    r.JWKSURL,
+			RequireOrg: r.RequireOrg,
+		})
+	}
+	return authn.NewOIDCVerifier(authn.OIDCVerifierOptions{
+		Realms:     realms,
+		CacheTTL:   c.CacheTTL,
+		MinRefresh: c.MinRefresh,
+		ClockSkew:  c.ClockSkew,
+		StepUpACRs: c.StepUpACRs,
+	})
+}

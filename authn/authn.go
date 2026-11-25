@@ -44,6 +44,8 @@ import (
 
 // HeaderStepUp 携带 step-up 证明（另一枚 JWT）。凭证不跨边界传播——每个
 // 服务用自己的 Authn 重新验证——因此不进 callctx 白名单。
+//
+// Deprecated: 请优先使用 OIDCVerifier。
 const HeaderStepUp = "X-Step-Up"
 
 // stepUpPurpose 是 step-up 证明的用途标记，防止普通访问令牌被冒充。
@@ -59,6 +61,8 @@ var (
 )
 
 // Issuer 是一个签发方的验签规格。
+//
+// Deprecated: 请优先使用 OIDCRealm 与 OIDCVerifier。
 type Issuer struct {
 	// Key 是该签发方的 EdDSA 验签公钥。
 	Key ed25519.PublicKey
@@ -99,6 +103,8 @@ type stepUpClaims struct {
 // 域代码与存储层（RLS）统一从 callctx.From(ctx).TenantID 取租户。
 //
 // 单签发方形态；多签发方（多分区同进程）见 MultiIssuer。
+//
+// Deprecated: 请优先使用 OIDCVerifier。
 func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Handler {
 	return MultiIssuer(map[string]Issuer{issuer: {Key: pub}})
 }
@@ -109,6 +115,8 @@ func Middleware(pub ed25519.PublicKey, issuer string) func(http.Handler) http.Ha
 // unsigned 分区/租户头；本中间件只从已验签令牌及组合根配置重建身份。
 //
 // 表为空、iss 为空、公钥缺失都是装配错误，直接 panic。
+//
+// Deprecated: 请优先使用 OIDCVerifier。
 func MultiIssuer(issuers map[string]Issuer) func(http.Handler) http.Handler {
 	if len(issuers) == 0 {
 		panic("authn: MultiIssuer 的签发方表为空")
