@@ -2,6 +2,13 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.11.0（2026-11-25）
+
+v0.11.0: 新增多 Realm OIDC 用户令牌验签器（OIDCVerifier / security.oidc）
+
+- authn 新增多 Realm OIDC/OAuth2 访问令牌验签器 `authn.OIDCVerifier`（`NewOIDCVerifier` / `OIDCRealm` / `OIDCVerifierOptions`），支持 RS256/ES256/EdDSA JWKS 自动拉取缓存与静态公钥、org_id 租户映射、Partition 绑定与 MFA step-up（`auth_time` 边界校验 + `amr`/`acr`）、非 loopback 禁止明文 HTTP JWKS；保留既有 `Middleware` / `MultiIssuer` / `Issuer` / `HeaderStepUp`（标记 Deprecated）保证 100% 向后兼容
+- bootstrap 新增声明式 `security.oidc` 配置与 `SecurityOptions.UserVerifier`（同时支持 `RunWithSecurity` 与可组合 `NewCore` Profile，非 dev 环境禁止 HTTP JWKS），与既有 `UserIssuers` / `AuthnPublicKey` 互斥并严格 fail closed
+
 ## v0.10.1（2026-11-25）
 
 v0.10.1: 修复私有域仓库嵌套 contract/go.mod 的 domain-ci.yml
