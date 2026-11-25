@@ -370,6 +370,30 @@ func TestArchLintEveryComponentAllowsItself(t *testing.T) {
 	}
 }
 
+func TestDomainCI_嵌套Contract工作区与私有仓库认证(t *testing.T) {
+	body, err := os.ReadFile("../.github/workflows/domain-ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(body)
+	for _, want := range []string{
+		`go work edit -replace "${cmod}=./contract"`,
+		"GOWORK=off go vet ./...",
+		"rm -f go.work go.work.sum",
+		"GH_TOKEN: ${{ github.token }}",
+		`GOPRIVATE="github.com/${GITHUB_REPOSITORY},github.com/${GITHUB_REPOSITORY}/*`,
+		`http.https://github.com/${GITHUB_REPOSITORY}.extraheader`,
+		`http.https://github.com/${GITHUB_REPOSITORY}.git.extraheader`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("domain-ci.yml 缺少 %q", want)
+		}
+	}
+	if strings.Contains(s, "go work init . ./contract") {
+		t.Error("domain-ci.yml 不应直接使用 go work init . ./contract")
+	}
+}
+
 func firstLine(b []byte) string {
 	s := string(b)
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
