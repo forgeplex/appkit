@@ -76,7 +76,12 @@ jobs:
 
       - name: 准备嵌套 contract 工作区（如有）
         if: hashFiles('contract/go.mod') != ''
-        run: go work init . ./contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmod=$(cd contract && GOWORK=off go list -m)
+          go work init .
+          go work edit -replace "${cmod}=./contract"
 
       - name: go vet
         run: go vet ./...
@@ -92,12 +97,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd contract && go vet ./... && go test -race -count=1 ./...)
+          (cd contract && GOWORK=off go vet ./... && GOWORK=off go test -race -count=1 ./...)
           shopt -s nullglob
           for f in contract/*/contract.yaml; do
             GOWORK=off go run github.com/forgeplex/appkit/cmd/appkit@"$APPKIT_TOOL" gen contract -check -in "$f" -dir "$(dirname "$f")"
           done
-          (cd contract && go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@"$APPKIT_TOOL" ./...)
+          (cd contract && GOWORK=off go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@"$APPKIT_TOOL" ./...)
 
       - name: appkit check（架构检查）
         run: go run github.com/forgeplex/appkit/cmd/appkit@"$APPKIT_TOOL" check
@@ -130,8 +135,21 @@ jobs:
         run: go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@"$APPKIT_TOOL" ./...
 
       - name: go.mod 整洁检查
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          rm -f go.work
+          set -euo pipefail
+          rm -f go.work go.work.sum
+          if [ -f contract/go.mod ]; then
+            auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+            export GOPRIVATE="github.com/${GITHUB_REPOSITORY},github.com/${GITHUB_REPOSITORY}/*${GOPRIVATE:+,$GOPRIVATE}"
+            export GIT_CONFIG_COUNT=2
+            export GIT_CONFIG_KEY_0="http.https://github.com/${GITHUB_REPOSITORY}.extraheader"
+            export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}"
+            export GIT_CONFIG_KEY_1="http.https://github.com/${GITHUB_REPOSITORY}.git.extraheader"
+            export GIT_CONFIG_VALUE_1="AUTHORIZATION: basic ${auth}"
+          fi
           GOWORK=off go mod tidy
           git diff --exit-code go.mod go.sum
           if [ -f contract/go.mod ]; then
