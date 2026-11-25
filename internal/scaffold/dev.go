@@ -145,12 +145,16 @@ func goEnvValue(dir, name string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// collectModuleDirs 收集 go work use 的目标：dir 自身（有 go.mod 时，记作 "."）
-// 与 root 下含 go.mod 的一级子目录（跳过与 dir 重复的自身）。
+// collectModuleDirs 收集 go work use 的目标：dir 自身（有 go.mod 时，记作 "."；
+// 若存在嵌套 ./contract/go.mod 一并纳入）与 root 下含 go.mod 的一级子目录及其
+// 嵌套 contract/go.mod 子模块（跳过与 dir 重复的自身）。
 func collectModuleDirs(absDir, root string) ([]string, error) {
 	var uses []string
 	if fileExists(filepath.Join(absDir, "go.mod")) {
 		uses = append(uses, ".")
+	}
+	if fileExists(filepath.Join(absDir, "contract", "go.mod")) {
+		uses = append(uses, "./contract")
 	}
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
@@ -169,10 +173,12 @@ func collectModuleDirs(absDir, root string) ([]string, error) {
 		if resolvePath(sub) == absDir {
 			continue // 自身已以 "." 纳入，避免同目录双写
 		}
-		if !fileExists(filepath.Join(sub, "go.mod")) {
-			continue
+		if fileExists(filepath.Join(sub, "go.mod")) {
+			uses = append(uses, sub)
 		}
-		uses = append(uses, sub)
+		if contractDir := filepath.Join(sub, "contract"); fileExists(filepath.Join(contractDir, "go.mod")) {
+			uses = append(uses, contractDir)
+		}
 	}
 	return uses, nil
 }

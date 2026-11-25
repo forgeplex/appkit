@@ -170,6 +170,37 @@ import "github.com/forgeplex/merchant/internal/merchant"
 			},
 		},
 		{
+			name: "嵌套 contract 子模块边界与跨域 */contract import 放行",
+			cfg:  ledgerCfg,
+			files: map[string]string{
+				"internal/ledger/use_peer.go": `package ledger
+
+import (
+	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/subscription/contract/subscriptionv1"
+)
+`,
+				"contract/ledgerv1/ok.go": `package ledgerv1
+
+import (
+	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/ledger/contract/common"
+)
+`,
+				"contract/ledgerv1/bad.go": `package ledgerv1
+
+import (
+	"github.com/forgeplex/ledger/internal/ledger"
+	"github.com/jackc/pgx/v5"
+)
+`,
+			},
+			want: []wantV{
+				{File: "contract/ledgerv1/bad.go", Line: 4, Msg: "禁止反向 import 根域模块"},
+				{File: "contract/ledgerv1/bad.go", Line: 5, Msg: "contract/ 子模块禁止 import github.com/jackc/pgx/v5"},
+			},
+		},
+		{
 			name: "allowRequires 放行的 module 可 import",
 			cfg: &archcheck.Config{
 				Version: 1, Kind: archcheck.KindDomain, Domain: "ledger",

@@ -167,3 +167,42 @@ func TestDevNewModuleAppears(t *testing.T) {
 		t.Errorf("新增模块应被纳入：\n%s", data)
 	}
 }
+
+// TestDevNestedContractModules 断言 appkit dev 会自动发现并幂等纳入自身 ./contract
+// 与兄弟仓库下的 <peer>/contract 嵌套子模块。
+func TestDevNestedContractModules(t *testing.T) {
+	root := t.TempDir()
+	ledger := filepath.Join(root, "ledger")
+	writeModule(t, ledger, "example.com/ledger")
+	writeModule(t, filepath.Join(ledger, "contract"), "example.com/ledger/contract")
+
+	sub := filepath.Join(root, "subscription")
+	writeModule(t, sub, "example.com/subscription")
+	writeModule(t, filepath.Join(sub, "contract"), "example.com/subscription/contract")
+
+	if err := Dev(ledger, root, nil); err != nil {
+		t.Fatalf("Dev(ledger): %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(ledger, "go.work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gowork := string(raw)
+	for _, want := range []string{"./contract", "subscription", filepath.ToSlash(filepath.Join("subscription", "contract"))} {
+		if !strings.Contains(filepath.ToSlash(gowork), want) {
+			t.Errorf("go.work 应包含 %s:\n%s", want, gowork)
+		}
+	}
+
+	// 幂等校验
+	if err := Dev(ledger, root, nil); err != nil {
+		t.Fatalf("Dev(ledger) second call: %v", err)
+	}
+	raw2, err := os.ReadFile(filepath.Join(ledger, "go.work"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw2) != gowork {
+		t.Errorf("重复执行 Dev 应保持 go.work 不变:\n前:\n%s\n后:\n%s", gowork, string(raw2))
+	}
+}

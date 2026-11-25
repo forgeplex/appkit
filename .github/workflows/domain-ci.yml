@@ -64,7 +64,7 @@ jobs:
       # ——「appkit check 能跑」与「go.mod 整洁检查」两头必红一头，域侧无解。
       - name: 解析 appkit 工具版本
         run: |
-          v=$(go list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $2}')
+          v=$(GOWORK=off go list -m github.com/forgeplex/appkit 2>/dev/null | awk '{print $2}')
           case "$v" in
             v*) ;;
             *)
@@ -74,6 +74,10 @@ jobs:
           esac
           echo "APPKIT_TOOL=$v" >> "$GITHUB_ENV"
 
+      - name: 准备嵌套 contract 工作区（如有）
+        if: hashFiles('contract/go.mod') != ''
+        run: go work init . ./contract
+
       - name: go vet
         run: go vet ./...
 
@@ -82,6 +86,18 @@ jobs:
 
       - name: go test
         run: go test -race -count=1 ./...
+
+      - name: contract 子模块检查（vet / test / gen -check / appkit-lint）
+        if: hashFiles('contract/go.mod') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd contract && go vet ./... && go test -race -count=1 ./...)
+          shopt -s nullglob
+          for f in contract/*/contract.yaml; do
+            GOWORK=off go run github.com/forgeplex/appkit/cmd/appkit@"$APPKIT_TOOL" gen contract -check -in "$f" -dir "$(dirname "$f")"
+          done
+          (cd contract && go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@"$APPKIT_TOOL" ./...)
 
       - name: appkit check（架构检查）
         run: go run github.com/forgeplex/appkit/cmd/appkit@"$APPKIT_TOOL" check
@@ -115,5 +131,9 @@ jobs:
 
       - name: go.mod 整洁检查
         run: |
-          go mod tidy
+          rm -f go.work
+          GOWORK=off go mod tidy
           git diff --exit-code go.mod go.sum
+          if [ -f contract/go.mod ]; then
+            (cd contract && GOWORK=off go mod tidy && git diff --exit-code go.mod go.sum)
+          fi

@@ -69,6 +69,21 @@ func CheckContract(inPath, outDir string) error {
 			drift = append(drift, ContractDrift{Path: name, Reason: "stale"})
 		}
 	}
+	_, hasService := files["service.gen.go"]
+	_, hasClient := files["client.gen.go"]
+	if hasService && !hasClient {
+		for _, name := range []string{"client.gen.go", "openapi.yaml", "server.gen.go"} {
+			outPath := filepath.Join(outDir, name)
+			_, err := os.Lstat(outPath)
+			if err == nil {
+				drift = append(drift, ContractDrift{Path: name, Reason: "unexpected"})
+				continue
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("检查 %s: %w", outPath, err)
+			}
+		}
+	}
 	if len(drift) != 0 {
 		return &ContractDriftError{Files: drift}
 	}
