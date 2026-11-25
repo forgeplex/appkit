@@ -186,6 +186,15 @@ func NewCore(ctx context.Context, options ProfileOptions) (*Core, error) {
 		}
 	}
 	security := options.Security
+	if options.Capabilities.BusinessHTTP && securityConfig.Security.OIDC != nil {
+		if security.UserVerifier != nil {
+			return nil, fmt.Errorf("%s: security.oidc 与 SecurityOptions.UserVerifier 不能同时配置", options.Service)
+		}
+		security.UserVerifier, err = securityConfig.Security.OIDC.verifier(base.Env)
+		if err != nil {
+			return nil, fmt.Errorf("%s: security.oidc 配置无效: %w", options.Service, err)
+		}
+	}
 	if options.Capabilities.BusinessHTTP && securityConfig.Security.Service != nil {
 		if security.ServiceVerifier != nil {
 			return nil, fmt.Errorf("%s: security.service 与 SecurityOptions.ServiceVerifier 不能同时配置", options.Service)
@@ -309,9 +318,12 @@ func (c *Core) Start(ctx context.Context) (*RunningProfile, error) {
 			appkit.Middleware(httpserver.Base(c.deps.Log)...),
 		)
 		if c.securityMode == appkit.SecurityUserFacing || c.securityMode == appkit.SecurityMixed {
-			if len(c.options.Security.UserIssuers) != 0 {
+			switch {
+			case c.options.Security.UserVerifier != nil:
+				appOptions = append(appOptions, appkit.Middleware(c.options.Security.UserVerifier.Middleware))
+			case len(c.options.Security.UserIssuers) != 0:
 				appOptions = append(appOptions, appkit.Middleware(authn.MultiIssuer(c.options.Security.UserIssuers)))
-			} else {
+			default:
 				appOptions = append(appOptions, appkit.Middleware(authn.Middleware(c.options.AuthnPublicKey, c.options.AuthnIssuer)))
 			}
 		}

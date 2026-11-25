@@ -71,6 +71,7 @@ type Debug struct {
 // 镜像以不同 target 部署时必须由运行环境显式选择。
 type httpSecurityConfig struct {
 	Mode    appkit.SecurityMode    `koanf:"mode"`
+	OIDC    *oidcVerifierConfig    `koanf:"oidc"`
 	Service *serviceVerifierConfig `koanf:"service"`
 }
 
@@ -192,18 +193,22 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 	return RunWithSecurity(ctx, o, r, SecurityOptions{})
 }
 
-// SecurityOptions 是可选的服务身份及多用户签发方装配。独立于既有 Options/Base，避免给
+// SecurityOptions 是可选的服务身份与用户验签器装配。独立于既有 Options/Base，避免给
 // 已导出的结构体增加字段而破坏无键字面量调用方。
 type SecurityOptions struct {
 	ServiceVerifier *authn.ServiceVerifier
 	// UserIssuers 用于单进程多用户签发方/分区，与 Options.AuthnPublicKey /
 	// AuthnIssuer 互斥。密钥与 Partition 均来自可信组合根，不从请求选配置。
 	UserIssuers map[string]authn.Issuer
+	// UserVerifier 用于校验来自 forgeplex/sso 等多 Realm OIDC 提供方的用户访问令牌，
+	// 与声明式 security.oidc、UserIssuers 及 AuthnPublicKey/AuthnIssuer 互斥。
+	UserVerifier *authn.OIDCVerifier
 }
 
 // RunWithSecurity 在连接数据库、模块装配或监听端口前验证安全配置。
-// internal_service 要求有效 ServiceVerifier；mixed 还要求 Options 的单用户
-// 签发方或 SecurityOptions.UserIssuers。没有凭证的请求只可访问显式公开路由及探针。
+// internal_service 要求有效 ServiceVerifier；user_facing 要求有效用户验签配置
+// （UserVerifier / security.oidc / UserIssuers / AuthnPublicKey+AuthnIssuer）；
+// mixed 同时要求两者。没有凭证的请求只可访问显式公开路由及探针。
 func RunWithSecurity(ctx context.Context, o Options, r RunOptions, security SecurityOptions) error {
 	if o.Service == "" {
 		return fmt.Errorf("bootstrap: Options.Service 不能为空")
@@ -239,6 +244,15 @@ func RunWithSecurity(ctx context.Context, o Options, r RunOptions, security Secu
 	}
 	if r.Minimal && base.Env != "dev" {
 		return fmt.Errorf("%s: -minimal 仅允许 env=dev，当前 env=%s", o.Service, base.Env)
+	}
+	if !r.MigrateOnly && securityConfig.Security.OIDC != nil {
+		if security.UserVerifier != nil {
+			return fmt.Errorf("%s: security.oidc 与 SecurityOptions.UserVerifier 不能同时配置", o.Service)
+		}
+		security.UserVerifier, err = securityConfig.Security.OIDC.verifier(base.Env)
+		if err != nil {
+			return fmt.Errorf("%s: security.oidc 配置无效: %w", o.Service, err)
+		}
 	}
 	if !r.MigrateOnly && securityConfig.Security.Service != nil {
 		if security.ServiceVerifier != nil {
@@ -277,9 +291,12 @@ func RunWithSecurity(ctx context.Context, o Options, r RunOptions, security Secu
 	if !r.MigrateOnly && (securityMode == appkit.SecurityUserFacing || securityMode == appkit.SecurityMixed) {
 		// 验签挂在 Base 之后（内一层）：RequestID/AccessLog 在外层，
 		// 401 响应也进访问日志。
-		if len(security.UserIssuers) != 0 {
+		switch {
+		case security.UserVerifier != nil:
+			opts = append(opts, appkit.Middleware(security.UserVerifier.Middleware))
+		case len(security.UserIssuers) != 0:
 			opts = append(opts, appkit.Middleware(authn.MultiIssuer(security.UserIssuers)))
-		} else {
+		default:
 			opts = append(opts, appkit.Middleware(authn.Middleware(o.AuthnPublicKey, o.AuthnIssuer)))
 		}
 	}
@@ -363,23 +380,23 @@ func validateHTTPSecurityWithOptions(o Options, env string, mode appkit.Security
 		if len(o.AuthnPublicKey) > 0 || o.AuthnIssuer != "" {
 			return fmt.Errorf("%s: security.mode=disabled 与 AuthnPublicKey/AuthnIssuer 冲突；要验证用户令牌请使用 user_facing", o.Service)
 		}
-		if security.ServiceVerifier != nil || len(security.UserIssuers) != 0 {
-			return fmt.Errorf("%s: security.mode=disabled 与 ServiceVerifier/UserIssuers 冲突", o.Service)
+		if security.ServiceVerifier != nil || len(security.UserIssuers) != 0 || security.UserVerifier != nil {
+			return fmt.Errorf("%s: security.mode=disabled 与 ServiceVerifier/UserIssuers/UserVerifier 冲突", o.Service)
 		}
 		return nil
 	case appkit.SecurityUserFacing:
 		if security.ServiceVerifier != nil {
 			return fmt.Errorf("%s: security.mode=user_facing 与 ServiceVerifier 冲突；双身份入口须选择 mixed", o.Service)
 		}
-		return validateUserSecurity(o, mode, security.UserIssuers)
+		return validateUserSecurity(o, mode, security)
 	case appkit.SecurityInternalService, appkit.SecurityMixed:
 		if err := security.ServiceVerifier.Validate(); err != nil {
 			return fmt.Errorf("%s: security.mode=%s 需要有效的服务身份配置（ServiceVerifier）: %w", o.Service, mode, err)
 		}
 		if mode == appkit.SecurityMixed {
-			return validateUserSecurity(o, mode, security.UserIssuers)
+			return validateUserSecurity(o, mode, security)
 		}
-		if len(o.AuthnPublicKey) > 0 || o.AuthnIssuer != "" || len(security.UserIssuers) != 0 {
+		if len(o.AuthnPublicKey) > 0 || o.AuthnIssuer != "" || len(security.UserIssuers) != 0 || security.UserVerifier != nil {
 			return fmt.Errorf("%s: security.mode=internal_service 与用户验签配置冲突；双身份入口须选择 mixed", o.Service)
 		}
 		return nil
@@ -388,12 +405,21 @@ func validateHTTPSecurityWithOptions(o Options, env string, mode appkit.Security
 	}
 }
 
-func validateUserSecurity(o Options, mode appkit.SecurityMode, issuers map[string]authn.Issuer) error {
-	if len(issuers) != 0 {
+func validateUserSecurity(o Options, mode appkit.SecurityMode, security SecurityOptions) error {
+	if security.UserVerifier != nil {
+		if len(security.UserIssuers) != 0 || len(o.AuthnPublicKey) != 0 || o.AuthnIssuer != "" {
+			return fmt.Errorf("%s: UserVerifier 与 UserIssuers/AuthnPublicKey/AuthnIssuer 不能同时配置", o.Service)
+		}
+		if err := security.UserVerifier.Validate(); err != nil {
+			return fmt.Errorf("%s: security.mode=%s 需要有效的 OIDC 用户验签配置（UserVerifier / security.oidc）: %w", o.Service, mode, err)
+		}
+		return nil
+	}
+	if len(security.UserIssuers) != 0 {
 		if len(o.AuthnPublicKey) != 0 || o.AuthnIssuer != "" {
 			return fmt.Errorf("%s: UserIssuers 与 AuthnPublicKey/AuthnIssuer 不能同时配置", o.Service)
 		}
-		for issuer, spec := range issuers {
+		for issuer, spec := range security.UserIssuers {
 			if strings.TrimSpace(issuer) == "" || len(spec.Key) != ed25519.PublicKeySize {
 				return fmt.Errorf("%s: UserIssuers 需要非空 issuer 与有效 Ed25519 公钥", o.Service)
 			}

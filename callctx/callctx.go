@@ -20,8 +20,8 @@
 //
 // 分区键（Partition）是租户之外的第二个数据维度：分区域域按它选 schema，
 // 租户域按 TenantID 过滤行，一个请求可以同时带两者（分区 a 里的商户 a1）。
-// 信任模型与租户同构：外部入口以令牌签发方所属的分区为准（authn.MultiIssuer
-// 按 iss 焊入）；严格 HTTP 入站不会信任 X-Partition，内部调用也须重新验凭证。
+// 信任模型与租户同构：外部入口以令牌签发方所属的分区为准（authn.OIDCVerifier /
+// authn.MultiIssuer 按 iss 焊入）；严格 HTTP 入站不会信任 X-Partition，内部调用也须重新验凭证。
 //
 // 生成的契约 NewSecureClient 通过服务凭证传递已授权的 Partition/TenantID，
 // Caller 由接收端验签后的 sub 重建，RequestID 可明文传播。下述 Transport
@@ -56,7 +56,7 @@ type Meta struct {
 	// 路由到对应 schema。与 TenantID 是两个维度——分区决定「落哪个 schema」，
 	// 租户决定「落哪些行」；一个字段装两样东西的代价是下游按错的维度查数据
 	// （rbac 的分区键经事件 meta 传播、被租户域当业务租户查渠道，就是判例）。
-	// 认证请求以令牌签发方所属的分区为准（authn.MultiIssuer 焊入）。
+	// 认证请求以令牌签发方所属的分区为准（authn.OIDCVerifier / authn.MultiIssuer 焊入）。
 	Partition string
 	// TenantID 是多租户下的业务租户标识。下游据此选数据边界（租户域的
 	// RLS 行过滤），不可由请求体覆盖。
