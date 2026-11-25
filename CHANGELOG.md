@@ -2,6 +2,13 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.10.1（2026-11-25）
+
+v0.10.1: 修复私有域仓库嵌套 contract/go.mod 的 domain-ci.yml
+
+- domain-ci.yml 嵌套 contract 工作区改用 `go work init .` + `go work edit -replace "${cmod}=./contract"`，并隔离 `contract/` 独立检查（`GOWORK=off`），避免 CI 拉取未发布或私有远端契约
+- `go.mod 整洁检查` 清理 `go.work.sum` 并仅针对当前仓库注入 `GOPRIVATE` 与 `GIT_CONFIG_*` `GITHUB_TOKEN` 认证头（保持 `contents: read` 最小权限）
+
 ## v0.10.0（2026-11-25）
 
 v0.10.0 — nested contract submodules, in-process contracts, and outbound client foundation
