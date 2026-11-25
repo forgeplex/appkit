@@ -132,8 +132,9 @@ func TestRender_域名与模块替换(t *testing.T) {
 			`^ledger\.`,
 		}},
 		{".go-arch-lint.yml", []string{
-			`"ledger"`,
-			`"ledger/**"`,
+			`"internal/ledger"`,
+			`"internal/ledger/**"`,
+			"contract/**",
 			"mayDependOn",
 			// deepScan 会把组合根的依赖注入判成 domain → postgres，必须关掉。
 			"deepScan: false",
