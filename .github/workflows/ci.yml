@@ -49,7 +49,9 @@ jobs:
       # appkit 工作区。显式预热整个 module graph，不能依赖 runner 缓存恰好
       # 已包含仅在生成域构建中才会加载的间接依赖。
       - name: 预热完整 Go module cache
-        run: go mod download all
+        run: |
+          go mod download all
+          go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.30.0 version
 
       # Makefile 是框架自检的唯一事实源；该入口要求一次性数据库并运行 race 测试。
       - name: 框架自检（make ci）
