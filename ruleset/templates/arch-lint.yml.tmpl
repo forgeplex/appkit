@@ -1,7 +1,7 @@
 # go-arch-lint v3 配置，由 appkit sync 物化；本地改动会被 CI 漂移检查拒绝。
-# 方向性约束矩阵（docs/DESIGN.md §4）：transport 只进不出，业务包零内部依赖。
+# 方向性约束矩阵（docs/DESIGN.md §4）：transport 只进不出，业务包零内部依赖；
+# 嵌套 contract/ 子模块只依赖自身。
 version: 3
-workdir: internal
 allow:
   # 第三方依赖的限制由 depguard 承担，这里只管内部拓扑。
   depOnAnyVendor: true
@@ -10,52 +10,76 @@ allow:
   # 会被判成「domain 依赖 postgres」——而这恰恰是 wiring 的定义。
   # import 层的方向矩阵（下面的 deps）已经拦住真正的越界，不靠 deepScan。
   deepScan: false
-  # 允许尚未建出的组件目录（如暂无 inbox 的域）。
+  # 允许尚未建出的组件目录（如暂无 inbox 或 contract 的域）。
   ignoreNotFoundComponents: true
+exclude:
+  - cmd
+  - db
 components:
+  root:
+    in:
+      - .
+  contract:
+    in:
+      - contract
+      - contract/**
   domain:
     in:
-      - "{{ .Domain }}"
-      - "{{ .Domain }}/**"
+      - "internal/{{ .Domain }}"
+      - "internal/{{ .Domain }}/**"
   postgres:
     in:
-      - postgres
-      - postgres/**
+      - internal/postgres
+      - internal/postgres/**
   http:
     in:
-      - http
-      - http/**
+      - internal/http
+      - internal/http/**
   inbox:
     in:
-      - inbox
-      - inbox/**
+      - internal/inbox
+      - internal/inbox/**
   module:
     in:
-      - module
-      - module/**
+      - internal/module
+      - internal/module/**
 deps:
   # 每个组件都列出自己：go-arch-lint 把「同组件内跨包 import」也当成一条边，
-  # 不显式放行的话，凡是长出子包的域（上面的 {{ .Domain }}/** 正是为此而设）
+  # 不显式放行的话，凡是长出子包的域（上面的 internal/{{ .Domain }}/** 正是为此而设）
   # 每一次内部 import 都会报违规，规则很快就没人看了。
   #
-  # domain 只依赖自己：internal/{{ .Domain }} 不得依赖任何**其他**内部组件。
+  # domain 只依赖自身与同仓 contract/：internal/{{ .Domain }} 不得依赖任何**其他**内部组件。
+  root:
+    mayDependOn:
+      - contract
+      - domain
+      - module
+      - root
+  contract:
+    mayDependOn:
+      - contract
   domain:
     mayDependOn:
+      - contract
       - domain
   postgres:
     mayDependOn:
+      - contract
       - domain
       - postgres
   http:
     mayDependOn:
+      - contract
       - domain
       - http
   inbox:
     mayDependOn:
+      - contract
       - domain
       - inbox
   module:
     mayDependOn:
+      - contract
       - domain
       - postgres
       - http

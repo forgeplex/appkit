@@ -46,6 +46,7 @@ var domainRE = regexp.MustCompile(`^[a-z][a-z0-9]*$`)
 // 与 arch-lint 组件名冲突的保留字，不能用作 domain。
 var reservedDomains = map[string]bool{
 	"domain": true, "postgres": true, "http": true, "inbox": true, "module": true,
+	"contract": true, "root": true,
 }
 
 func (c Config) validate() error {

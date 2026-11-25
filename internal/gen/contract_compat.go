@@ -91,6 +91,17 @@ func CheckContractCompatibilitySources(baseName string, base []byte, candidateNa
 	}
 	var issues []ContractCompatibilityIssue
 	add := func(at, why string) { issues = append(issues, ContractCompatibilityIssue{at, why}) }
+	normalizeMode := func(m string) string {
+		if m == "" {
+			return contractModeFull
+		}
+		return m
+	}
+	oldMode := normalizeMode(old.Mode)
+	nextMode := normalizeMode(next.Mode)
+	if oldMode == contractModeFull && nextMode == contractModeInProcess {
+		add("mode", "mode_downgraded:full->inprocess")
+	}
 	if old.Package != next.Package {
 		add("package", "package_changed")
 	}
@@ -110,7 +121,7 @@ func CheckContractCompatibilitySources(baseName string, base []byte, candidateNa
 			add(at, "method_removed")
 			continue
 		}
-		if method.Path != other.Path {
+		if oldMode != contractModeInProcess && method.Path != other.Path {
 			add(at+".path", "path_changed")
 		}
 		if method.Idempotent != other.Idempotent {

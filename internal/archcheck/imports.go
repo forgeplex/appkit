@@ -52,6 +52,7 @@ type fileLoc struct {
 	inDomain    bool // internal/<domain>/**：业务包
 	pgxExempt   bool // internal/postgres/**、cmd/**、internal/module/**（wiring 放行）
 	inTransport bool // internal/http/**、internal/inbox/**
+	inContract  bool // contract/**：嵌套契约子模块
 }
 
 func classify(rel string, cfg *Config) fileLoc {
@@ -61,6 +62,7 @@ func classify(rel string, cfg *Config) fileLoc {
 	}
 	l.pgxExempt = underDir(rel, "internal/postgres") || underDir(rel, "cmd") || underDir(rel, "internal/module")
 	l.inTransport = underDir(rel, "internal/http") || underDir(rel, "internal/inbox")
+	l.inContract = underDir(rel, "contract")
 	return l
 }
 
@@ -69,6 +71,17 @@ func underDir(rel, d string) bool { return strings.HasPrefix(rel, d+"/") }
 
 // underPkg 判断 import 路径 imp 是否为包 pkg 本身或其子包。
 func underPkg(imp, pkg string) bool { return imp == pkg || strings.HasPrefix(imp, pkg+"/") }
+
+// isNestedContractImport reports whether imp refers to a nested contract submodule
+// or a subpackage beneath it ("github.com/forgeplex/<repo>/contract[/...]").
+func isNestedContractImport(imp string) bool {
+	if !strings.HasPrefix(imp, forgeplexPrefix) {
+		return false
+	}
+	rest := strings.TrimPrefix(imp, forgeplexPrefix)
+	parts := strings.Split(rest, "/")
+	return len(parts) >= 2 && parts[0] != "" && parts[0] != "appkit" && parts[1] == "contract"
+}
 
 func checkFileImports(path, rel string, cfg *Config) ([]Violation, error) {
 	fset := token.NewFileSet()
@@ -93,6 +106,15 @@ func checkFileImports(path, rel string, cfg *Config) ([]Violation, error) {
 // importViolation 按序检查单条 import，命中第一条规则即返回（每条 import 至多报一次）。
 func importViolation(imp string, loc fileLoc, cfg *Config) string {
 	mod := cfg.Module
+	// 规则 0：嵌套契约子模块不得反向依赖根域实现或重型 infra。
+	if loc.inContract {
+		if mod != "" && underPkg(imp, mod) && !underPkg(imp, mod+"/contract") {
+			return fmt.Sprintf("contract/ 子模块禁止反向 import 根域模块 %s（避免与实现耦合/循环依赖）", imp)
+		}
+		if strings.HasPrefix(imp, "github.com/jackc/pgx") || strings.HasPrefix(imp, "github.com/gin-gonic/") {
+			return fmt.Sprintf("contract/ 子模块禁止 import %s（契约子模块须零 infra 依赖）", imp)
+		}
+	}
 	// 规则 1：业务包零 infra，且不得反向依赖 transport / 直连 postgres。
 	if loc.inDomain {
 		switch {
@@ -121,7 +143,8 @@ func importViolation(imp string, loc fileLoc, cfg *Config) string {
 	// 规则 5：全仓禁 import 其他 forgeplex 域 module（require 铁律的 import 层复查）。
 	if cfg.Kind == KindDomain && strings.HasPrefix(imp, forgeplexPrefix) {
 		if underPkg(imp, mod) || underPkg(imp, "github.com/forgeplex/appkit") ||
-			(cfg.Contracts != "" && underPkg(imp, cfg.Contracts)) {
+			(cfg.Contracts != "" && underPkg(imp, cfg.Contracts)) ||
+			isNestedContractImport(imp) {
 			return ""
 		}
 		for _, m := range cfg.AllowRequires {

@@ -118,4 +118,56 @@ import "github.com/jackc/pgx/v5"
 		}
 		assertViolations(t, got, nil)
 	})
+
+	t.Run("含嵌套 contract/go.mod 的干净 domain 仓库零违规", func(t *testing.T) {
+		dir := writeRepo(t, map[string]string{
+			".appkit.yml": `version: 1
+domain: ledger
+module: github.com/forgeplex/ledger
+contracts: github.com/forgeplex/ledger/contract
+allowRequires: []
+`,
+			"go.mod": `module github.com/forgeplex/ledger
+
+go 1.26
+
+require (
+	github.com/forgeplex/appkit v0.1.0
+	github.com/forgeplex/ledger/contract v0.1.0
+	github.com/forgeplex/subscription/contract v0.1.0
+)
+`,
+			"contract/go.mod": `module github.com/forgeplex/ledger/contract
+
+go 1.26
+
+require github.com/forgeplex/appkit v0.1.0
+`,
+			"contract/ledgerv1/service.go": `package ledgerv1
+
+import "github.com/forgeplex/appkit/apperr"
+`,
+			"internal/ledger/service.go": `package ledger
+
+import (
+	"context"
+
+	"github.com/forgeplex/appkit/tx"
+	"github.com/forgeplex/ledger/contract/ledgerv1"
+	"github.com/forgeplex/subscription/contract/subscriptionv1"
+)
+`,
+			"internal/postgres/store.go": `package postgres
+
+import "github.com/jackc/pgx/v5"
+`,
+			"db/queries/q.sql":            "SELECT o.id FROM ledger.outbox o;\n",
+			"db/migrations/0001_init.sql": "CREATE SCHEMA IF NOT EXISTS ledger;\n",
+		})
+		got, err := archcheck.Run(dir)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		assertViolations(t, got, nil)
+	})
 }

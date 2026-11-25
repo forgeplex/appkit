@@ -14,10 +14,18 @@ import (
 	yaml "go.yaml.in/yaml/v3"
 )
 
+const (
+	contractModeFull      = "full"
+	contractModeInProcess = "inprocess"
+)
+
 // contractDoc 是 contract.yaml 的顶层 schema——契约包的事实源：
 // 接口、DTO、wrapper、client、openapi 导出全部由它派生（DESIGN §3）。
+// Mode 为 "full"（默认）时生成含 HTTP client/server/openapi 的全套契约文件；
+// 为 "inprocess" 时仅生成 service.gen.go 与 wrap.gen.go，供纯进程内集成。
 type contractDoc struct {
 	Version int         `yaml:"version"`
+	Mode    string      `yaml:"mode"`
 	Package string      `yaml:"package"`
 	System  string      `yaml:"system"`
 	Types   []typeDef   `yaml:"types"`
@@ -101,6 +109,11 @@ var contractFilenames = []string{
 	"client.gen.go", "openapi.yaml", "server.gen.go", "service.gen.go", "wrap.gen.go",
 }
 
+// contractInProcessFilenames lists the files generated when mode is "inprocess".
+var contractInProcessFilenames = []string{
+	"service.gen.go", "wrap.gen.go",
+}
+
 // contractV2Filenames use distinct names so a V2 schema can be generated next
 // to an existing V1 package without replacing its stable Unary artifacts.
 var contractV2Filenames = []string{
@@ -110,6 +123,9 @@ var contractV2Filenames = []string{
 func contractOutputFilenames(files map[string][]byte) []string {
 	if _, ok := files["service_v2.gen.go"]; ok {
 		return contractV2Filenames
+	}
+	if _, ok := files["client.gen.go"]; !ok {
+		return contractInProcessFilenames
 	}
 	return contractFilenames
 }
@@ -187,11 +203,13 @@ func RenderContractSource(sourceName string, data []byte) (map[string][]byte, er
 	files := map[string][]byte{
 		"service.gen.go": service,
 		"wrap.gen.go":    renderWrap(doc.Package, "Service", doc.System, methods, imports),
-		"client.gen.go":  renderClient(doc),
-		"server.gen.go":  renderServer(doc),
-		"openapi.yaml":   renderOpenAPI(doc),
 	}
-	for _, name := range contractFilenames {
+	if doc.Mode != contractModeInProcess {
+		files["client.gen.go"] = renderClient(doc)
+		files["server.gen.go"] = renderServer(doc)
+		files["openapi.yaml"] = renderOpenAPI(doc)
+	}
+	for _, name := range contractOutputFilenames(files) {
 		if !strings.HasSuffix(name, ".go") {
 			continue
 		}
@@ -224,6 +242,11 @@ func parseContractSource(inPath string, data []byte) (*contractDoc, error) {
 	}
 	if doc.Version != 1 {
 		return nil, fmt.Errorf("%s: 不支持的 version %d（当前仅支持 1）", inPath, doc.Version)
+	}
+	switch doc.Mode {
+	case "", contractModeFull, contractModeInProcess:
+	default:
+		return nil, fmt.Errorf("%s: mode %q 非法（只允许 full 或 inprocess）", inPath, doc.Mode)
 	}
 	if !rePackage.MatchString(doc.Package) {
 		return nil, fmt.Errorf("%s: package %q 非法（须匹配 ^[a-z][a-z0-9]*$）", inPath, doc.Package)
@@ -314,13 +337,15 @@ func checkMethodsDoc(inPath string, doc *contractDoc, named map[string]bool) err
 			return fmt.Errorf("%s: 方法名 %q 与 %s:%d 重复", at, m.Name, inPath, prev)
 		}
 		seenName[m.Name] = m.line
-		if !rePath.MatchString(m.Path) {
-			return fmt.Errorf("%s: 方法 %s 的 path %q 非法（须为 / 开头的安全路径）", at, m.Name, m.Path)
+		if m.Path != "" || doc.Mode != contractModeInProcess {
+			if !rePath.MatchString(m.Path) {
+				return fmt.Errorf("%s: 方法 %s 的 path %q 非法（须为 / 开头的安全路径）", at, m.Name, m.Path)
+			}
+			if prev, dup := seenPath[m.Path]; dup {
+				return fmt.Errorf("%s: path %q 与 %s:%d 重复", at, m.Path, inPath, prev)
+			}
+			seenPath[m.Path] = m.line
 		}
-		if prev, dup := seenPath[m.Path]; dup {
-			return fmt.Errorf("%s: path %q 与 %s:%d 重复", at, m.Path, inPath, prev)
-		}
-		seenPath[m.Path] = m.line
 		if m.Doc == "" {
 			// 契约是给别的团队读的：没有 doc 的方法不该进合约仓库。
 			return fmt.Errorf("%s: 方法 %s 缺少 doc（契约方法的用途说明）", at, m.Name)
@@ -513,13 +538,21 @@ func renderService(doc *contractDoc) []byte {
 		}
 	}
 
-	fmt.Fprintf(&b, "// Service 是 %s 域的契约接口（事实源 contract.yaml）。进程内 wrapper\n", doc.System)
-	b.WriteString("// 与远程 client 实现同一个接口，调用方无从（也不需要）分辨对端形态。\n")
+	if doc.Mode == contractModeInProcess {
+		fmt.Fprintf(&b, "// Service 是 %s 域的进程内契约接口（事实源 contract.yaml）。\n", doc.System)
+	} else {
+		fmt.Fprintf(&b, "// Service 是 %s 域的契约接口（事实源 contract.yaml）。进程内 wrapper\n", doc.System)
+		b.WriteString("// 与远程 client 实现同一个接口，调用方无从（也不需要）分辨对端形态。\n")
+	}
 	b.WriteString("type Service interface {\n")
 	for _, m := range doc.Methods {
 		docLine := m.Doc
 		if m.Idempotent {
-			docLine += "幂等：重复执行安全，client 会对可用性故障做有界重试。"
+			if doc.Mode == contractModeInProcess {
+				docLine += "幂等：重复执行安全。"
+			} else {
+				docLine += "幂等：重复执行安全，client 会对可用性故障做有界重试。"
+			}
 		}
 		fmt.Fprintf(&b, "\t// %s %s\n", m.Name, docLine)
 		fmt.Fprintf(&b, "\t%s\n", methodSig(&m))
