@@ -111,9 +111,9 @@ func topLevelSQLWords(s string) []string {
 				depth--
 			}
 			i++
-		case isSQLIdentStart(c):
+		case isIdentStart(c):
 			start := i
-			for i < len(s) && isSQLIdentPart(s[i]) {
+			for i < len(s) && isIdentPart(s[i]) {
 				i++
 			}
 			if depth == 0 {
@@ -124,35 +124,6 @@ func topLevelSQLWords(s string) []string {
 		}
 	}
 	return words
-}
-
-func matchDollarTag(s string) (string, bool) {
-	if len(s) < 2 || s[0] != '$' {
-		return "", false
-	}
-	if s[1] == '$' {
-		return "$$", true
-	}
-	if !isSQLIdentStart(s[1]) {
-		return "", false
-	}
-	for i := 2; i < len(s); i++ {
-		if s[i] == '$' {
-			return s[:i+1], true
-		}
-		if !isSQLIdentPart(s[i]) {
-			return "", false
-		}
-	}
-	return "", false
-}
-
-func isSQLIdentStart(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
-}
-
-func isSQLIdentPart(c byte) bool {
-	return isSQLIdentStart(c) || (c >= '0' && c <= '9')
 }
 
 // CheckQueries 扫描 db/queries/*.sql 中的高危 SQL 写法：
