@@ -21,7 +21,7 @@ func renderClientV2(doc *contractDocV2) []byte {
 		b.WriteString("\t\"github.com/forgeplex/appkit/httpserver\"\n")
 	}
 	if hasV2Unary(doc) {
-		b.WriteString("\t\"github.com/forgeplex/appkit/apperr\"\n\t\"github.com/forgeplex/appkit/callctx\"\n\t\"github.com/forgeplex/appkit/outbound\"\n")
+		b.WriteString("\t\"github.com/forgeplex/appkit/apperr\"\n")
 	}
 	b.WriteString(")\n\n")
 
@@ -114,9 +114,8 @@ func renderV2UnaryWrapper(b *bytes.Buffer, doc *contractDocV2) {
 }
 
 func renderV2HTTPClient(b *bytes.Buffer, doc *contractDocV2) {
-	b.WriteString("// ClientV2 is the generated remote binding for V2 Unary methods.\ntype ClientV2 struct { base string; hc *http.Client; secure bool }\n\n")
-	b.WriteString("// NewClientV2 is the legacy/dev entry point; production callers should use NewSecureClientV2.\nfunc NewClientV2(base, caller string, hc *http.Client) *ClientV2 {\n\tif hc == nil { hc = &http.Client{} }\n\tinner := *hc\n\tinner.Transport = callctx.Transport{Base: outbound.InstrumentTransport(hc.Transport), Caller: caller}\n\treturn &ClientV2{base: strings.TrimSuffix(base, \"/\"), hc: &inner}\n}\n\n")
-	b.WriteString("// NewSecureClientV2 creates the authenticated HTTPS client for V2 Unary methods.\nfunc NewSecureClientV2(base string, opts contract.SecureClientOptions) (*ClientV2, error) {\n\thc, err := contract.NewSecureHTTPClient(base, opts)\n\tif err != nil { return nil, err }\n\treturn &ClientV2{base: strings.TrimSuffix(base, \"/\"), hc: hc, secure: true}, nil\n}\n\n")
+	b.WriteString("// ClientV2 is the generated remote binding for V2 Unary methods.\ntype ClientV2 struct { base string; hc *http.Client }\n\n")
+	b.WriteString("// NewSecureClientV2 creates the authenticated HTTPS client for V2 Unary methods.\nfunc NewSecureClientV2(base string, opts contract.SecureClientOptions) (*ClientV2, error) {\n\thc, err := contract.NewSecureHTTPClient(base, opts)\n\tif err != nil { return nil, err }\n\treturn &ClientV2{base: strings.TrimSuffix(base, \"/\"), hc: hc}, nil\n}\n\n")
 	b.WriteString("var _ ServiceV2 = (*ClientV2)(nil)\n\n")
 	for _, m := range doc.Methods {
 		if m.Kind == "unary" {
@@ -144,7 +143,7 @@ func renderV2UnaryClientMethod(b *bytes.Buffer, doc *contractDocV2, m methodDefV
 		fmt.Fprintf(b, "\tcall := func() (%s, error) {\n\t\treturn %s", resultType, call)
 		fmt.Fprintf(b, "\t\threq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+%q, http.NoBody)\n", m.Path)
 	}
-	fmt.Fprintf(b, "\t\tif err != nil { return %s{}, apperr.Internal(err) }\n\t\threq.Header.Set(\"Content-Type\", \"application/json\")\n\t\treturn doV2[%s](c.hc, hreq, c.secure)\n\t})\n\t}\n", resultType, resultType)
+	fmt.Fprintf(b, "\t\tif err != nil { return %s{}, apperr.Internal(err) }\n\t\threq.Header.Set(\"Content-Type\", \"application/json\")\n\t\treturn doV2[%s](c.hc, hreq)\n\t})\n\t}\n", resultType, resultType)
 	if m.Idempotent {
 		if len(m.Response) == 0 {
 			b.WriteString("\t_, err := retryUnavailableV2(ctx, call)\n\treturn err\n}\n\n")
@@ -166,11 +165,11 @@ func v2UnaryResult(m methodDefV2) string {
 }
 
 func renderV2HTTPDo(b *bytes.Buffer) {
-	b.WriteString(`func doV2[T any](hc *http.Client, hreq *http.Request, secure bool) (T, error) {
+	b.WriteString(`func doV2[T any](hc *http.Client, hreq *http.Request) (T, error) {
 	var zero T
 	resp, err := hc.Do(hreq)
 	if err != nil {
-		if secure && (apperr.Is(err, apperr.CodeUnauthenticated) || apperr.Is(err, apperr.CodePermissionDenied) || apperr.Is(err, apperr.CodeInvalidArgument)) {
+		if apperr.Is(err, apperr.CodeUnauthenticated) || apperr.Is(err, apperr.CodePermissionDenied) || apperr.Is(err, apperr.CodeInvalidArgument) {
 			return zero, apperr.From(err)
 		}
 		return zero, apperr.Unavailable(err)

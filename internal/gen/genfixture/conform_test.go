@@ -2,7 +2,6 @@ package genfixture
 
 import (
 	"context"
-	"net/http/httptest"
 	"testing"
 
 	"github.com/forgeplex/appkit/apperr"
@@ -12,14 +11,12 @@ import (
 
 // TestGeneratedArtifactsConform 是合约仓库生成物的终证：同一份
 // contract.yaml 生成的进程内 wrapper 与远程 client（打生成的 server
-// handler，真 HTTP 回环）过同一批 Conform 用例——「部署形态是启动参数」
+// handler，真 HTTPS 回环 + 服务 JWT 验签）过同一批 Conform 用例——「部署形态是启动参数」
 // 在这条契约上成立。两个绑定共用同一个 stub，SeenMeta 读同一处。
 func TestGeneratedArtifactsConform(t *testing.T) {
 	stub := &stubService{}
 	local := WrapService(stub, 0)
-	srv := httptest.NewServer(NewHTTPHandler(WrapService(stub, 0)))
-	t.Cleanup(srv.Close)
-	remote := NewClient(srv.URL, "conform-test", nil)
+	remote, _ := remoteStub(t, stub)
 
 	apptest.Conform(t,
 		[]apptest.Binding[Service]{

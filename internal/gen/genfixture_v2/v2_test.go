@@ -95,9 +95,18 @@ func fixtureConfig() contract.StreamConfig {
 
 func TestV2UnaryHTTPClientServer(t *testing.T) {
 	service := WrapServiceV2(fixtureService{}, 0)
-	server := httptest.NewServer(NewHTTPHandlerV2(service))
+	server := httptest.NewTLSServer(NewHTTPHandlerV2(service))
 	defer server.Close()
-	client := NewClientV2(server.URL, "fixture", nil)
+	client, err := NewSecureClientV2(server.URL, contract.SecureClientOptions{
+		Audience:   "fixture",
+		HTTPClient: server.Client(),
+		Credentials: contract.ServiceCredentialProviderFunc(func(context.Context, contract.ServiceScope) (contract.ServiceCredential, error) {
+			return contract.ServiceCredential{Token: "v2-test-token", ExpiresAt: time.Now().Add(time.Minute)}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	got, err := client.Ping(context.Background(), PingRequestV2{Name: "AppKit"})
 	if err != nil || got.Message != "hello AppKit" {
 		t.Fatalf("Ping() = %+v, %v", got, err)

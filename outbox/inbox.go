@@ -11,18 +11,6 @@ import (
 	"github.com/forgeplex/appkit/pgtx"
 )
 
-// Inbox 把 next 包装为幂等消费者：以 INSERT … ON CONFLICT DO NOTHING 在
-// {schema}.inbox 占位，占位冲突说明该事件已处理过，直接返回 nil；占位成功才调
-// next。去重键是 (consumer, event_id)：同一事件可被多个消费者各自处理一次，
-// 只在同一 consumer 内去重——同 topic 的第二个消费者不会被静默跳过。
-// 该兼容入口使用普通 pgtx.Transactor 开启事务。若业务使用租户、分区域或双层
-// 隔离，应改用 InboxWithTransactor，并传入同一套 pgtx Transactor；这样 Inbox
-// 占位、Service 的嵌套 Do/savepoint 和 repository 写入都在同一个已验证作用域内。
-// schema 不合法或 consumer 为空时 panic（构造期编程错误，fail-fast）。
-func Inbox(pool *pgxpool.Pool, schema, consumer string, next appkit.EventHandler) appkit.EventHandler {
-	return InboxWithTransactor(pool, pgtx.New(pool), schema, consumer, next)
-}
-
 // InboxWithTransactor 把 next 包装为幂等消费者，并使用 transactor 划定事务边界。
 // transactor 必须与 pool 连接到同一个数据库；pool 仅用于在事务上下文内取得
 // pgtx DBTX，实际查询会落到 transactor 建立的当前 pgx.Tx。

@@ -162,8 +162,8 @@ appkit new domain rbac -partitioned -dir rbac
 
 1. **schema 由调用方确定**。迁移与查询全部**不带 schema 前缀**；每次 `tx.Do`
    开启事务后按调用方的分区键（`callctx.Meta.Partition`）`SET LOCAL search_path`
-   路由到对应分区。分区键的来源与租户同构：认证请求由 `authn.MultiIssuer`
-   按令牌签发方焊入（iss=`rbac-a` ↔ 分区 `a`）。严格 HTTP 模式会在最外层
+   路由到对应分区。分区键的来源与租户同构：认证请求由 `authn.OIDCVerifier`
+   按已验令牌配置焊入（`Partition`）。严格 HTTP 模式会在最外层
    清除 `X-Partition` / `X-Tenant-Id` 及预置的分区/租户，必须由已验证凭证
    重建，不能只凭东西向头信任身份。事件 meta 可以携带分区，但消费者须
    保证消息来自可信链路。它与 `Meta.TenantID`（业务租户）是两个字段——分区
@@ -965,10 +965,19 @@ func TestIdentityConformance(t *testing.T) {
     srv := httptest.NewServer(identityv1.NewHTTPHandler(impl))
     t.Cleanup(srv.Close)
 
+    cli, err := identityv1.NewSecureClient(srv.URL, contract.SecureClientOptions{
+        Audience:           "identity",
+        AllowInsecureHTTP:  true, // 仅限测试 loopback
+        CredentialProvider: testCredProvider,
+    })
+    if err != nil {
+        t.Fatal(err)
+    }
+
     apptest.Conform(t,
         []apptest.Binding[identityv1.Service]{
             {Name: "local", Service: impl},
-            {Name: "remote", Service: identityv1.NewClient(srv.URL, "authn", nil)},
+            {Name: "remote", Service: cli},
         },
         []apptest.Case[identityv1.Service]{
             {Name: "凭据正确", Do: verify("a@b.c", "right"),
@@ -1406,11 +1415,20 @@ upstream_http:
 spy := &metaSpy{inner: echo.NewService()} // 记下服务端每次看到的 callctx.Meta
 seen := func() callctx.Meta { return spy.Last() }
 
-apptest.Conform(t,
-    []apptest.Binding[echov1.Service]{
-        {Name: "local", Service: echov1.WrapService(spy, 0), SeenMeta: seen},
-        {Name: "remote", Service: echov1.NewClient(srv.URL, "echo", nil), SeenMeta: seen},
-    },
+    cli, err := echov1.NewSecureClient(srv.URL, contract.SecureClientOptions{
+        Audience:           "echo",
+        AllowInsecureHTTP:  true, // 仅限测试 loopback
+        CredentialProvider: testCredProvider,
+    })
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    apptest.Conform(t,
+        []apptest.Binding[echov1.Service]{
+            {Name: "local", Service: echov1.WrapService(spy, 0), SeenMeta: seen},
+            {Name: "remote", Service: cli, SeenMeta: seen},
+        },
     []apptest.Case[echov1.Service]{
         // 检查跑在这条上：它要额外发一次真实调用，得有 Idempotent 授权。
         {Name: "回显", Do: echoCall("hi"), Want: ..., Idempotent: true},
@@ -1600,60 +1618,35 @@ reg.MountAuthenticated("/files/", mux)
 appkit: 模块 "files" 绑定了未声明的权限码 "files:wirte"——在 Register 阶段用 reg.Permissions 声明
 ```
 
-### ③ `user_facing` 组合根挂验签（两行）
+### ③ `user_facing` 组合根挂验签（OIDC）
 
-私钥在提供方；组合根只持 Ed25519 公钥。`appkit new system` 生成的 main.go
-加两个字段：
+用户面验签统一走 OIDC（`authn.OIDCVerifier`）。推荐在配置文件中填写 `security.oidc`
+（由 `bootstrap.Main` / `bootstrap.Run` 自动加载），或通过 `SecurityOptions.UserVerifier`
+注入自定义验签器：
+
+```yaml
+# config/prod.yaml
+security:
+  mode: user_facing
+  oidc:
+    realms:
+      - issuer: https://idp.example.com
+        audience: psp-api
+        # partition: a # 多分区同进程时按需设置，将分区键焊进 callctx
+```
+
+手写 `appkit.New` 时同时注入 OIDC 验签中间件与安全模式：
 
 ```go
-bootstrap.Main(bootstrap.Options{
-    Service: "sso",
-    // …Modules / Minimal / AppOptions 照旧…
-    AuthnPublicKey: mustEd25519Pub(cfg.Authn.PubkeyFile), // user_facing 必填
-    AuthnIssuer:    cfg.Authn.Issuer,                     // 如 "rbac-demo"
+verifier, err := authn.NewOIDCVerifier(authn.OIDCVerifierOptions{
+    Realms: []authn.OIDCRealm{
+        {Issuer: "https://idp.example.com", Audience: "psp-api"},
+    },
 })
-```
-
-```go
-func mustEd25519Pub(path string) ed25519.PublicKey {
-	p, err := os.ReadFile(path)
-	if err != nil {
-		panic(err)
-	}
-	block, _ := pem.Decode(p)
-	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
-	if err != nil {
-		panic(err)
-	}
-	ed, ok := pub.(ed25519.PublicKey)
-	if !ok {
-		panic(path + ": 不是 Ed25519 公钥")
-	}
-	return ed
-}
-```
-
-公钥必须恰好是 Ed25519 的 32 字节，issuer 也必填——没有 iss 约束的验签会接受
-其他系统的令牌。手写 `appkit.New` 要同时注入验签中间件与安全模式：
-
-```go
-appkit.Middleware(authn.Middleware(pub, issuer)),
+// ...
+appkit.Middleware(verifier.Middleware),
 appkit.Security(appkit.SecurityUserFacing),
 ```
-
-多分区同进程（N 个 rbac 分区，每个一个 iss=`rbac-<分区键>`）用多签发方形态，
-同时显式配置安全模式；分区键焊进 `callctx`（分区域 / 分区 + 行级的域据此路由）：
-
-```go
-appkit.Middleware(authn.MultiIssuer(map[string]authn.Issuer{
-    "rbac-a": {Key: pubA, Partition: "a"},
-    "rbac-b": {Key: pubB, Partition: "b"}, // 可各配一把密钥，缩小泄露半径
-})),
-appkit.Security(appkit.SecurityUserFacing),
-```
-
-按令牌 iss 选公钥（伪造 iss 只会取到别家的钥而验不过）；step-up 证明必须与
-访问令牌同一签发方；未知 iss 401。
 
 行为约定：无 Authorization 头时，验签中间件本身不报错；`MountPublic`
 可继续，`MountAuthenticated` / `MountPermission` 的守卫返回 401。有头但
@@ -1681,8 +1674,8 @@ step-up 令牌），重试时放进 `X-Step-Up` 头；框架验它的签名、is
   完成，框架判定永远是集合包含；
 - **step-up 令牌**（`X-Step-Up`）：JWT / EdDSA；`iss`、`sub`（与访问令牌
   一致）、`exp`、`purpose="step-up"`、`iat`；
-- **密钥与 iss**：Ed25519 公钥交组合根配置，iss 唯一标识提供方（多分区
-  各自一个 iss，组合根经 `authn.MultiIssuer` 把 iss 映射到分区键）。
+- **密钥与 iss**：由 OIDC IdP JWKS 提供，组合根在 `security.oidc.realms[]` 配置 `issuer`、
+  `audience` 与可选分区映射（`partition`）。
 
 两个注意：权限是令牌快照，变更（授/撤）在令牌过期后才生效——需要即时
 生效的码，提供方把对应令牌的 `exp` 签短一点；拆分部署时每个服务**自己**

@@ -44,7 +44,7 @@ example 的单分区形态（`partitionKey = "demo"` → schema `rbac_demo`）�
 **③ 分区键 ≠ 业务租户。** `callctx.Meta` 里这两个维度是两个字段：
 `Partition`（分区键）决定事务路由到哪个 schema，`TenantID`（业务租户）
 决定行落在哪个 `tenant_id`；各自的头（`X-Partition` / `X-Tenant-Id`）、各自
-的事件 meta 键，认证请求都以令牌为准（`authn.MultiIssuer` 按签发方焊分区，
+的事件 meta 键，认证请求都以令牌为准（`authn.OIDCVerifier` 按配置焊分区，
 `tid` 焊租户）。它们曾经共用一个字段，混用有真实事故——example 早期验证码
 邮件死信，就是 rbac 的分区键 `demo` 经 outbox 事件 meta → relay → `callctx`
 传播，被 email 域当成业务租户查渠道（`tenant_id = 'demo'` 零匹配）。判例见
@@ -160,8 +160,8 @@ Partitions: map[string]rbac.PartitionSpec{
 
 **④ 判定（两个门）。** 域内端点用 `reg.Require(code, handler)` 绑码
 （demo.go 有一字不差的判定矩阵：未认证 401 / 无码 403 / 有码 200，
-挑战码还须新鲜 step-up 证明）；框架侧由组合根挂 `authn.Middleware` 验签
-（多分区同进程用 `authn.MultiIssuer`，一并把分区键焊进 callctx）。
+挑战码还须新鲜 step-up 证明）；框架侧由组合根挂 `authn.OIDCVerifier` 验签
+（按需一并把分区键焊进 callctx）。
 files / ledger 域的 HTTP 面尚未绑码（判定归组合根/网关的部署现状）——
 新域从第一天就绑，域内判定与框架机制并存互补。跨租户码只开门，不开
 数据：数据面的放开是用例里的 `tx.WithReadAllTenants`（第 3 节纪律 3），
@@ -208,7 +208,7 @@ apps/
 `-partitioned -tenant` 双层形态（GUIDE §3.3）——平台一套 schema，平台内
 商户分行，运营是分区内 `tenant_id = platform` 的普通用户，读全部的边界是
 本平台的 schema。组合根注入 `Partitions`/`Schemas` 映射与
-`authn.MultiIssuer`，加一个平台 = 每个分区域加一条映射 + 重启。判据：
+OIDC 验签配置，加一个平台 = 每个分区域加一条映射 + 重启。判据：
 平台是部署期决定的；平台要运行时入驻、数量无上界，这个形态不合适。
 
 ## 6. 能力域的租户语义是现成的
@@ -264,7 +264,7 @@ relay 投递时还原成 `callctx`——下游域 `tenantOf(ctx)` 取到的是**
 | 商户怎么隔离 | 租户域：tenant_id 列 + RLS | §2 / GUIDE §3.2 |
 | 什么时候开新分区 | 数据互不相关 / 合规要求，与前端数量无关 | §1② |
 | 跨租户管理怎么写 | All\* 用例 + 域声明跨租户码 + 组合根授予；读用 `tx.WithReadAllTenants`，写显式切目标租户 | §3 / §4 |
-| N 个平台各自独立 | 平台 = 分区（`-partitioned -tenant` 双层），`authn.MultiIssuer` 按 iss 焊分区键 | §5 / GUIDE §3.3 |
+| N 个平台各自独立 | 平台 = 分区（`-partitioned -tenant` 双层），OIDC 验签配置焊分区键 | §5 / GUIDE §3.3 |
 | 字段 10 vs 5 | 不该知道 → 双 DTO；纯排版 → 前端裁 | §3③ |
 | 运营/商户何时拆组合根 | 前端团队分头 / 网络隔离；拆时同库同分区 | §5 |
 | 平台发信、商户收信 | email 全局渠道兜底，零配置 | §6 |

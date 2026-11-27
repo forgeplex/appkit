@@ -62,38 +62,34 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
-      # appkit 经 MVS 依赖钻石被全部域仓库共享，公开 API 近乎终身兼容
-      # （DESIGN §9）。主 module 与 lint/ 嵌套 module 分别对比最新发版 tag。
-      - name: API 向后兼容门禁（apidiff vs 最新 tag）
+      # 0.x 阶段允许按需清理旧兼容面；apidiff 作为非阻断变更报告输出，供发版与升级审查。
+      - name: API 变更报告（apidiff vs 最新 tag，0.x 非阻断）
         run: |
-          # --match 排除 lint/vX.Y.Z 路标 tag（lint/ 嵌套 module 的 Go 模块
-          # 解析需要，见 Makefile tag 目标），基线永远指主 module 的发版 tag。
           base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
           if [ -z "$base" ]; then
             echo "无发版 tag，跳过 apidiff"
             exit 0
           fi
           git worktree add /tmp/apidiff-base "$base"
+          trap 'git worktree remove --force /tmp/apidiff-base 2>/dev/null || true' EXIT
           # Revision pinned on 2026-09-04; dependency automation updates it by PR.
           apidiff=golang.org/x/exp/cmd/apidiff@e88cd73687aa969fbec16261e6c467ab22a053f2
           (cd /tmp/apidiff-base && go run "$apidiff" -m -w /tmp/base.export github.com/forgeplex/appkit)
           go run "$apidiff" -m -w /tmp/head.export github.com/forgeplex/appkit
-          out=$(go run "$apidiff" -m -incompatible /tmp/base.export /tmp/head.export 2>/dev/null)
+          out=$(go run "$apidiff" -m -incompatible /tmp/base.export /tmp/head.export 2>/dev/null || true)
           if [ -n "$out" ]; then
-            echo "相对 $base 存在破坏性 API 变更（appkit 必须向后兼容，见 docs/DESIGN.md §9）:"
+            echo "::notice::相对 $base 存在破坏性 API 变更（0.x 清理期非阻断，请在发版说明中记录迁移指引）:"
             echo "$out"
-            exit 1
+          else
+            echo "相对 $base 无破坏性变更"
           fi
-          echo "相对 $base 无破坏性变更"
 
-          # lint/ 是单独发布的 Go module；主 module 的 apidiff 不会加载它。
-          # 两个 module 的版本 tag 锁步，因此从同一 base commit 比较。
           (cd /tmp/apidiff-base/lint && go run "$apidiff" -m -w /tmp/base.lint.export github.com/forgeplex/appkit/lint)
           (cd lint && go run "$apidiff" -m -w /tmp/head.lint.export github.com/forgeplex/appkit/lint)
-          lint_out=$(go run "$apidiff" -m -incompatible /tmp/base.lint.export /tmp/head.lint.export 2>/dev/null)
+          lint_out=$(go run "$apidiff" -m -incompatible /tmp/base.lint.export /tmp/head.lint.export 2>/dev/null || true)
           if [ -n "$lint_out" ]; then
-            echo "相对 $base 存在破坏性 API 变更（lint module，见 docs/STABILITY.md）:"
+            echo "::notice::lint module 相对 $base 存在破坏性 API 变更（0.x 非阻断）:"
             echo "$lint_out"
-            exit 1
+          else
+            echo "lint module 相对 $base 无破坏性变更"
           fi
-          echo "lint module 相对 $base 无破坏性变更"

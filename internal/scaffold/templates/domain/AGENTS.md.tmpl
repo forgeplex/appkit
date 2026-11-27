@@ -7,7 +7,7 @@ AI 编码代理的操作规程：照此行事，架构检查与 CI 会绿；绕�
 
 ## 分区域域（partitioned）——先读这段再动手
 
-本域一套代码、N 份数据分区：schema 由调用方确定（authn.MultiIssuer 按令牌
+本域一套代码、N 份数据分区：schema 由调用方确定（authn.OIDCVerifier 按 Realm
 签发方确定分区，已验证 principal 把分区键重建进 `callctx.Meta.Partition`；
 unsigned `X-Partition` 只负责传输、不授信。组合根注入「分区键 → schema」
 映射，见 `internal/module/module.go`）。租户行级身份是独立的 `TenantID`。
@@ -157,30 +157,32 @@ unsigned `X-Partition` 只负责传输、不授信。组合根注入「分区键
 
 1. **不按层拆**：不要 `internal/{{.Name}}/model`、`/service`、`/repo`——包名读不出
    内容、`model.User` 必然 stutter，且没解决任何阅读问题（找一个功能仍要跨三个
-   目录）；
+   目录）；`make check`（`appkit check`）会直接拒绝常见按层子目录名；
 2. **不拆成平级包**：`internal/<功能>` 与 `internal/{{.Name}}` 平级会逃出「业务包
    零 infra import」的机检（depguard / go-arch-lint / appkit check 都按
-   `internal/{{.Name}}/**` 圈定业务包），在里面 import `net/http` 不会有任何告警。
+   `internal/{{.Name}}/**` 圈定业务包）；`make check` 已白名单锁定 `internal/` 顶层目录，
+   未知平级目录会直接报红。
 
-这一节是约定级（文件组织没有可靠的 lint 落点），靠 review 与本规程维持。
+目录拓扑由 `make check` 机检；单文件命名与拆分粒度仍属约定级，靠 review 与本规程维持。
 
 ## 惯用法（别自己发明）
 
 - **HTTP 安全模式**：每个监听进程必须显式配置 `security.mode`；生成的 dev
   配置用 `disabled` 只为本地开发，staging/prod 禁用它。模块只负责给每条根
   路由选安全分类，组合根负责按部署暴露面选择模式和装配验签器；不要把“内网”
-  当作身份校验。`user_facing` 配置 `AuthnPublicKey`/`AuthnIssuer`；
+  当作身份校验。`user_facing` 配置 `security.oidc` 或 `UserVerifier`；
   `internal_service/mixed` 配置 `security.service` 或 ServiceVerifier，缺失时
   fail closed。服务 JWT 的租户/分区委托必须显式授权；
 - **金额**：存储与运算用 `decimal.Decimal`（sqlc 已把 NUMERIC 全局 override
   成它，无需注册任何 codec）；需要把"币种+金额"绑在一起时才用 `money.Money`
   （领域层值对象，不落库——币种另列存）。JSON/合约边界金额一律字符串，
   入站解析用 `money.ParseCanonical`（规范形态：拒 "+80"/"080"/"8e1"/负零，
-  同值同串，幂等指纹与签名才不歪）。禁 float、decimal 不上 JSON 面都有
-  机检：`make lint` 与 CI 的 appkit-lint（moneyfloat/decjson，默认只查
-  生产代码，`-xxx.tests=true` 连测试一起查）；
+  同值同串，幂等指纹与签名才不歪）。禁 float、decimal 不上 JSON 面、禁
+  `json.Unmarshal` 直接解进 `any`/`map[string]any` 都有机检：`make lint` 与 CI 的
+  appkit-lint（`moneyfloat`/`decjson`/`jsonany`，默认只查生产代码，`-xxx.tests=true`
+  连测试一起查）；
 - **错误**：跨层只传 `*apperr.Error`，判定用 `apperr.Is(err, code)`，
-  禁止字符串比对；
+  禁止字符串比对（`appkit-lint` 的 `errcmp` 机检）；
 - **事件**：只能在 `tx.Do` 内经注入的 Publisher 发（落 outbox，提交后
   relay 自动外发）；事务外发布会被运行时守卫拒绝；
 - **消费事件**：`reg.Consumer(topic, outbox.InboxWithTransactor(pool, txr, schema, consumer, h))`，
@@ -193,11 +195,15 @@ unsigned `X-Partition` 只负责传输、不授信。组合根注入「分区键
   金额入站走 `money.ParseCanonical` 的域，把同款规范化口径接进
   `idem.WithCanonicalizer`（否则 "80"/"80.00" 的重试撞 422）；多租户/多账本
   用 `idem.WithKeyScope` 隔离键空间，别手拼前缀；
-- **后台任务**：`reg.Worker(name, run)`，**禁止自己 `go func()`**——框架负责
-  起协程、关停等待、异常退出上报，手写的那三件事每次都会漏一件；
+- **后台任务**：`reg.Worker(name, run)`，**禁止自己 `go func()`**（`appkit-lint` 的
+  `nogoroutine` 机检）——框架负责起协程、关停等待、异常退出上报，手写的那三件事每次都会漏一件；
 - **周期任务**：`reg.Worker(name, job.Every(pool, job.Task{Name: "{{.Name}}.xxx",
-  Interval: ..., Run: ...}))`。裸 `time.Ticker` 在多副本上就是每轮重复执行，
-  轻则浪费重则重复入账；
+  Interval: ..., Run: ...}))`。裸 `time.Ticker` 在多副本上就是每轮重复执行
+  （`forbidigo` 已禁 `time.NewTicker/Tick`），轻则浪费重则重复入账；
+- **数据库查询**：`internal/postgres` 必须经 `pgtx.From(ctx, s.pool)` 执行查询，
+  禁止绕过它直接调 `*pgxpool.Pool` 的 `Query`/`QueryRow`/`Exec`（`appkit-lint` 的 `pgtxbypass` 机检）；
+- **身份头与路由分类**：禁止直接从 `http.Header` 读取 `Authorization`/`X-Step-Up`/`X-Tenant-Id`/`X-Partition`/`X-Caller`
+  （`authheader` 机检），禁止裸 `reg.Mount`（`rawmount` 机检）；确需豁免使用 `//appkit:ignore <规则名> -- <理由>`；
 - **指标**：契约调用、outbox 投递与死信、周期任务、数据库查询已由框架自动埋点，
   不要重复埋；要加自己的指标用 `otel.Meter("{{.Module}}")` 新建，
   **不要往框架指标上加标签**（基数会失控）；

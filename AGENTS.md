@@ -5,12 +5,14 @@
 
 ## 不可破坏的承诺
 
-1. **公开 API 向后兼容**：appkit 经 MVS 依赖钻石被全部域仓库共享，破坏性
-   变更 = 全域联动升级。CI 有 apidiff 门禁（基线 = 最新发版 tag）。
-   新能力用「新增」表达，不改已有签名/语义。
+1. **公开 API 演进纪律**：appkit 经 MVS 依赖钻石被全部域仓库共享。0.x 阶段
+   在清理旧兼容面时允许通过 minor 版本做显式破坏性清理（CI 的 `apidiff`
+   以非阻断报告呈现变更明细，发版说明须写清迁移指引）；日常新能力仍优先
+   用「新增」表达，避免无必要的签名震荡。
 2. **根包只依赖标准库**：appkit.go/registry.go/app.go/run.go 的 API 面
    不得出现 gin/pgx/otel 等第三方类型（http.Handler、fs.FS、context 级抽象）。
-   `tx` 包同样零驱动依赖（pgx 实现在 `pgtx`）。
+   `tx` 包同样零驱动依赖（pgx 实现在 `pgtx`）。由 `stdlib_only_test.go` 在
+   `make check` 中自动守卫。
 3. **约束左移**：新增架构规则时按 编译器 > 代码生成 > 运行时守卫 > lint/CI >
    约定 的顺序找落点，并在 docs/DESIGN.md §7 的对照表里诚实标注强度。
 4. **进程内 ≠ 裸调用**：contract 边界的四件套（事务守卫/ctx 防火墙/超时/

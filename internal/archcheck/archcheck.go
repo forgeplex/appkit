@@ -106,8 +106,9 @@ func modulePathFromGoMod(dir string) string {
 	return modfile.ModulePath(data)
 }
 
-// Run 读取 .appkit.yml 后依次执行四类检查，返回全部违规。
-// kind: system 跳过 Requires 与 SQL 检查，Imports 内部只保留结构性规则。
+// Run 读取 .appkit.yml 后依次执行架构检查（依赖、目录拓扑、import 边界、
+// SQL 跨 schema、迁移序号与 DDL 风险），返回全部违规。
+// kind: system 跳过 Requires / Layout / SQL 检查，Imports 内部只保留结构性规则。
 func Run(dir string) ([]Violation, error) {
 	cfg, err := LoadConfig(dir)
 	if err != nil {
@@ -121,7 +122,12 @@ func Run(dir string) ([]Violation, error) {
 		}
 		all = append(all, vs...)
 	}
-	vs, err := CheckImports(dir, cfg)
+	vs, err := CheckLayout(dir, cfg)
+	if err != nil {
+		return nil, err
+	}
+	all = append(all, vs...)
+	vs, err = CheckImports(dir, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -132,8 +138,23 @@ func Run(dir string) ([]Violation, error) {
 			return nil, err
 		}
 		all = append(all, vs...)
+		vs, err = CheckQueries(dir)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, vs...)
 	}
 	vs, err = CheckMigrations(dir)
+	if err != nil {
+		return nil, err
+	}
+	all = append(all, vs...)
+	vs, err = CheckMigrationDDL(dir)
+	if err != nil {
+		return nil, err
+	}
+	all = append(all, vs...)
+	vs, err = CheckConfigs(dir)
 	if err != nil {
 		return nil, err
 	}

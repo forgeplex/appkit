@@ -112,17 +112,17 @@ appkit/                          # module github.com/forgeplex/appkit
 ├── httpserver/                  # 根 HTTP 中间件链（RequestID/Recover/AccessLog/OTel）
 │                                #   标准库实现，模块接缝只用 http.Handler；
 │                                #   模块内部想用 gin 组路由是模块自己的事
-├── authn/                       # 验签机制件（golang-jwt，框架内唯一第三方
-│                                #   依赖新增点）：EdDSA Bearer 令牌 + X-Step-Up
-│                                #   证明 → 注入 appkit.Actor。判定不在这，在根包
-│                                #   Require；claims 布局即提供方契约——见 §5.4
+├── authn/                       # 验签机制件（OIDC JWKS + 服务 EdDSA JWT）：
+│                                #   OIDCVerifier 解析用户 Bearer 令牌 → 注入 appkit.Actor，
+│                                #   ServiceVerifier 解析服务间令牌 → 注入 ServicePrincipal。
+│                                #   判定不在这，在根包 Require/Mount*
 ├── apperr/                      # Error{Code, HTTPStatus, Message, Details}
 │                                #   RFC 9457 (problem+json) 映射；
 │                                #   ★ 错误身份 = 错误码（apperr.Is(err, code)），
 │                                #   保证单体/微服务两种模式下错误判定行为一致
-├── money/                       # Money(decimal + currency) 领域值对象，不落库；
-│                                #   NUMERIC 持久化走 decimal.Decimal（pgx 原生
-│                                #   编解码，pgxmoney 已废弃）；全系统禁 float 金额
+├── money/                       # Money(decimal + currency) 领域值对象与共享校验原语
+│                                #   （canonical/正/非负 decimal、币种/资产码、精度检查），
+│                                #   NUMERIC 持久化走 decimal.Decimal；全系统禁 float 金额
 ├── refs/                        # 可选的资源引用值与版本化定义：严格 JSON、必填/
 │                                #   格式/不可变校验；不含身份、跨域查验或持久化
 ├── page/                        # 列表端点的分页机制件：?limit 解析校验（畸形 422
@@ -477,8 +477,8 @@ handler：构建服务器后框架会强制恢复它。
 标准装配，是降低这个信任面的主要手段。
 
 bootstrap 从 `security.mode` 读模式，并对部署配置再收紧一层：`disabled`
-仅 `env=dev`；`user_facing` 必须同时提供恰好 32 字节的 Ed25519 公钥
-与非空 issuer（或显式 UserIssuers），然后自动挂用户验签。`internal_service`
+仅 `env=dev`；`user_facing` 必须配置 `security.oidc` 或注入 `SecurityOptions.UserVerifier`，
+然后自动挂 OIDC 用户验签。`internal_service`
 需要 `security.service` 或 ServiceVerifier；`mixed` 需要两类配置。
 服务 JWT 验证 iss/aud/sub/exp/iat/kid、互斥类型与最长生命周期，委托默认拒绝。
 配置缺失或无效仍 fail-closed，不接受「内网就算可信」作为替代。`-migrate`
@@ -530,20 +530,18 @@ InternalService guard。`disabled` 下它无 guard，只用于 bootstrap `env=de
 | 持 Challenge 码、证明缺失或超过 5 分钟 | 403 `STEP_UP_REQUIRED` |
 | 其余 | 放行 |
 
-**验签（authn 包，机制件）**：`authn.Middleware(pub, issuer)` 解析 Bearer
-访问令牌与 `X-Step-Up` 证明——EdDSA 算法白名单（防算法混淆攻击）、iss、
-exp 必填，全部过验后注入 Actor。无 Authorization 头原样放行（判公开与否是
+**验签（authn 包，机制件）**：`authn.NewOIDCVerifier(opts)` 解析 OIDC Bearer
+访问令牌（多 Realm JWKS 验签、iss/aud/exp 校验与可选 `Partition` 映射），
+全部过验后注入 Actor。无 Authorization 头原样放行（判公开与否是
 `Mount*` guard 的职责——只有 Public 是合法匿名状态）；**有头但验不过
 必须 401**：坏凭证是攻击不是匿名，静默降级会掩盖问题。内建 `/healthz` /
 `/readyz` 是特例：即使夹带坏 Authorization 也旁路验签，探针只表达存活/
-就绪状态。依赖方向单向：authn → 根包，组合根挂链（或 bootstrap 两行配置），
-根包不 import authn。
+就绪状态。依赖方向单向：authn → 根包，组合根经 `security.oidc` 或
+`SecurityOptions.UserVerifier` 挂链，根包不 import authn。
 
-多分区同进程（每个 rbac 分区一个 iss=`rbac-<分区键>`，可各配一把密钥）用
-`authn.MultiIssuer(map[iss]Issuer{Key, Partition})`：按令牌 iss 选公钥（伪造
-iss 只会取到别家的钥而验不过）、step-up 证明必须与访问令牌同一签发方；签发方
-配了 Partition 就把分区键焊进 `callctx.Meta.Partition`——与租户同一信任模型，
-令牌说了算。单签发方的 `Middleware` 是它的一个条目。
+多分区同进程时由 `OIDCVerifier` 按可信签发方/配置映射 `Partition`，将分区键焊进
+`callctx.Meta.Partition`——与租户同一信任模型，令牌说了算。旧版自签 Ed25519
+用户验签入口（`authn.Middleware` / `authn.MultiIssuer`）已移除，用户面统一走 OIDC。
 
 **claims 布局 = 提供方契约**（照此签发即可写出第二个提供方、平替 rbac）：
 
@@ -590,7 +588,7 @@ Require 验**策略**（该码是否标了 Challenge、证明是否新鲜）。�
 / `NewRoutedTenant` 的路由函数读它）与 `Meta.TenantID`（业务租户，GUC 与 RLS
 读它）。曾经共用 TenantID 一个字段——rbac 的分区键 `demo` 经事件 meta 传播、
 被 email 域当业务租户查渠道，验证码邮件死信——是拆开的直接原因。分区键的
-可信来源与租户同构：`authn.MultiIssuer` 按令牌签发方焊入，X-Partition 头只在
+可信来源与租户同构：`authn.OIDCVerifier` 按已验令牌配置焊入，X-Partition 头只在
 内部东西向存活。
 
 tenant 形态的机制四件（全部在 `pgtx`，DDL 库函数是唯一事实源；partitioned +
@@ -670,13 +668,13 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 域 repo 互不依赖、看不到彼此实现 | 独立 module + internal/ + CI 检查 go.mod require 清单 | ★ 编译器级，不可绕过 |
 | 跨域只经契约类型 | 唯一可见类型就是 contracts 生成接口 | ★ 编译器级 |
 | 契约/事件/错误码单一事实源 | 只有生成物，无手写类型 | ★ 生成级 + drift check |
-| http 包不写 SQL、业务包零 infra import | depguard + go-arch-lint：配置由 `appkit sync` 物化（同时解决 IDE 集成与 golangci-lint 无配置继承），CI 先验未漂移**再按它跑这两个检查器**，版本与域仓库 `make lint` 同源（`ruleset.GolangciLintVersion` / `ArchLintVersion`） | ▲ CI 级，nolint 需写理由 |
-| 金额禁 float、ctx 不进 struct、decimal 不上 JSON 面 | appkit-lint 自研 analyzer（moneyfloat[-scope 圈定业务包] / ctxstruct / decjson）；domain-ci.yml 与域仓库 `make lint` 都跑它，版本随 go.mod 钉的 appkit 走（规则与依赖同版本升级；go.work 联调须显式给版本，不回退 main） | ▲ CI 级：默认只查生产代码——测试夹具低一档，且存量域的测试不该被规则升级卡红（`-<name>.tests=true` 可连测试查） |
+| http 包不写 SQL、业务包零 infra import、通用正确性与安全基线 | depguard + go-arch-lint + golangci-lint 后端基线（`bidichk`/`bodyclose`/`contextcheck`/`durationcheck`/`errchkjson`/`errorlint`/`exhaustive`/`fatcontext`/`gosec`/`modernize`/`nilerr`/`nilnil`/`noctx`/`rowserrcheck`/`sloglint`/`sqlclosecheck` + `forbidigo` 禁 `fmt.Print*`、`time.NewTicker/Tick`、`http.Error`、全局 `http.Get/Post/DefaultClient`、`os.Exit`、`log.Fatal*/Panic*`、`http.ListenAndServe*`、`signal.Notify*`）：配置由 `appkit sync` 物化，CI 先验未漂移**再按它跑这两个检查器**，版本与域仓库 `make lint` 同源（`ruleset.GolangciLintVersion` / `ArchLintVersion`） | ▲ CI 级，nolint 需写理由 |
+| 金额禁 float、ctx 不进 struct、decimal/any 不上 JSON 面、HTTP 入站强制规范金额解析、禁裸 go/读身份头/HTTP 写 callctx/err 字符串比对/传递 `pgx.Tx`/绕过 `pgtx.From` | appkit-lint 自研 analyzer（`moneyfloat` / `ctxstruct` / `decjson` / `nogoroutine` / `authheader` / `errcmp` / `pgtxbypass` / `jsonany` / `canonicalmoney` / `txparam` / `callctxwrite` / `timenow`[opt-in `-scope`]），支持 `//appkit:ignore <name> -- <理由>` 带理由豁免；`domain-ci.yml` 与域仓库 `make lint` 都跑它，版本随 go.mod 钉的 appkit 走 | ▲ CI 级：默认只查生产代码（`-<name>.tests=true` 可连测试查）；业务/边界规则自动跳过带标准生成头的文件 |
 | 事务不泄漏到业务代码 | pgtx 回调式 API，业务只见 ctx | ★ API 设计级 |
 | 事务内禁跨模块调用 | contract.Call 运行时守卫（HasTx 检查）；前提是调用经生成 wrapper（ProvideContract 强制包裹；生成物由 `appkit gen contract` 产出） | ▲ 运行时级，测试即暴露 |
 | 忘发事件不可能 | outbox.Publish 是事务 API 的一等公民 | ★ API 设计级 |
 | 生成物禁手改 | CI 重新生成后 `git diff --exit-code` | ▲ CI 级 |
-| appkit/contracts 向后兼容 | apidiff / oasdiff 门禁 | ▲ CI 级 |
+| appkit/contracts API 变更审查 | 0.x 阶段 `ci.yml` 的 `apidiff` 输出非阻断变更报告供发版审查，合同变更用 `contract-check` / `oasdiff` 门禁 | ▲ CI 级 |
 | CI 本身不可绕过 | reusable workflow 从 appkit module provenance 解析并固定完整 commit SHA、第三方 Action 固定 commit SHA、默认 `contents: read`；main/release tag protection + required checks | 组织级（仓库 ruleset 必须另行配置，见 `docs/CI_SECURITY.md`） |
 | 启动装配改不坏 | `bootstrap.Main` 收走 main() 的固定装配，代码在 module cache（0444 只读）；用户仓库的 main 只声明模块清单 | ▲ 物理级：改不动，但可绕开自己写 main（骨架默认不绕） |
 | HTTP 安全模式不能遗漏 | 仅在启用业务 HTTP 时 `App.Run` 与 Bootstrap Profile 才校验 `SecurityMode`；bootstrap 还要求 `security.mode`，并把 `disabled` 限于 `env=dev`；Headless 无业务 HTTP，Probe-only 走独立的 loopback/认证策略；`App.Migrate` 显式豁免 | ▲ 运行时 + 装配级：业务 Listener 零值不能启动；调用方仍可显式选 `SecurityDisabled`（测试/开发逃生口），自建 Listener 不在该边界内 |
@@ -684,10 +682,10 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | Probe Listener 默认不暴露公网 | `ProbeOptions` 默认 `127.0.0.1:8081`；非 loopback 需显式确认网络边界并提供认证 middleware；处理器只匹配两个精确路径 | ▲ Bootstrap 装配级：不可信 middleware 的认证强度无法静态证明，网络策略仍须独立验证 |
 | OS Signal 不被多个层重复拥有 | `App.Run` 与 `bootstrap.Runner.Run` 是进程入口；`App.Start` / `Core.Start` / `Core.Execute` 不注册框架 Signal Handler | ▲ API 路径 + 子进程测试级；应用仍可自行安装 handler，必须避免与框架入口叠加 |
 | Core 资源按依赖逆序关闭 | `Core` LIFO cleanup stack：可选资源先关、Telemetry 最后 flush；一项失败不跳过后续 hook，错误通过 `errors.Join` 保留 | ▲ 运行时 + 测试级；只保证注册入 Core 栈的资源，外部资源要显式纳入生命周期 |
-| 严格模式没有未分类根路由 | Registry 记录 Public/Authenticated/Permission/InternalService，全部 Setup 后、listen 前校验模式矩阵；分类 API 同时包上用户/权限/服务 guard | ▲ 运行时守卫：受信组合根的 Middleware 仍可短路 `next` 或在边界内注入 principal，不是对任意 wiring 的沙箱 |
+| 严格模式没有未分类根路由 | 裸 `(*Registry).Mount` 已移除，只提供 `MountPublic`/`MountAuthenticated`/`MountPermission`/`MountInternalService`，全部 Setup 后、listen 前校验模式矩阵并包上用户/权限/服务 guard | ★ 编译器级（无未分类挂点）+ ▲ 运行时守卫（模式矩阵） |
 | 网络身份输入不继承为可信 ctx | 严格模式的 `identityBoundary` 强制在可配 Middleware 最外层，清 Actor/ServicePrincipal/partition/tenant/caller 及四个 unsigned 头；`HTTPServer` Option 之后强制恢复根 handler | ▲ 运行时信任边界：中间件顺序和 Handler Option 不能把边界挪掉，但边界内的受信 Middleware 若重新信头仍可自伤 |
 | 服务身份验证 | `authn.ServiceVerifier` 验证固定类型的短期服务 JWT，静态 iss+kid+sub、单一 aud、exp/iat；非空委托默认拒绝；bootstrap 先验配置 | ▲ 运行时 + 装配级：策略/公钥配置属于受信组合根；不提供任意 wiring 沙箱 |
-| 安全远程契约 | `NewSecureClient` 需要凭证 provider 与 HTTPS，绑定 origin、禁止重定向/弱 TLS、清除上游凭证 | ▲ 构造 + 出站守卫：旧 NewClient 保留兼容，不能据此宣称已认证；应用不得替换已验证 transport |
+| 安全远程契约 | 仅生成 `NewSecureClient` / `NewSecureClientV2`（旧未认证 `NewClient` 已移除），强制凭证 provider 与 HTTPS、绑定 origin、禁止重定向/弱 TLS、清除上游凭证 | ★ 编译器/生成级 + ▲ 出站守卫 |
 | pprof 不暴露在用户面 | `user_facing + Pprof` 启动拒绝；internal/mixed 的每个 pprof handler 包 InternalService guard；disabled 仅作 bootstrap `env=dev` / 直接 App 测试 | ▲ 运行时：内部模式还须配置有效服务验签器 |
 | 规则集不被改松 | `appkit check` 内联 `ruleset.Check`（配置缺失同样算漂移），不再只靠 CI 那一步 | ▲ 本地+CI 级 |
 | 已应用的迁移不可变 | 历史表存内容 sha256，启动期逐个比对，不符即 `MIGRATION_DRIFT` 拒绝启动；`.gitattributes` 钉 `*.sql eol=lf` 消除跨平台误报 | ★ 运行时级，启动即暴露 |
@@ -696,7 +694,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 分区域域的 SQL 无前缀纪律 | `partitioned: true` 时 archcheck 前缀规则翻转（任何 schema 前缀违规，无 DB 即拦）；sqlc 编译器兜底——带前缀与无前缀两个世界各自封闭，混写双向都是编译错误 | ▲ CI 级 + ★ 编译器级 |
 | 租户域跨租户泄漏 | RLS（ENABLE+FORCE+隔离策略+读全部策略，`pgtx.TenantPolicySQL`）+ 事务级 GUC（`pgtx.NewTenant` / `NewRoutedTenant` 的 Do）；Setup 期 `pgtx.VerifyTenantRLS` 校验完整性（缺任一件/角色 superuser 或 BYPASSRLS 即拒启，点名表并附修复 SQL） | ★ 运行时级：漏写 WHERE 只会查不到行/写入被拒，且缺件启动即暴露 |
 | 跨租户读只能是显式、只读、不传播 | `tx.WithReadAllTenants` 是进程内 ctx 标记（不进 callctx：防火墙剥掉、事件不带）；落成第二个 GUC `app.tenant_scope`，与租户值那条通道（令牌 tid）分离；策略只对 SELECT 放开，写入的 WITH CHECK 不变；标记须在最外层 Do 之前打，嵌套内切换报错 | ★ 存储级：写全部模式不存在；「谁能打标记」归 `reg.Require` 跨租户码 + 用例纪律（约定级） |
-| 分区与租户身份只能来自已验证凭证 | 严格 HTTP 边界先清除 ctx partition/tenant 与 unsigned 头；MultiIssuer 从签发方配置重建 Partition，ServiceVerifier 从授权后的签名委托重建范围 | ▲ 中间件级：标准 bootstrap 可执行；自写受信 Middleware 仍可错误地授予权限 |
+| 分区与租户身份只能来自已验证凭证 | 严格 HTTP 边界先清除 ctx partition/tenant 与 unsigned 头；OIDCVerifier 从已验令牌重建 Actor/Tenant/Partition，ServiceVerifier 从授权后的签名委托重建范围 | ▲ 中间件级：标准 bootstrap 可执行；自写受信 Middleware 仍可错误地授予权限 |
 | 嵌套事务不改变外层隔离范围 | `pgtx.Do` 绑定 tenant 模式、tenant ID、read-all、实际 schema 与具体事务句柄，内层重绑或无法验证的 raw pgx.Tx 在 savepoint 前拒绝 | ★ 运行时守卫：同范围嵌套保留，错误可由外层处理；不是阻止受信代码直接执行 SET LOCAL 的 SQL 沙箱 |
 | schema 文档支持分区域域 | `partitioned: true` 自动生成 logical-template：无前缀迁移在代表 schema 回放一次，全部文档显式标记；分区＋tenant 的 RLS 同步呈现 | ▲ 工具/CI 级；只证明逻辑模板，未枚举或检查运行中分区；未启用文档的仓库仍 notice 放行 |
 | 没人跑迁移不可能 | 登记了迁移却既无 `Migrator` 又无 `SkipMigrations()` → 启动报错；`-migrate` 无 `database.url` 亦报错 | ★ 装配级 fail-fast |
@@ -706,7 +704,7 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 表有说明（`COMMENT ON TABLE`） | 缺的表在 `db/SCHEMA.md` 表清单里标 ⚠ 缺说明并给出该补的那一句；`appkit schema -check` 在 CI 里逐表打 `::warning` 注解 | ▲ 软约束：不阻断 CI（刻意的，存量仓库不会突然红），且 `db/SCHEMA.md` 带 `linguist-generated` 在 PR diff 里默认折叠——⚠ 没人主动打开就看不见，::warning 注解是让它浮出水面的那一半 |
 | 长驻任务死了必被发现 | `Registry.Worker` 托管：异常退出上报主循环并触发关停；需要资源生命周期的组件用 `ManagedService`（Critical/Optional、Ready、反序 Drain/Close） | ★ API 设计级 |
 | ctx 只能传白名单元数据 | `callctx.Meta` 是具名字段的 struct 而非 map，防火墙剥值后只放回它 | ★ 编译器级：塞不进去 |
-| 周期任务多副本不重跑 | `job.Every` 用 Postgres advisory lock（session 级，连接断开自动释放） | ▲ API 设计级：正确写法零成本，裸 ticker 拦不住 |
+| 周期任务多副本不重跑、后台协程托管 | `job.Every` 用 Postgres advisory lock（session 级，连接断开自动释放）；`forbidigo` 禁裸 `time.NewTicker/Tick`，`appkit-lint` 的 `nogoroutine` 禁生产代码裸 `go` 语句（有界并发可 `//appkit:ignore nogoroutine -- <理由>`） | ▲ API 设计级 + CI 级：绕过需显式带理由豁免 |
 | 指标基数不失控 | 标签值只能是稳定契约名或 `internal/metrics` 收敛过的枚举；Stream transport/direction/outcome 固定，错误码过框架白名单，未知塌缩为 `other`；SQL 动词同样过白名单 | ▲ API 设计级：业务传不进框架指标，但自建 meter 仍可自伤 |
 | 已死的 ctx 不落到实现上 | `contract.Call` 在进 fn 前查 `ctx.Err()`——跨网络时这种调用本来就发不出去 | ★ 运行时级：两种形态由构造一致 |
 | 两种部署形态语义一致 | `apptest.Conform` 让同一批用例跑过每个绑定，比对错误码/返回值/边界语义 | ▲ 测试级：写了才有；但不写就只剩口头承诺 |
@@ -715,11 +713,12 @@ partitioned 与 tenant 不组合：schema 隔离已经足够，叠加行级只�
 | 出站 HTTP 也带上 `callctx` 白名单 | `callctx.Transport` 装进 `http.Client` 一次即可（不必逐调用点写 `Inject`）；`apptest.Conform` 填了 `Binding.SeenMeta` 就当场验请求头 | ▲ API 设计级 + 测试级：漏点从「每个调用点」收敛到「一处装配」，且验得到。但两者都得自己接——不填 `SeenMeta` 就仍是口头承诺 |
 | 端点权限绑定 ⊆ 已声明码 | Registry 收集绑定（Register/Setup 期都可能产生，模块内部 mux 在 Setup 装配），全部 Setup 之后、监听之前统一校验，拼错的码点名（模块、码）报错 | ★ 装配期硬失败 |
 | 权限判定语义统一（集合包含 + step-up 新鲜度） | `MountPermission` / `reg.Require` 共用唯一判定实现，401/403/STEP_UP 矩阵在框架；业务域不再各写一份会漂移的判定 | ★ API 设计级 |
-| 验签只在 authn 一处、模块不自解凭证 | 组合根挂链 + 脚手架注释教学 | ▲ 提高绕过成本：模块仍可自解 Authorization 头绕过，无机制挡 |
+| 验签只在 authn 一处、模块不自解凭证 | 组合根挂链 + `appkit-lint` 的 `authheader` 拦截生产代码直接从 `http.Header` 读取 `Authorization`/`X-Step-Up`/`X-Tenant-Id`/`X-Partition`/`X-Caller`/`X-Actor-*` 常量头名 | ▲ CI 级 + 装配级：常量头名读取静态拦住，动态拼头名仍可绕过（非沙箱） |
 | 列表端点分页形态统一（limit 解析/游标编码/响应信封） | `page` 包：`Parse` 值域校验（畸形 422，不静默裁剪）+ 游标不透明编解码（JSON→base64url）+ `List` 信封 + `Trim` 的 limit+1 多取一行技巧；机制归框架，排序键与 keyset SQL 归域 | 约定级：用不用在域，自写手翻页无机检——形态统一靠采纳与 review |
 | 可选资源引用有统一值格式与结构规则 | `refs.Values` 私有 map + 防御性复制 + 严格平面 JSON；`refs.Schema` 校验声明键、格式、必填与完整快照更新；契约生成器 opt-in `refs` 类型输出 Values 与 OpenAPI 对象 | ▲ API/生成级：采用 Values 的 JSON 入口强制值格式；资源 Schema 必须由业务显式调用，绕过校验的原生存储写入不受保护。不强加 BaseModel 或业务列 |
 | 引用不等于身份，不隐含跨域归属与并发保证 | refs 不进 callctx/claims；Target 只是类型语义；归属与授权经业务契约验证，持久化须版本检查或等效原子约束 | ▲ 边界设计级 + 用例纪律：框架不自动证明目标存在、父子关系、跨域一致性或 Schema 版本兼容；见 [REFS.md](REFS.md) |
-| 业务包 / transport 文件按功能成簇、子包只嵌套在业务包下 | 脚手架 AGENTS.md「文件怎么分」+ §4；三条方向性约束的机检（depguard / go-arch-lint / archcheck）都按 `internal/<domain>/**` 圈定业务包，嵌套子包自动纳入 | 约定级：文件命名与「不按层拆」没有 lint 落点；「不拆平级包」的后果（逃出机检）是靠规程点名的，不是工具拦的——文件行数检查器不存在，别假装有 |
+| 业务包 / transport 文件按功能成簇、子包只嵌套在业务包下 | `appkit check`（`CheckLayout`）白名单校验 `internal/` 顶层目录（堵住平级包逃出 `internal/<domain>/**` 机检的洞），并禁止在 `internal/<domain>/` 下建 `model/service/repo/dto` 等按层子包；文件命名与拆分粒度仍由 AGENTS.md「文件怎么分」约定 | ▲ CI 级（目录拓扑）+ 约定级（单文件命名与行数拆分，无行数检查器） |
+| 迁移 DDL 与查询/配置静态风险拦截 | `appkit check`（`CheckMigrationDDL` / `CheckQueries` / `CheckConfigs`）静态拦截事务内 `CREATE INDEX CONCURRENTLY`、缺 `DEFAULT` 的 `ADD COLUMN NOT NULL`、`ALTER COLUMN TYPE`、浮点列类型（`REAL`/`DOUBLE PRECISION`/`FLOAT`）、无豁免 `DROP TABLE`/`TRUNCATE`、`db/queries/*.sql` 中的 `SELECT *` 与无 `WHERE` 写查询、非 dev `config/*.yaml` 里的 `disabled`/明文私钥/明文 HTTP OIDC；`domain-ci.yml` 在 PR 期禁止修改/删除已合并迁移并执行 `govulncheck` | ▲ CI 级：正则/语句切分与 YAML 静态检查，不替代真实数据库回放或大表锁评估 |
 
 逃生舱（防止约束被政治性推翻）：带理由的 `//nolint`（nolintlint 强制）、
 go-arch-lint 的存量违规"技术债合法化"清单、跨域报表/对账走**事件驱动读模型**

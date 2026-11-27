@@ -12,10 +12,8 @@ import (
 	"time"
 
 	"github.com/forgeplex/appkit/apperr"
-	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
 	"github.com/forgeplex/appkit/httpserver"
-	"github.com/forgeplex/appkit/outbound"
 )
 
 // wrappedServiceV2 applies contract.Call to V2 Unary implementations.
@@ -38,19 +36,8 @@ func (w wrappedServiceV2) Ping(ctx context.Context, req PingRequestV2) (PingResp
 
 // ClientV2 is the generated remote binding for V2 Unary methods.
 type ClientV2 struct {
-	base   string
-	hc     *http.Client
-	secure bool
-}
-
-// NewClientV2 is the legacy/dev entry point; production callers should use NewSecureClientV2.
-func NewClientV2(base, caller string, hc *http.Client) *ClientV2 {
-	if hc == nil {
-		hc = &http.Client{}
-	}
-	inner := *hc
-	inner.Transport = callctx.Transport{Base: outbound.InstrumentTransport(hc.Transport), Caller: caller}
-	return &ClientV2{base: strings.TrimSuffix(base, "/"), hc: &inner}
+	base string
+	hc   *http.Client
 }
 
 // NewSecureClientV2 creates the authenticated HTTPS client for V2 Unary methods.
@@ -59,7 +46,7 @@ func NewSecureClientV2(base string, opts contract.SecureClientOptions) (*ClientV
 	if err != nil {
 		return nil, err
 	}
-	return &ClientV2{base: strings.TrimSuffix(base, "/"), hc: hc, secure: true}, nil
+	return &ClientV2{base: strings.TrimSuffix(base, "/"), hc: hc}, nil
 }
 
 var _ ServiceV2 = (*ClientV2)(nil)
@@ -76,17 +63,17 @@ func (c *ClientV2) Ping(ctx context.Context, req PingRequestV2) (PingResponseV2,
 				return PingResponseV2{}, apperr.Internal(err)
 			}
 			hreq.Header.Set("Content-Type", "application/json")
-			return doV2[PingResponseV2](c.hc, hreq, c.secure)
+			return doV2[PingResponseV2](c.hc, hreq)
 		})
 	}
 	return retryUnavailableV2(ctx, call)
 }
 
-func doV2[T any](hc *http.Client, hreq *http.Request, secure bool) (T, error) {
+func doV2[T any](hc *http.Client, hreq *http.Request) (T, error) {
 	var zero T
 	resp, err := hc.Do(hreq)
 	if err != nil {
-		if secure && (apperr.Is(err, apperr.CodeUnauthenticated) || apperr.Is(err, apperr.CodePermissionDenied) || apperr.Is(err, apperr.CodeInvalidArgument)) {
+		if apperr.Is(err, apperr.CodeUnauthenticated) || apperr.Is(err, apperr.CodePermissionDenied) || apperr.Is(err, apperr.CodeInvalidArgument) {
 			return zero, apperr.From(err)
 		}
 		return zero, apperr.Unavailable(err)

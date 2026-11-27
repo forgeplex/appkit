@@ -3,7 +3,6 @@ package bootstrap
 import (
 	"cmp"
 	"context"
-	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,7 +17,6 @@ import (
 	"time"
 
 	"github.com/forgeplex/appkit"
-	"github.com/forgeplex/appkit/authn"
 	"github.com/forgeplex/appkit/config"
 	"github.com/forgeplex/appkit/health"
 	"github.com/forgeplex/appkit/httpserver"
@@ -72,8 +70,6 @@ type ProfileOptions struct {
 	Modules                func(ProfileDeps) ([]appkit.Module, error)
 	AppOptions             func(ProfileDeps) []appkit.Option
 	Security               SecurityOptions
-	AuthnPublicKey         ed25519.PublicKey
-	AuthnIssuer            string
 	NewBus                 func() EventBus
 	AllowDirectBusForSplit bool
 	PoolOptions            []pgtx.PoolOption
@@ -206,13 +202,8 @@ func NewCore(ctx context.Context, options ProfileOptions) (*Core, error) {
 	}
 	options.Security = security
 	securityMode := securityConfig.Security.Mode
-	legacyOptions := Options{
-		Service:        options.Service,
-		AuthnPublicKey: options.AuthnPublicKey,
-		AuthnIssuer:    options.AuthnIssuer,
-	}
 	if options.Capabilities.BusinessHTTP {
-		if err := validateHTTPSecurityWithOptions(legacyOptions, base.Env, securityMode, copts.EnvPrefix, false, security); err != nil {
+		if err := validateHTTPSecurityWithOptions(Options{Service: options.Service}, base.Env, securityMode, copts.EnvPrefix, false, security); err != nil {
 			return nil, err
 		}
 	}
@@ -318,14 +309,7 @@ func (c *Core) Start(ctx context.Context) (*RunningProfile, error) {
 			appkit.Middleware(httpserver.Base(c.deps.Log)...),
 		)
 		if c.securityMode == appkit.SecurityUserFacing || c.securityMode == appkit.SecurityMixed {
-			switch {
-			case c.options.Security.UserVerifier != nil:
-				appOptions = append(appOptions, appkit.Middleware(c.options.Security.UserVerifier.Middleware))
-			case len(c.options.Security.UserIssuers) != 0:
-				appOptions = append(appOptions, appkit.Middleware(authn.MultiIssuer(c.options.Security.UserIssuers)))
-			default:
-				appOptions = append(appOptions, appkit.Middleware(authn.Middleware(c.options.AuthnPublicKey, c.options.AuthnIssuer)))
-			}
+			appOptions = append(appOptions, appkit.Middleware(c.options.Security.UserVerifier.Middleware))
 		}
 		if c.securityMode == appkit.SecurityInternalService || c.securityMode == appkit.SecurityMixed {
 			appOptions = append(appOptions, appkit.Middleware(c.options.Security.ServiceVerifier.Middleware))

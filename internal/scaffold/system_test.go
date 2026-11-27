@@ -82,14 +82,14 @@ func TestSystemScaffold(t *testing.T) {
 			"telemetry:", "traces:", "metrics:", "enabled: false", "otel.example.com/v1/traces", "otel.example.com/v1/metrics")
 		mustContain(t, "deploy/README.md", readFile(t, dir, "deploy/README.md"),
 			"-target=all", "-target=relay",
-			"security.mode", "AuthnPublicKey", "AuthnIssuer", "internal_service/mixed",
+			"security.mode", "security.oidc", "UserVerifier", "internal_service/mixed",
 			"fail closed", "-migrate", "不要求 security.mode",
 			// 迁移与告警是部署时才想起来的两件事，写在这里而不是散在别处。
 			"-migrate", "appkit.SkipMigrations()", "MIGRATION_DRIFT",
 			"appkit.outbox.oldest_pending.age")
 		mustContain(t, "AGENTS.md", readFile(t, dir, "AGENTS.md"),
 			"HTTP 身份边界", "security.mode", "disabled", "user_facing",
-			"internal_service", "mixed", "AuthnPublicKey", "AuthnIssuer", "pprof")
+			"internal_service", "mixed", "security.oidc", "UserVerifier", "pprof")
 		mustContain(t, "README.md", readFile(t, dir, "README.md"),
 			"security.mode: disabled", "user_facing", "internal_service/mixed", "fail closed",
 			"NewSecureClient", "ServiceVerifier", "security.service")

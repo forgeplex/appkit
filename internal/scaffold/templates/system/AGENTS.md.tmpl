@@ -23,9 +23,8 @@
 - mode 是**每个部署实例**的暴露面，不是编译时常量：用户入口选
   `user_facing`，服务入口最终选 `internal_service`，同时承载两类入口才选
   `mixed`；
-- `user_facing` 需要 `AuthnPublicKey` 与 `AuthnIssuer`（多签发方用
-  SecurityOptions.UserIssuers）；`internal_service/mixed` 需要 `security.service`
-  或 ServiceVerifier，缺失时 fail closed。服务委托默认拒绝非空范围；
+- `user_facing` 需要 `security.oidc` 或 `SecurityOptions.UserVerifier`；
+  `internal_service/mixed` 需要 `security.service` 或 ServiceVerifier，缺失时 fail closed。服务委托默认拒绝非空范围；
 - `/healthz`、`/readyz` 是隐式公开探针；pprof 不得挂在 `user_facing`，在
   `internal_service/mixed` 下也必须经过已验证的服务身份。
 

@@ -28,3 +28,19 @@ func Files(fset *token.FileSet, files []*ast.File, skipTests bool) []*ast.File {
 	}
 	return out
 }
+
+// NonGeneratedFiles 返回待检查的非生成文件：剔除带有标准 Go 生成头
+// （// Code generated ... DO NOT EDIT.）的文件，且在 skipTests 为 true 时剔除 _test.go。
+func NonGeneratedFiles(fset *token.FileSet, files []*ast.File, skipTests bool) []*ast.File {
+	out := make([]*ast.File, 0, len(files))
+	for _, f := range files {
+		if skipTests && strings.HasSuffix(fset.Position(f.Package).Filename, "_test.go") {
+			continue
+		}
+		if ast.IsGenerated(f) {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}

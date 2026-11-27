@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/forgeplex/appkit/apperr"
-	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
 )
 
@@ -24,19 +23,16 @@ type Client struct {
 	hc   *http.Client
 }
 
-// NewClient 返回契约 client。base 是服务根地址（如 "http://ledger:8080"），
-// caller 填本服务名（callctx 白名单的归因值）。
-//
-// 白名单传播焊死在装配处：hc 为 nil 走默认 Transport；非 nil 时在其
-// Transport 外包一层 callctx.Transport（不改调用方的 client）。
-// 「忘了装 Transport」这个静默失效形态在生成 client 里不存在。
-func NewClient(base, caller string, hc *http.Client) *Client {
-	if hc == nil {
-		hc = &http.Client{}
+// NewSecureClient 返回显式认证的 HTTPS 契约 client。Audience 与服务凭证
+// provider 必填；每次尝试取新凭证，拒绝过期凭证、不安全 transport 和重定向。
+// caller 由服务 JWT 的 subject 决定，不接受调用方伪造的 caller 或用户凭证。
+// Partition/TenantID 经 contract ctx 防火墙传给 provider，由其明确授权委托。
+func NewSecureClient(base string, opts contract.SecureClientOptions) (*Client, error) {
+	hc, err := contract.NewSecureHTTPClient(base, opts)
+	if err != nil {
+		return nil, err
 	}
-	inner := *hc
-	inner.Transport = callctx.Transport{Base: hc.Transport, Caller: caller}
-	return &Client{base: strings.TrimSuffix(base, "/"), hc: &inner}
+	return &Client{base: strings.TrimSuffix(base, "/"), hc: hc}, nil
 }
 
 // 编译期断言：Client 与 Service 漂移时本包编译失败。
@@ -66,6 +62,9 @@ func do[T any](hc *http.Client, hreq *http.Request) (T, error) {
 	var zero T
 	resp, err := hc.Do(hreq)
 	if err != nil {
+		if apperr.Is(err, apperr.CodeUnauthenticated) || apperr.Is(err, apperr.CodePermissionDenied) || apperr.Is(err, apperr.CodeInvalidArgument) {
+			return zero, apperr.From(err)
+		}
 		return zero, apperr.Unavailable(err)
 	}
 	defer resp.Body.Close()

@@ -412,7 +412,7 @@ func TestWebSocketOriginRequiresMatchingSchemeForSameHost(t *testing.T) {
 func TestWebSocketOriginPatternsRejectUnsafeOrMalformedValues(t *testing.T) {
 	for _, pattern := range []string{"", " *", "*", "**", "*.*", "*.*.*", "https://*", "https://**", "https://example.test/path", "ftp://example.test", "["} {
 		t.Run(pattern, func(t *testing.T) {
-			cfg := websocketTestConfig(httpserver.NewWebSocketHub())
+			cfg := websocketTestConfig(startWebSocketHub(t))
 			cfg.OriginPatterns = []string{pattern}
 			_, err := httpserver.NewWebSocketHandler[string, string](cfg,
 				func(context.Context) (httpserver.WebSocketIdentity, error) {
@@ -530,44 +530,14 @@ func TestWebSocketMessageLimitAndHubDrain(t *testing.T) {
 }
 
 func TestWebSocketHubRequiresExplicitLimitsBeforeUpgrade(t *testing.T) {
-	hub := httpserver.NewWebSocketHub()
-	cfg := websocketTestConfig(hub)
-	called := make(chan struct{}, 1)
-	server, _ := startWebSocketServer(t, cfg, func(context.Context) (httpserver.WebSocketIdentity, error) {
-		return httpserver.WebSocketIdentity{Subject: "unbounded-test"}, nil
-	}, func(context.Context, contract.Stream[string, string]) error {
-		called <- struct{}{}
-		return nil
-	})
-
-	conn, response, err := websocket.Dial(context.Background(), server.URL+"/bidi", &websocket.DialOptions{
-		HTTPClient: server.Client(), Subprotocols: []string{"appkit.contract.bidi.v1"},
-	})
-	if err == nil || response == nil {
-		if conn != nil {
-			_ = conn.CloseNow()
-		}
-		t.Fatalf("unbounded Hub upgrade = (%v, %v), want pre-upgrade rejection", conn, err)
-	}
-	defer response.Body.Close()
-	body, readErr := io.ReadAll(response.Body)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	var problem apperr.Problem
-	if err := json.Unmarshal(body, &problem); err != nil {
-		t.Fatalf("decode problem response %q: %v", body, err)
-	}
-	if response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Content-Type") != "application/problem+json" || problem.Code != apperr.CodeUnavailable {
-		t.Fatalf("unbounded Hub response = status %d, content-type %q, problem %+v", response.StatusCode, response.Header.Get("Content-Type"), problem)
-	}
-	if strings.Contains(problem.Detail, "MaxConnections") || strings.Contains(problem.Detail, "rate") {
-		t.Fatalf("problem response leaked internal budget detail: %+v", problem)
-	}
-	select {
-	case <-called:
-		t.Fatal("application handler ran for an unbounded Hub")
-	default:
+	cfg := websocketTestConfig(&httpserver.WebSocketHub{})
+	_, err := httpserver.NewWebSocketHandler[string, string](cfg,
+		func(context.Context) (httpserver.WebSocketIdentity, error) {
+			return httpserver.WebSocketIdentity{Subject: "unbounded-test"}, nil
+		},
+		func(context.Context, contract.Stream[string, string]) error { return nil })
+	if !apperr.Is(err, apperr.CodeInvalidArgument) {
+		t.Fatalf("NewWebSocketHandler with zero-value Hub = %v, want INVALID_ARGUMENT", err)
 	}
 }
 
@@ -882,7 +852,7 @@ func TestWebSocketSecureClientConformance(t *testing.T) {
 func TestWebSocketSecureClientOperationCancellationIsRetryable(t *testing.T) {
 	release := make(chan struct{})
 	ready := make(chan struct{})
-	cfg := websocketTestConfig(httpserver.NewWebSocketHub())
+	cfg := websocketTestConfig(startWebSocketHub(t))
 	stream, err := openSecureWebSocketStream(t, context.Background(), cfg.Stream,
 		func(ctx context.Context, peer contract.Stream[string, string]) error {
 			value, err := peer.Recv(ctx)
@@ -923,7 +893,7 @@ func TestWebSocketSecureClientOperationCancellationIsRetryable(t *testing.T) {
 }
 
 func TestWebSocketSecureClientRemoteErrorIsStableAndSanitized(t *testing.T) {
-	cfg := websocketTestConfig(httpserver.NewWebSocketHub())
+	cfg := websocketTestConfig(startWebSocketHub(t))
 	stream, err := openSecureWebSocketStream(t, context.Background(), cfg.Stream,
 		func(context.Context, contract.Stream[string, string]) error {
 			return errors.New("private-upstream-token-shaped-detail")
@@ -947,7 +917,7 @@ func TestWebSocketSecureClientCloseCancelsRemoteHandlerWithoutWaitingForIt(t *te
 	cancelled := make(chan struct{})
 	release := make(chan struct{})
 	handlerDone := make(chan struct{})
-	stream, err := openSecureWebSocketStream(t, context.Background(), websocketTestConfig(httpserver.NewWebSocketHub()).Stream,
+	stream, err := openSecureWebSocketStream(t, context.Background(), websocketTestConfig(startWebSocketHub(t)).Stream,
 		func(ctx context.Context, _ contract.Stream[string, string]) error {
 			defer close(handlerDone)
 			close(started)

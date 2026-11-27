@@ -7,7 +7,7 @@
 
 `config/prod.yaml` 故意把 `security.mode` 留空：服务会在监听前 fail closed，
 部署者必须按该 Deployment 的暴露面显式设置。
-`user_facing`，并须在组合根装配 `AuthnPublicKey` 与 `AuthnIssuer`；
+`user_facing`，并须配置 `security.oidc` 或在组合根装配 `UserVerifier`；
 `internal_service/mixed` 还须配置 `security.service` 或注入 ServiceVerifier，
 验证服务 JWT 的签发方、公钥、主体、接收方与委托范围，不能拿“仅内网可达”
 代替身份验证。`-migrate` 不监听 HTTP，因此不要求 security.mode。

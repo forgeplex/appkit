@@ -104,6 +104,19 @@ jobs:
           done
           (cd contract && GOWORK=off go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@"$APPKIT_TOOL" ./...)
 
+      - name: PR 迁移不可变检查（禁止修改/删除已合并迁移）
+        if: github.event_name == 'pull_request' && github.base_ref != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "${GITHUB_BASE_REF}"
+          changed=$(git diff --name-status --diff-filter=MD "origin/${GITHUB_BASE_REF}...HEAD" -- db/migrations/ || true)
+          if [ -n "$changed" ]; then
+            echo "::error::禁止修改或删除已合并的历史迁移文件（会触发生产 MIGRATION_DRIFT），改表结构请新增迁移文件："
+            echo "$changed"
+            exit 1
+          fi
+
       - name: appkit check（架构检查）
         run: go run github.com/forgeplex/appkit/cmd/appkit@"$APPKIT_TOOL" check
 
@@ -121,18 +134,21 @@ jobs:
       # 先验规则集未漂移，再按规则集跑 lint——否则跑的可能是被改松的配置。
       # 版本必须与 ruleset.GolangciLintVersion / ruleset.ArchLintVersion 一致
       # （域仓库 Makefile 的 lint 目标从那里渲染），否则本地绿、CI 红。
-      - name: golangci-lint（depguard / wrapcheck / forbidigo）
+      - name: golangci-lint（边界 / 并发安全 / 正确性 / 安全基线）
         run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run ./...
 
       - name: go-arch-lint（组件依赖矩阵）
         run: go run github.com/fe3dback/go-arch-lint@v1.18.0 check
 
-      # 自研检查器：金额禁 float / decimal 不上 JSON 面 / ctx 不进 struct。
-      # 版本取上面解析出的 APPKIT_TOOL。
+      # 自研检查器：金额/JSON 边界、ctx 传播、路由分类、裸 goroutine、身份头读取、
+      # 错误字符串比对、pgtx.From 绕过等。版本取上面解析出的 APPKIT_TOOL。
       # 默认只查生产代码——存量域的测试文件不该被规则升级一夜卡红，
       # 要连测试一起查在本地 make lint 里显式 -xxx.tests=true。
-      - name: appkit-lint（moneyfloat / ctxstruct / decjson）
+      - name: appkit-lint（自研架构与边界检查器集合）
         run: go run github.com/forgeplex/appkit/lint/cmd/appkit-lint@"$APPKIT_TOOL" ./...
+
+      - name: govulncheck（可达调用图依赖漏洞扫描）
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
       - name: go.mod 整洁检查
         shell: bash

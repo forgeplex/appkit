@@ -38,13 +38,11 @@ func serviceSecurityFixture(t *testing.T) (SecurityOptions, ed25519.PrivateKey) 
 }
 
 func TestServiceSecurityModeMatrix(t *testing.T) {
-	service, key := serviceSecurityFixture(t)
-	pub := key.Public().(ed25519.PublicKey)
-	user := Options{Service: "matrix", AuthnPublicKey: pub, AuthnIssuer: "users"}
+	service, _ := serviceSecurityFixture(t)
+	verifier, _ := testOIDCVerifier(t)
 	plain := Options{Service: "matrix"}
-	multi := SecurityOptions{UserIssuers: map[string]authn.Issuer{"users": {Key: pub, Partition: "eu"}}}
-	both := multi
-	both.ServiceVerifier = service.ServiceVerifier
+	user := SecurityOptions{UserVerifier: verifier}
+	both := SecurityOptions{ServiceVerifier: service.ServiceVerifier, UserVerifier: verifier}
 	for _, tc := range []struct {
 		name string
 		mode appkit.SecurityMode
@@ -53,20 +51,16 @@ func TestServiceSecurityModeMatrix(t *testing.T) {
 		want string
 	}{
 		{"internal configured", appkit.SecurityInternalService, plain, service, ""},
-		{"mixed configured", appkit.SecurityMixed, user, service, ""},
-		{"mixed multi issuer", appkit.SecurityMixed, plain, both, ""},
-		{"user multi issuer", appkit.SecurityUserFacing, plain, multi, ""},
+		{"mixed configured", appkit.SecurityMixed, plain, both, ""},
+		{"user configured", appkit.SecurityUserFacing, plain, user, ""},
 		{"internal missing", appkit.SecurityInternalService, plain, SecurityOptions{}, "服务身份配置"},
 		{"internal zero verifier", appkit.SecurityInternalService, plain, SecurityOptions{ServiceVerifier: &authn.ServiceVerifier{}}, "服务身份配置"},
-		{"mixed missing user", appkit.SecurityMixed, plain, service, "AuthnPublicKey"},
-		{"mixed missing service", appkit.SecurityMixed, user, SecurityOptions{}, "服务身份配置"},
-		{"internal ignores no user", appkit.SecurityInternalService, user, service, "冲突"},
-		{"internal ignores no multi", appkit.SecurityInternalService, plain, both, "冲突"},
-		{"user ignores no service", appkit.SecurityUserFacing, user, service, "冲突"},
-		{"disabled ignores no service", appkit.SecurityDisabled, plain, service, "冲突"},
-		{"disabled ignores no multi", appkit.SecurityDisabled, plain, multi, "冲突"},
-		{"ambiguous users", appkit.SecurityUserFacing, user, multi, "不能同时"},
-		{"invalid users", appkit.SecurityUserFacing, plain, SecurityOptions{UserIssuers: map[string]authn.Issuer{"users": {}}}, "有效 Ed25519"},
+		{"mixed missing user", appkit.SecurityMixed, plain, service, "UserVerifier"},
+		{"mixed missing service", appkit.SecurityMixed, plain, user, "服务身份配置"},
+		{"internal rejects user", appkit.SecurityInternalService, plain, both, "冲突"},
+		{"user rejects service", appkit.SecurityUserFacing, plain, both, "冲突"},
+		{"disabled rejects service", appkit.SecurityDisabled, plain, service, "冲突"},
+		{"disabled rejects user", appkit.SecurityDisabled, plain, user, "冲突"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateHTTPSecurityWithOptions(tc.o, "dev", tc.mode, "MATRIX", false, tc.s)
@@ -162,7 +156,8 @@ func TestRunWithSecurityServesVerifiedServiceRequests(t *testing.T) {
 				},
 			}
 			if mode == appkit.SecurityMixed {
-				o.AuthnPublicKey, o.AuthnIssuer = key.Public().(ed25519.PublicKey), "users"
+				verifier, _ := testOIDCVerifier(t)
+				security.UserVerifier = verifier
 			}
 			ctx, cancel := context.WithCancel(t.Context())
 			done := make(chan error, 1)

@@ -12,36 +12,15 @@ import (
 	"time"
 
 	"github.com/forgeplex/appkit/apperr"
-	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
-	"github.com/forgeplex/appkit/outbound"
 )
 
 // Client 是 greet 契约的远程绑定：与进程内 wrapper（wrap.gen.go）实现
 // 同一个 Service 接口，方法体同样经 contract.Call——事务守卫、ctx 防火墙、
 // 超时与错误规范化在两种部署形态下完全一致（DESIGN §5.3）。
 type Client struct {
-	base   string
-	hc     *http.Client
-	secure bool
-}
-
-// NewClient 返回契约 client。base 是服务根地址（如 "http://ledger:8080"），
-// caller 填本服务名（callctx 白名单的归因值）。
-//
-// 这是兼容旧行为的 legacy/dev 入口，不提供服务认证或 HTTPS 强制；
-// 生产服务调用使用 NewSecureClient。
-//
-// 白名单传播焊死在装配处：hc 为 nil 走默认 Transport；非 nil 时在其
-// Transport 外包一层 callctx.Transport（不改调用方的 client）。
-// 「忘了装 Transport」这个静默失效形态在生成 client 里不存在。
-func NewClient(base, caller string, hc *http.Client) *Client {
-	if hc == nil {
-		hc = &http.Client{}
-	}
-	inner := *hc
-	inner.Transport = callctx.Transport{Base: outbound.InstrumentTransport(hc.Transport), Caller: caller}
-	return &Client{base: strings.TrimSuffix(base, "/"), hc: &inner}
+	base string
+	hc   *http.Client
 }
 
 // NewSecureClient 返回显式认证的 HTTPS 契约 client。Audience 与服务凭证
@@ -53,7 +32,7 @@ func NewSecureClient(base string, opts contract.SecureClientOptions) (*Client, e
 	if err != nil {
 		return nil, err
 	}
-	return &Client{base: strings.TrimSuffix(base, "/"), hc: hc, secure: true}, nil
+	return &Client{base: strings.TrimSuffix(base, "/"), hc: hc}, nil
 }
 
 // 编译期断言：Client 与 Service 漂移时本包编译失败。
@@ -71,7 +50,7 @@ func (c *Client) Greet(ctx context.Context, req GreetRequest) (GreetReply, error
 				return GreetReply{}, apperr.Internal(err)
 			}
 			hreq.Header.Set("Content-Type", "application/json")
-			return do[GreetReply](c.hc, hreq, c.secure)
+			return do[GreetReply](c.hc, hreq)
 		})
 	})
 }
@@ -84,7 +63,7 @@ func (c *Client) Stats(ctx context.Context) (StatsReply, error) {
 				return StatsReply{}, apperr.Internal(err)
 			}
 			hreq.Header.Set("Content-Type", "application/json")
-			return do[StatsReply](c.hc, hreq, c.secure)
+			return do[StatsReply](c.hc, hreq)
 		})
 	})
 }
@@ -100,7 +79,7 @@ func (c *Client) Reset(ctx context.Context, req ResetRequest) error {
 			return struct{}{}, apperr.Internal(err)
 		}
 		hreq.Header.Set("Content-Type", "application/json")
-		return do[struct{}](c.hc, hreq, c.secure)
+		return do[struct{}](c.hc, hreq)
 	})
 	return err
 }
@@ -113,7 +92,7 @@ func (c *Client) Ping(ctx context.Context) error {
 				return struct{}{}, apperr.Internal(err)
 			}
 			hreq.Header.Set("Content-Type", "application/json")
-			return do[struct{}](c.hc, hreq, c.secure)
+			return do[struct{}](c.hc, hreq)
 		})
 	})
 	return err
@@ -131,7 +110,7 @@ func (c *Client) Search(ctx context.Context, req SearchRequest) (SearchReply, er
 				return SearchReply{}, apperr.Internal(err)
 			}
 			hreq.Header.Set("Content-Type", "application/json")
-			return do[SearchReply](c.hc, hreq, c.secure)
+			return do[SearchReply](c.hc, hreq)
 		})
 	})
 }
@@ -139,11 +118,11 @@ func (c *Client) Search(ctx context.Context, req SearchRequest) (SearchReply, er
 // do 执行一次 HTTP 调用并按契约约定解码：200 解析 JSON 响应体，其余
 // 状态一律经 apperr.FromProblem 重建错误——错误身份 = 错误码，跨网络重建后
 // apperr.Is 判定与进程内一致。网络层故障折叠为 CodeUnavailable（可重试信号）。
-func do[T any](hc *http.Client, hreq *http.Request, secure bool) (T, error) {
+func do[T any](hc *http.Client, hreq *http.Request) (T, error) {
 	var zero T
 	resp, err := hc.Do(hreq)
 	if err != nil {
-		if secure && (apperr.Is(err, apperr.CodeUnauthenticated) || apperr.Is(err, apperr.CodePermissionDenied) || apperr.Is(err, apperr.CodeInvalidArgument)) {
+		if apperr.Is(err, apperr.CodeUnauthenticated) || apperr.Is(err, apperr.CodePermissionDenied) || apperr.Is(err, apperr.CodeInvalidArgument) {
 			return zero, apperr.From(err)
 		}
 		return zero, apperr.Unavailable(err)

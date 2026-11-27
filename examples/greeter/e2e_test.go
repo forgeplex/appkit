@@ -12,8 +12,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/contract"
 	"github.com/forgeplex/appkit/examples/greeter/gateway"
 	"github.com/forgeplex/appkit/examples/greeter/greet"
 	"github.com/forgeplex/appkit/examples/greeter/greetapi"
@@ -121,10 +123,19 @@ func TestGreetHandler(t *testing.T) {
 // 生成 client——handler 里不再手写 contract.Call。
 func TestGatewayHandler(t *testing.T) {
 	local := greetapi.WrapService(greet.NewService(), 0)
-	// 远程形态对拍：生成 client 打生成 server handler（真 HTTP 回环）。
-	greetSrv := httptest.NewServer(greetapi.NewHTTPHandler(greetapi.WrapService(greet.NewService(), 0)))
+	// 远程形态对拍：生成安全 client 打生成 server handler（真 HTTPS 回环）。
+	greetSrv := httptest.NewTLSServer(greetapi.NewHTTPHandler(greetapi.WrapService(greet.NewService(), 0)))
 	t.Cleanup(greetSrv.Close)
-	remote := greetapi.NewClient(greetSrv.URL, "gateway", nil)
+	remote, err := greetapi.NewSecureClient(greetSrv.URL, contract.SecureClientOptions{
+		Audience:   "greet",
+		HTTPClient: greetSrv.Client(),
+		Credentials: contract.ServiceCredentialProviderFunc(func(context.Context, contract.ServiceScope) (contract.ServiceCredential, error) {
+			return contract.ServiceCredential{Token: "greeter-test-token", ExpiresAt: time.Now().Add(time.Minute)}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		name       string

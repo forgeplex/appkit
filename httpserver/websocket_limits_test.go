@@ -96,12 +96,12 @@ func TestNewWebSocketHubWithLimitsRejectsUnboundedOrInvalidBudgets(t *testing.T)
 		})
 	}
 
-	legacy := NewWebSocketHub()
-	if err := legacy.Start(context.Background()); !apperr.Is(err, apperr.CodeInvalidArgument) {
-		t.Fatalf("unbounded legacy Hub.Start() = %v, want INVALID_ARGUMENT", err)
+	var zero WebSocketHub
+	if err := zero.Start(context.Background()); !apperr.Is(err, apperr.CodeInvalidArgument) {
+		t.Fatalf("zero-value Hub.Start() = %v, want INVALID_ARGUMENT", err)
 	}
-	if err := legacy.Ready(context.Background()); !apperr.Is(err, apperr.CodeUnavailable) {
-		t.Fatalf("unbounded legacy Hub.Ready() = %v, want UNAVAILABLE", err)
+	if err := zero.Ready(context.Background()); !apperr.Is(err, apperr.CodeUnavailable) {
+		t.Fatalf("zero-value Hub.Ready() = %v, want UNAVAILABLE", err)
 	}
 }
 

@@ -847,7 +847,7 @@ func TestSSEHandlerRespectsStrictRouteClassifications(t *testing.T) {
 	}
 }
 
-func TestSSEStrictSecurityRejectsUnclassifiedAndIncompatibleRoutes(t *testing.T) {
+func TestSSEStrictSecurityRejectsIncompatibleRoutes(t *testing.T) {
 	handler := makeSSEHandler(t, sseTestConfig(), func(context.Context, string, contract.Stream[httpserver.SSEEvent[sseTestReply], sseTestRequest]) error {
 		return nil
 	})
@@ -858,9 +858,9 @@ func TestSSEStrictSecurityRejectsUnclassifiedAndIncompatibleRoutes(t *testing.T)
 		want  string
 	}{
 		{
-			name: "unclassified route", mode: appkit.SecurityUserFacing,
-			mount: func(reg *appkit.Registry, h http.Handler) { reg.Mount("POST /sse", h) },
-			want:  "未声明安全分类",
+			name: "user route in internal-service mode", mode: appkit.SecurityInternalService,
+			mount: func(reg *appkit.Registry, h http.Handler) { reg.MountAuthenticated("POST /sse", h) },
+			want:  "用户身份路由",
 		},
 		{
 			name: "internal route in user-facing mode", mode: appkit.SecurityUserFacing,

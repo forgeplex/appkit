@@ -2,6 +2,7 @@ package consumer_test
 
 import (
 	"context"
+	"crypto/ed25519"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,7 +18,9 @@ import (
 	"example.test/reusable"
 	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/authn"
 	"github.com/forgeplex/appkit/callctx"
+	"github.com/forgeplex/appkit/contract"
 	"github.com/forgeplex/appkit/tx"
 )
 
@@ -34,15 +37,46 @@ func TestReusedModule(t *testing.T) {
 			if err != nil { t.Fatal(err) }
 			primary, primaryProbe := reusable.Module("primary")
 			backup, backupProbe := reusable.Module("backup")
+			pub, priv, err := ed25519.GenerateKey(nil)
+			if err != nil { t.Fatal(err) }
+			signer, err := authn.NewServiceSigner(authn.ServiceSignerOptions{
+				Issuer: "acceptance-ca", Subject: project, KeyID: "k1", Key: priv, TTL: time.Minute,
+				AuthorizeDelegation: func(context.Context, appkit.ServicePrincipal, authn.ServiceDelegation) error {
+					return nil
+				},
+			})
+			if err != nil { t.Fatal(err) }
+			verifier, err := authn.NewServiceVerifier(authn.ServiceVerifierOptions{
+				Audience: "sample",
+				Issuers:  map[string]authn.ServiceIssuer{"acceptance-ca": {Keys: map[string]ed25519.PublicKey{"k1": pub}, Subjects: []string{project}}},
+				AuthorizeDelegation: func(context.Context, appkit.ServicePrincipal, authn.ServiceDelegation) error {
+					return nil
+				},
+			})
+			if err != nil { t.Fatal(err) }
 			var hits atomic.Int64
 			serve := func(probe *reusable.Service) *httptest.Server {
-				inner := sample.NewHTTPHandler(sample.WrapService(probe, reusable.BoundaryTimeout))
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				inner := verifier.Middleware(sample.NewHTTPHandler(sample.WrapService(probe, reusable.BoundaryTimeout)))
+				server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					hits.Add(1)
 					inner.ServeHTTP(w, r)
 				}))
 				t.Cleanup(server.Close)
 				return server
+			}
+			newRemote := func(server *httptest.Server) (sample.Service, error) {
+				return sample.NewSecureClient(server.URL, contract.SecureClientOptions{
+					Audience:   "sample",
+					HTTPClient: server.Client(),
+					Credentials: contract.ServiceCredentialProviderFunc(func(ctx context.Context, scope contract.ServiceScope) (contract.ServiceCredential, error) {
+						raw, err := signer.Sign(ctx, scope.Audience, authn.ServiceDelegation{
+							TenantID:  scope.TenantID,
+							Partition: scope.Partition,
+						})
+						if err != nil { return contract.ServiceCredential{}, err }
+						return contract.ServiceCredential{Token: raw, ExpiresAt: time.Now().Add(time.Minute)}, nil
+					}),
+				})
 			}
 			primaryServer, backupServer := serve(primaryProbe), serve(backupProbe)
 			selectedProbe, otherName := primaryProbe, "backup"
@@ -71,10 +105,10 @@ func TestReusedModule(t *testing.T) {
 				appkit.Target(target), appkit.HTTPAddr("127.0.0.1:0"),
 				appkit.Logger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 				appkit.RemoteNamed[sample.Service]("primary", func(*appkit.Registry) (sample.Service, error) {
-					return sample.NewClient(primaryServer.URL, project, nil), nil
+					return newRemote(primaryServer)
 				}),
 				appkit.RemoteNamed[sample.Service]("backup", func(*appkit.Registry) (sample.Service, error) {
-					return sample.NewClient(backupServer.URL, project, nil), nil
+					return newRemote(backupServer)
 				}),
 			)
 			start(t, app, ready)
