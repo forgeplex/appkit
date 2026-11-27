@@ -2,6 +2,25 @@
 
 按版本倒序；每条是其 annotated tag message 的镜像，事实源是 tag，本文件禁手改（发版后跑 `make changelog` 重新生成）。网页版见 [Releases](https://github.com/forgeplex/appkit/releases)。
 
+## v0.12.0（2026-11-27）
+
+v0.12.0: 清理旧兼容 API、补齐 lint/archcheck/CI 静态门禁并上提公共 money 原语
+
+- **破坏性清理（0.x 兼容面收口）**：
+  - 移除已废弃的 `money/pgxmoney` 包（NUMERIC 持久化统一走 `decimal.Decimal` 原生编解码）
+  - 移除旧版静态 Ed25519 用户验签（`authn.Middleware` / `authn.MultiIssuer` / `authn.Issuer` / `authn.HeaderStepUp`）与 `bootstrap` 旧字段（`Options.AuthnPublicKey` / `AuthnIssuer`、`SecurityOptions.UserIssuers`、`ProfileOptions.AuthnPublicKey` / `AuthnIssuer`）；用户面统一走 OIDC（`security.oidc` / `authn.NewOIDCVerifier` / `SecurityOptions.UserVerifier`）
+  - 移除未分类根路由挂载 `(*appkit.Registry).Mount`（根路由分类升至编译器级，改用 `MountPublic` / `MountAuthenticated` / `MountPermission` / `MountInternalService`），并移除已冗余的 `lint/rawmount`
+  - 移除旧 `outbox.Inbox`（统一走 `outbox.InboxWithTransactor`）
+  - 移除无界 `httpserver.NewWebSocketHub`（统一走 `httpserver.NewWebSocketHubWithLimits`）
+  - 契约代码生成仅保留 `NewSecureClient` / `NewSecureClientV2`，移除无认证 `NewClient` / `NewClientV2`
+- **新增 lint、archcheck、框架自检与 CI 门禁**：
+  - `ruleset`（golangci-lint 模板）启用 `bidichk`、`bodyclose`、`contextcheck`、`durationcheck`、`errchkjson`、`errorlint`、`exhaustive`、`fatcontext`、`gosec`、`modernize`、`nilerr`、`nilnil`、`noctx`、`rowserrcheck`、`sloglint`、`sqlclosecheck`，扩展 `forbidigo` 禁裸 ticker/HTTP/Exit/ListenAndServe/signal
+  - `internal/archcheck` 新增目录结构守卫（`layout`）、高危 DDL 检查（禁 `CREATE INDEX CONCURRENTLY`、浮点金额列、无默认值的 `ADD COLUMN ... NOT NULL`、`ALTER COLUMN TYPE`、`DROP TABLE`/`TRUNCATE`）、高危查询检查（禁 `SELECT *`、缺顶层 `WHERE` 的 `UPDATE`/`DELETE`）以及非 dev 配置安全检查（禁 PEM 私钥、`disabled`、`user_facing+pprof`、非 loopback HTTP OIDC）
+  - `lint/`（`appkit-lint`）新增统一豁免指令 `//appkit:ignore <name> -- <reason>` 及 9 个新 analyzer：`nogoroutine`、`authheader`、`errcmp`、`pgtxbypass`、`jsonany`、`timenow`（opt-in）、`canonicalmoney`、`txparam`、`callctxwrite`
+  - 新增 `stdlib_only_test.go` 守卫根包与 `tx` 包零第三方依赖；`ci.yml` 0.x 阶段将 `apidiff` 调整为非阻断变更报告；`domain-ci.yml` 新增 PR 迁移不可变检查并钉版 `govulncheck@v1.1.4`
+- **上提公共金额原语到 `money`**：
+  - 新增 `CodeInvalidAssetCode`、`CodeScaleExceeded`、`ParseCanonicalDecimal`、`ParsePositiveDecimal`、`ParseNonNegativeDecimal`、`ValidCurrency`、`ValidateCurrency`、`ValidAssetCode`、`ValidateAssetCode`、`CheckScale`、`FormatAmount`，供各业务域直接复用
+
 ## v0.11.0（2026-11-25）
 
 v0.11.0: 新增多 Realm OIDC 用户令牌验签器（OIDCVerifier / security.oidc）
