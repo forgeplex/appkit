@@ -50,6 +50,27 @@ DELETE FROM ledger.users;
 			},
 		},
 		{
+			name: "子查询/CTE/字符串字面量中的 WHERE 不得绕过顶层 UPDATE/DELETE 门禁",
+			sql: `UPDATE ledger.accounts SET balance = (SELECT sum(amount) FROM ledger.entries WHERE account_id = ledger.accounts.id);
+WITH target AS (SELECT id FROM ledger.users WHERE active = false)
+DELETE FROM ledger.users;
+UPDATE ledger.users SET note = 'WHERE id = 1';
+`,
+			want: []wantV{
+				{File: "db/queries/q.sql", Line: 1, Msg: "缺少 WHERE"},
+				{File: "db/queries/q.sql", Line: 2, Msg: "缺少 WHERE"},
+				{File: "db/queries/q.sql", Line: 4, Msg: "缺少 WHERE"},
+			},
+		},
+		{
+			name: "CTE + 顶层 WHERE 及 WITH INSERT ON CONFLICT DO UPDATE 正常放行",
+			sql: `WITH target AS (SELECT id FROM ledger.users WHERE active = false)
+UPDATE ledger.users SET status = 'archived' FROM target WHERE ledger.users.id = target.id;
+WITH src AS (SELECT $1::text AS id)
+INSERT INTO ledger.users (id) SELECT id FROM src ON CONFLICT (id) DO UPDATE SET status = 'active';
+`,
+		},
+		{
 			name: "显式注释豁免放行",
 			sql: `-- appkit:allow-unsafe-sql: 全表清理测试表
 DELETE FROM ledger.temp_work;
