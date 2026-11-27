@@ -191,7 +191,7 @@ func TestDomainScaffold(t *testing.T) {
 			// 根路由必须显式分类；裸 Mount 在严格模式会拒绝启动。
 			"security.mode", "reg.MountPublic", "reg.MountAuthenticated",
 			"reg.MountPermission", "reg.MountInternalService",
-			"AuthnPublicKey", "AuthnIssuer", "internal_service/mixed", "fail closed",
+			"security.oidc", "UserVerifier", "internal_service/mixed", "fail closed",
 			// 出站 HTTP 的正解是装 Transport，不是逐调用点写 Inject——
 			// 规程指错机制，代理就会照着摊到每个调用点的那种写法写。
 			"callctx.Transport",

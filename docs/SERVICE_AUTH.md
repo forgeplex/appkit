@@ -7,9 +7,10 @@
 ## 接收端
 
 标准 bootstrap 在连接数据库、装配模块、监听端口之前检查配置。`user_facing`
-仍使用 `Options.AuthnPublicKey/AuthnIssuer`；`internal_service` 要求服务验签器；
-`mixed` 两种都要。单进程多用户签发方使用 `MainWithSecurity` / `RunWithSecurity`
-的 `SecurityOptions.UserIssuers`，不能同时配置旧的单签发方字段。
+要求 `security.oidc` 配置或 `SecurityOptions.UserVerifier`；`internal_service`
+要求服务验签器（`security.service` 或 `SecurityOptions.ServiceVerifier`）；
+`mixed` 两种都要。旧版静态公钥用户验签字段（`AuthnPublicKey` / `AuthnIssuer`
+/ `UserIssuers`）已移除，用户面统一走 OIDC。
 
 以下配置使用占位公钥，必须换成签发方的真实 **Ed25519 公钥**才能启动；接收端
 不需要私钥。公钥允许标准 base64 的 32 字节原始公钥，或单个 PKIX `PUBLIC KEY`
@@ -77,12 +78,13 @@ nil policy 拒绝任何非空委托，提供自定义 policy 时还可拒绝空�
 
 ## 出站客户端
 
-重新运行 `appkit gen contract` 后，生成物同时提供：
+重新运行 `appkit gen contract` 后，生成物仅提供安全客户端构造器（旧无认证
+`NewClient` / `NewClientV2` 已移除）：
 
-- `NewClient(base, caller, hc)`：保留兼容，供显式 legacy/dev 和契约单元测试；
-  它不建立服务身份，不能作为生产内部调用的认证方案。
-- `NewSecureClient(base, contract.SecureClientOptions)`：返回 `(*Client, error)`；
-  必须提供 HTTPS、Audience 与 ServiceCredentialProvider。
+- `NewSecureClient(base, contract.SecureClientOptions)`（以及 v2 契约的
+  `NewSecureClientV2`）：返回 `(*Client, error)`；必须提供 HTTPS、Audience
+  与 `ServiceCredentialProvider`（本地测试可通过 `AllowInsecureHTTP` +
+  测试 `ServiceCredentialProvider` 构造）。
 
 将签发器连接到 provider 的核心装配如下（`signer` 由可信组合根构造，私钥不进代码库）：
 

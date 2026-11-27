@@ -157,9 +157,7 @@ type WebSocketHub struct {
 	changed          chan struct{}
 }
 
-// NewWebSocketHub 创建尚未 Start、且未配置连接/速率预算的 WebSocket Hub。
-// 为保持现有调用签名，该 Hub 仍可构造，但 Start 不会使其进入可接纳状态。
-func NewWebSocketHub() *WebSocketHub {
+func newWebSocketHub() *WebSocketHub {
 	return &WebSocketHub{
 		pending:     make(map[*webSocketReservation]struct{}),
 		connections: make(map[*managedWebSocket]struct{}),

@@ -39,7 +39,7 @@ func NewWebSocketHubWithLimits(limits WebSocketHubLimits) (*WebSocketHub, error)
 	if err := validateWebSocketHubLimits(limits); err != nil {
 		return nil, err
 	}
-	hub := NewWebSocketHub()
+	hub := newWebSocketHub()
 	hub.limits = limits
 	hub.limitsConfigured = true
 	return hub, nil
@@ -67,7 +67,7 @@ func validateWebSocketRateLimits(limits WebSocketRateLimits) error {
 
 func (h *WebSocketHub) validateMessageLimit(maxMessageBytes int64) error {
 	if h == nil || !h.limitsConfigured {
-		return nil // The legacy constructor remains constructible but cannot admit upgrades.
+		return apperr.InvalidArgument("httpserver WebSocket hub: explicit finite limits are required")
 	}
 	if maxMessageBytes > h.limits.Inbound.ByteBurst || maxMessageBytes > h.limits.Outbound.ByteBurst {
 		return apperr.InvalidArgument("httpserver WebSocket: MaxMessageBytes must fit inbound and outbound byte bursts")

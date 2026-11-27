@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -175,11 +176,21 @@ func TestSecureGeneratedClientStrictAppAndLocalBoundary(t *testing.T) {
 			}
 		})
 	}
-	// A compatibility client has no service credential and must not gain access
+	// A raw HTTP request without a service credential must not gain access
 	// merely by carrying unsigned tenant/partition/caller headers.
-	legacy := NewClient(srv.URL, "caller-service", srv.Client())
-	if _, err := legacy.Greet(ctx, GreetRequest{Name: "Ada"}); !apperr.Is(err, apperr.CodeUnauthenticated) {
-		t.Fatalf("legacy unsigned client entered an internal route: %v", err)
+	unsignedReq, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/greet", strings.NewReader(`{"name":"Ada"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsignedReq.Header.Set("Content-Type", "application/json")
+	callctx.Inject(callctx.Meta{RequestID: "req-1", Partition: "partition-1", TenantID: "tenant-1", Caller: "caller-service"}, unsignedReq.Header.Set)
+	unsignedResp, err := srv.Client().Do(unsignedReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsignedResp.Body.Close()
+	if unsignedResp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unsigned HTTP request entered an internal route: status=%d", unsignedResp.StatusCode)
 	}
 	before := providerCalls.Load()
 	denied := callctx.With(ctx, callctx.Meta{Partition: "other-partition", TenantID: "tenant-1"})

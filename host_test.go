@@ -205,7 +205,7 @@ func TestHeadlessAppStartNeedsNoSecurityOrHTTPListener(t *testing.T) {
 
 func TestHeadlessRejectsRoutesAndPprof(t *testing.T) {
 	module := ModuleFunc("route", func(reg *Registry) error {
-		reg.Mount("/business", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		reg.MountPublic("/business", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 		return nil
 	})
 	for _, tc := range []struct {

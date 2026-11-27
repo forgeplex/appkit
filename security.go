@@ -45,7 +45,6 @@ func validateSecurityMode(mode SecurityMode) error {
 type routeSecurity string
 
 const (
-	routeUnclassified    routeSecurity = "unclassified"
 	routePublic          routeSecurity = "public"
 	routeAuthenticated   routeSecurity = "authenticated"
 	routePermission      routeSecurity = "permission"
@@ -171,8 +170,6 @@ func (r *Registry) validateRouteSecurity(mode SecurityMode, pprof bool) error {
 	for _, m := range r.mounts {
 		prefix := fmt.Sprintf("模块 %q 的路由 %q", m.module, m.pattern)
 		switch {
-		case m.security == routeUnclassified:
-			problems = append(problems, prefix+" 未声明安全分类——使用 MountPublic/MountAuthenticated/MountPermission/MountInternalService")
 		case mode == SecurityUserFacing && m.security == routeInternalService:
 			problems = append(problems, prefix+" 声明为 InternalService，但当前模式是 user_facing（需要 mixed 或 internal_service）")
 		case mode == SecurityInternalService && (m.security == routeAuthenticated || m.security == routePermission):

@@ -45,10 +45,10 @@ func TestSchemaValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ctors := map[string]func(){
-				"MigrationSQL": func() { outbox.MigrationSQL(tc.schema) },
-				"NewRelay":     func() { outbox.NewRelay(nil, tc.schema, outbox.NewDirectBus()) },
-				"NewPublisher": func() { outbox.NewPublisher(nil, tc.schema) },
-				"Inbox":        func() { outbox.Inbox(nil, tc.schema, "c", nil) },
+				"MigrationSQL":        func() { outbox.MigrationSQL(tc.schema) },
+				"NewRelay":            func() { outbox.NewRelay(nil, tc.schema, outbox.NewDirectBus()) },
+				"NewPublisher":        func() { outbox.NewPublisher(nil, tc.schema) },
+				"InboxWithTransactor": func() { outbox.InboxWithTransactor(nil, pgtx.New(nil), tc.schema, "c", nil) },
 			}
 			for name, fn := range ctors {
 				if got := panics(fn); got != tc.wantPanic {
@@ -169,7 +169,7 @@ func TestPublishGuards(t *testing.T) {
 
 func TestInboxRejectsMissingID(t *testing.T) {
 	t.Parallel()
-	h := outbox.Inbox(nil, "s", "c", func(context.Context, appkit.Event) error {
+	h := outbox.InboxWithTransactor(nil, pgtx.New(nil), "s", "c", func(context.Context, appkit.Event) error {
 		t.Fatal("不应调用 next")
 		return nil
 	})
@@ -182,8 +182,8 @@ func TestInboxRejectsMissingID(t *testing.T) {
 // consumer 为空时去重维度缺失，构造期必须 fail-fast。
 func TestInboxRejectsEmptyConsumer(t *testing.T) {
 	t.Parallel()
-	if !panics(func() { outbox.Inbox(nil, "s", "", nil) }) {
-		t.Fatal("Inbox 空 consumer 应 panic")
+	if !panics(func() { outbox.InboxWithTransactor(nil, pgtx.New(nil), "s", "", nil) }) {
+		t.Fatal("InboxWithTransactor 空 consumer 应 panic")
 	}
 }
 

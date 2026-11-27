@@ -485,3 +485,59 @@ func TestParseCanonical(t *testing.T) {
 		}
 	}
 }
+
+func TestCanonicalDecimalHelpers(t *testing.T) {
+	d, err := money.ParseCanonicalDecimal("10.50")
+	if err != nil || money.FormatAmount(d) != "10.50" {
+		t.Fatalf("ParseCanonicalDecimal(10.50) = (%v, %v)", d, err)
+	}
+	if _, err := money.ParseCanonicalDecimal("-0.00"); !apperr.Is(err, money.CodeInvalidAmount) {
+		t.Fatalf("负零应报 CodeInvalidAmount，得到 %v", err)
+	}
+	if _, err := money.ParsePositiveDecimal("0"); !apperr.Is(err, money.CodeInvalidAmount) {
+		t.Fatalf("ParsePositiveDecimal(0) 应报错，得到 %v", err)
+	}
+	if _, err := money.ParsePositiveDecimal("-1"); !apperr.Is(err, money.CodeInvalidAmount) {
+		t.Fatalf("ParsePositiveDecimal(-1) 应报错，得到 %v", err)
+	}
+	if d, err := money.ParsePositiveDecimal("0.01"); err != nil || money.FormatAmount(d) != "0.01" {
+		t.Fatalf("ParsePositiveDecimal(0.01) = (%v, %v)", d, err)
+	}
+	if d, err := money.ParseNonNegativeDecimal("0.00"); err != nil || !d.IsZero() {
+		t.Fatalf("ParseNonNegativeDecimal(0.00) = (%v, %v)", d, err)
+	}
+	if _, err := money.ParseNonNegativeDecimal("-0.01"); !apperr.Is(err, money.CodeInvalidAmount) {
+		t.Fatalf("ParseNonNegativeDecimal(-0.01) 应报错，得到 %v", err)
+	}
+}
+
+func TestCurrencyAndAssetValidation(t *testing.T) {
+	if !money.ValidCurrency("USD") || !money.ValidCurrency("USDT") || money.ValidCurrency("us") {
+		t.Fatal("ValidCurrency 判定异常")
+	}
+	if err := money.ValidateCurrency("usd"); !apperr.Is(err, money.CodeInvalidCurrency) {
+		t.Fatalf("ValidateCurrency(usd) = %v", err)
+	}
+	for _, ok := range []string{"US", "USD", "USDT", "BTC", "USDC01", "A12345678901"} {
+		if !money.ValidAssetCode(ok) || money.ValidateAssetCode(ok) != nil {
+			t.Errorf("ValidAssetCode(%q) 期望合法", ok)
+		}
+	}
+	for _, bad := range []string{"", "A", "1USD", "usd", "USD-1", "A123456789012"} {
+		if money.ValidAssetCode(bad) || !apperr.Is(money.ValidateAssetCode(bad), money.CodeInvalidAssetCode) {
+			t.Errorf("ValidateAssetCode(%q) 期望报 CodeInvalidAssetCode", bad)
+		}
+	}
+}
+
+func TestCheckScale(t *testing.T) {
+	if err := money.CheckScale(decimal.RequireFromString("1.500"), 2); err != nil {
+		t.Fatalf("尾随零应在标度内放行: %v", err)
+	}
+	if err := money.CheckScale(decimal.RequireFromString("1.005"), 2); !apperr.Is(err, money.CodeScaleExceeded) {
+		t.Fatalf("超标度有效小数应报 CodeScaleExceeded，得到 %v", err)
+	}
+	if err := money.CheckScale(decimal.RequireFromString("1"), 19); !apperr.Is(err, money.CodeInvalidAmount) {
+		t.Fatalf("scale>18 应报 CodeInvalidAmount，得到 %v", err)
+	}
+}

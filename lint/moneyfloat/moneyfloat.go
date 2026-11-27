@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/tools/go/analysis"
 
+	"github.com/forgeplex/appkit/lint/internal/directive"
 	"github.com/forgeplex/appkit/lint/internal/prodfiles"
 )
 
@@ -80,11 +81,14 @@ func run(pass *analysis.Pass) (any, error) {
 		return nil, nil
 	}
 
+	files := prodfiles.Files(pass.Fset, pass.Files, !tests)
+	ignores := directive.Parse(pass, files, pass.Analyzer.Name)
+
 	// 同一 ident 可能被多个语法上下文覆盖（如 struct 字段是函数类型），按位置去重。
 	reported := map[token.Pos]bool{}
 	report := func(label string, expr ast.Expr) {
 		for _, id := range floatIdents(pass, expr) {
-			if reported[id.Pos()] {
+			if reported[id.Pos()] || ignores.Ignored(pass.Fset, id.Pos()) {
 				continue
 			}
 			reported[id.Pos()] = true
@@ -121,7 +125,7 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 		return true
 	}
-	for _, f := range prodfiles.Files(pass.Fset, pass.Files, !tests) {
+	for _, f := range files {
 		ast.Inspect(f, filter)
 	}
 	return nil, nil

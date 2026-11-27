@@ -5,9 +5,25 @@ linters:
   # standard 组默认启用 errcheck / govet / staticcheck / ineffassign / unused。
   default: standard
   enable:
+    - bidichk
+    - bodyclose
+    - contextcheck
     - depguard
+    - durationcheck
+    - errchkjson
+    - errorlint
+    - exhaustive
+    - fatcontext
     - forbidigo
+    - gosec
+    - modernize
+    - nilerr
+    - nilnil
+    - noctx
     - nolintlint
+    - rowserrcheck
+    - sloglint
+    - sqlclosecheck
     - wrapcheck
   settings:
     depguard:
@@ -36,6 +52,16 @@ linters:
           deny:
             - pkg: github.com/jackc/pgx
               desc: pgx 只允许出现在 internal/postgres；其余包经 internal/{{ .Domain }} 的接口访问数据
+    exhaustive:
+      # 带 default 分支的 switch 视为已穷举，只拦真正漏分支且无兜底的枚举 switch。
+      default-signifies-exhaustive: true
+    gosec:
+      excludes:
+        # G104 与标准组 errcheck 重复，避免同一处漏查错误报两条。
+        - G104
+    sloglint:
+      # 禁止调用全局 slog.Info/Warn/Error 等默认 logger，日志一律走注入的 *slog.Logger。
+      no-global: all
     wrapcheck:
       # 本框架的错误词汇是 apperr（错误身份 = 错误码，DESIGN §5.2），不是
       # fmt.Errorf("%w")：appkit 交回的错误已在边界归一化为 *apperr.Error
@@ -63,6 +89,20 @@ linters:
       forbid:
         - pattern: '^fmt\.Print.*$'
           msg: 禁用 fmt.Print*；日志走注入的 slog
+        - pattern: '^time\.(NewTicker|Tick)$'
+          msg: 禁用裸 time.Ticker/Tick；周期任务走 reg.Worker + job.Every（多副本 advisory lock）
+        - pattern: '^http\.Error$'
+          msg: 禁用 http.Error；错误响应统一走 httpserver.WriteError（RFC 9457）
+        - pattern: '^http\.(Get|Post|PostForm|Head|DefaultClient|DefaultTransport)$'
+          msg: 禁用默认全局 HTTP 客户端；请显式构造带超时与 callctx.Transport / NewSecureClient 的客户端
+        - pattern: '^os\.Exit$'
+          msg: 禁用 os.Exit；进程生命周期与优雅关停统一由 bootstrap.Main / App.Run 托管
+        - pattern: '^log\.(Fatal|Fatalf|Fatalln|Panic|Panicf|Panicln)$'
+          msg: 禁用 log.Fatal*/Panic*；错误请返回上层，日志走注入的 slog
+        - pattern: '^http\.ListenAndServe.*$'
+          msg: 禁用裸 http.ListenAndServe*；HTTP Listener 与安全边界统一由 appkit 托管
+        - pattern: '^signal\.Notify.*$'
+          msg: 禁用自建 signal.Notify*；OS 信号处理统一由 App.Run / bootstrap.Runner 拥有
     nolintlint:
       allow-unused: false
       require-explanation: true
@@ -71,8 +111,9 @@ linters:
     # sqlc / 合约生成物不 lint（生成物禁手改由 CI drift check 保证）。
     generated: lax
     rules:
-      # 测试代码放宽错误包裹与打印限制。
+      # 测试代码放宽错误包裹、打印与安全扫描限制。
       - path: _test\.go
         linters:
           - wrapcheck
           - forbidigo
+          - gosec

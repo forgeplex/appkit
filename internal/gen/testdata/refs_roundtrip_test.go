@@ -11,11 +11,28 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/contract"
 	"github.com/forgeplex/appkit/refs"
 	"github.com/forgeplex/appkit/tx"
 )
+
+func newTestSecureClient(t *testing.T, server *httptest.Server) *Client {
+	t.Helper()
+	client, err := NewSecureClient(server.URL, contract.SecureClientOptions{
+		Audience:   "refs",
+		HTTPClient: server.Client(),
+		Credentials: contract.ServiceCredentialProviderFunc(func(context.Context, contract.ServiceScope) (contract.ServiceCredential, error) {
+			return contract.ServiceCredential{Token: "refs-test-token", ExpiresAt: time.Now().Add(time.Minute)}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
 
 type echoService struct{ calls atomic.Int32 }
 
@@ -56,9 +73,9 @@ func TestReferencesRoundTrip(t *testing.T) {
 	}
 	stub := &echoService{}
 	wrapped := WrapService(stub, 0)
-	server := httptest.NewServer(NewHTTPHandler(wrapped))
+	server := httptest.NewTLSServer(NewHTTPHandler(wrapped))
 	defer server.Close()
-	client := NewClient(server.URL, "test", server.Client())
+	client := newTestSecureClient(t, server)
 	req := ExchangeRequest{Refs: values, Batches: [][]refs.Values{{values, {}}}, Entry: Entry{Refs: values, History: []refs.Values{values}}, Entries: []Entry{{Refs: values}}}
 	want := ExchangeReply{Refs: req.Refs, Batches: req.Batches, Entry: req.Entry, Entries: req.Entries}
 	wantJSON, err := json.Marshal(want)
@@ -190,11 +207,11 @@ func TestReferencesEnvelopeBoundaries(t *testing.T) {
 
 func TestReferencesClientRejectsMalformedValue(t *testing.T) {
 	for _, body := range []string{`{"refs":null}`, `{"refs":{"merchant_id":"a","merchant_id":"b"}}`, `{"refs":{"merchant_id":42}}`} {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, body)
 		}))
-		client := NewClient(server.URL, "test", server.Client())
+		client := newTestSecureClient(t, server)
 		if _, err := client.Load(context.Background()); !apperr.Is(err, apperr.CodeInternal) {
 			t.Errorf("malformed refs response = %v", err)
 		}

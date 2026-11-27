@@ -13,6 +13,7 @@ import (
 
 	"golang.org/x/tools/go/analysis"
 
+	"github.com/forgeplex/appkit/lint/internal/directive"
 	"github.com/forgeplex/appkit/lint/internal/prodfiles"
 )
 
@@ -31,6 +32,8 @@ func init() {
 }
 
 func run(pass *analysis.Pass) (any, error) {
+	files := prodfiles.Files(pass.Fset, pass.Files, !tests)
+	ignores := directive.Parse(pass, files, pass.Analyzer.Name)
 	visit := func(n ast.Node) bool {
 		st, ok := n.(*ast.StructType)
 		if !ok {
@@ -38,6 +41,9 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 		for _, f := range st.Fields.List {
 			if !isContext(pass.TypesInfo.TypeOf(f.Type)) {
+				continue
+			}
+			if ignores.Ignored(pass.Fset, f.Pos()) {
 				continue
 			}
 			if len(f.Names) == 0 {
@@ -51,7 +57,7 @@ func run(pass *analysis.Pass) (any, error) {
 		}
 		return true
 	}
-	for _, f := range prodfiles.Files(pass.Fset, pass.Files, !tests) {
+	for _, f := range files {
 		ast.Inspect(f, visit)
 	}
 	return nil, nil

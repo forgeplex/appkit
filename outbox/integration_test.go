@@ -362,7 +362,7 @@ func TestInboxIntegration(t *testing.T) {
 					return nil
 				})
 			}
-			h := outbox.Inbox(pool, schema, "ledger", next)
+			h := outbox.InboxWithTransactor(pool, pgtx.New(pool), schema, "ledger", next)
 			evt := appkit.Event{ID: uuid.NewString(), Topic: "ledger.entry_posted"}
 
 			err1 := h(ctx, evt)
@@ -553,7 +553,7 @@ func TestOutboxEndToEnd(t *testing.T) {
 
 	var calls atomic.Int64
 	bus := outbox.NewDirectBus()
-	bus.Subscribe(topic, outbox.Inbox(pool, schema, "ledger", func(context.Context, appkit.Event) error {
+	bus.Subscribe(topic, outbox.InboxWithTransactor(pool, tr, schema, "ledger", func(context.Context, appkit.Event) error {
 		calls.Add(1)
 		return nil
 	}))
@@ -595,7 +595,7 @@ func TestRelaySingleConnPoolNoDeadlock(t *testing.T) {
 
 	var calls atomic.Int64
 	bus := outbox.NewDirectBus()
-	bus.Subscribe(topic, outbox.Inbox(pool, schema, "ledger", func(context.Context, appkit.Event) error {
+	bus.Subscribe(topic, outbox.InboxWithTransactor(pool, pgtx.New(pool), schema, "ledger", func(context.Context, appkit.Event) error {
 		calls.Add(1)
 		return nil
 	}))
@@ -745,11 +745,11 @@ func TestInboxMultiConsumers(t *testing.T) {
 
 	var emailCalls, auditCalls atomic.Int64
 	bus := outbox.NewDirectBus()
-	bus.Subscribe(topic, outbox.Inbox(pool, schema, "email", func(context.Context, appkit.Event) error {
+	bus.Subscribe(topic, outbox.InboxWithTransactor(pool, pgtx.New(pool), schema, "email", func(context.Context, appkit.Event) error {
 		emailCalls.Add(1)
 		return nil
 	}))
-	bus.Subscribe(topic, outbox.Inbox(pool, schema, "audit", func(context.Context, appkit.Event) error {
+	bus.Subscribe(topic, outbox.InboxWithTransactor(pool, pgtx.New(pool), schema, "audit", func(context.Context, appkit.Event) error {
 		auditCalls.Add(1)
 		return nil
 	}))

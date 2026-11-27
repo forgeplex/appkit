@@ -28,7 +28,9 @@ import (
 // 本包错误码。money 属框架层，不进合约仓库的业务错误码注册表。
 const (
 	CodeInvalidCurrency  = "MONEY_INVALID_CURRENCY"
+	CodeInvalidAssetCode = "MONEY_INVALID_ASSET_CODE"
 	CodeInvalidAmount    = "MONEY_INVALID_AMOUNT"
+	CodeScaleExceeded    = "MONEY_SCALE_EXCEEDED"
 	CodeCurrencyMismatch = "MONEY_CURRENCY_MISMATCH"
 )
 
@@ -41,13 +43,18 @@ const (
 	minExponent  = -18
 	maxExponent  = 30
 	maxDigits    = 38
+	maxScale     = 18
 )
 
 var (
 	errInvalidCurrency = apperr.New(CodeInvalidCurrency, http.StatusUnprocessableEntity,
 		"currency 必须是 3-6 位大写字母（ISO 4217 或资产代码，如 USDT）")
+	errInvalidAssetCode = apperr.New(CodeInvalidAssetCode, http.StatusUnprocessableEntity,
+		"asset code 必须匹配 ^[A-Z][A-Z0-9]{1,11}$（2-12 位大写字母或数字，字母开头）")
 	errInvalidAmount = apperr.New(CodeInvalidAmount, http.StatusUnprocessableEntity,
 		"amount 必须是十进制数字字符串")
+	errScaleExceeded = apperr.New(CodeScaleExceeded, http.StatusUnprocessableEntity,
+		"amount 小数位数超出资产允许标度")
 	errCurrencyMismatch = apperr.New(CodeCurrencyMismatch, http.StatusUnprocessableEntity,
 		"币种不匹配")
 )
@@ -94,28 +101,83 @@ func Parse(amount string, currency string) (Money, error) {
 // 再放任 "+80"/"8e1" 进来，同值的形态就更多了）。
 var canonicalForm = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?$`)
 
-// ParseCanonical 按 Parse 的全部约束解析，且只接受规范形态的金额字符串
-// （并拒绝 "-0"）。入站 DTO 用它：同值只有一种字节形态，是幂等指纹与
-// 签名可比的前提。出站渲染不受此限——按资产标度定宽是 DTO 层的事。
-func ParseCanonical(amount string, currency string) (Money, error) {
+// ParseCanonicalDecimal 解析无币种的规范十进制字符串（拒绝正号、前导零、
+// 裸小数点、科学计数法、负零，以及超长或超指数/位数域的输入）。
+// 适用于费率、手续费、限额、无币种金额字段等场景，避免调用方硬塞假币种。
+func ParseCanonicalDecimal(amount string) (decimal.Decimal, error) {
 	if len(amount) > maxAmountLen {
-		return Money{}, errInvalidAmount.
+		return decimal.Decimal{}, errInvalidAmount.
 			WithMessage("amount 字符串过长（最多 %d 字节）", maxAmountLen).
 			WithDetail("length", len(amount))
 	}
 	if !canonicalForm.MatchString(amount) {
-		return Money{}, errInvalidAmount.
+		return decimal.Decimal{}, errInvalidAmount.
 			WithMessage("amount 必须是规范十进制字符串（如 \"80\"、\"80.00\"、\"-3.5\"）：拒绝正号、前导零、裸小数点、科学计数法")
 	}
-	m, err := Parse(amount, currency)
+	d, err := decimal.NewFromString(amount)
+	if err != nil {
+		return decimal.Decimal{}, errInvalidAmount.WithDetail("amount", amount).WithCause(err)
+	}
+	if err := validAmount(d); err != nil {
+		return decimal.Decimal{}, err
+	}
+	if d.IsZero() && strings.HasPrefix(amount, "-") {
+		return decimal.Decimal{}, errInvalidAmount.
+			WithMessage("amount 不接受负零（\"0\"/\"0.00\" 已是零的规范形态）")
+	}
+	return d, nil
+}
+
+// ParsePositiveDecimal 按 ParseCanonicalDecimal 解析并要求严格大于 0。
+func ParsePositiveDecimal(amount string) (decimal.Decimal, error) {
+	d, err := ParseCanonicalDecimal(amount)
+	if err != nil {
+		return decimal.Decimal{}, err
+	}
+	if !d.IsPositive() {
+		return decimal.Decimal{}, errInvalidAmount.WithMessage("amount 必须大于 0")
+	}
+	return d, nil
+}
+
+// ParseNonNegativeDecimal 按 ParseCanonicalDecimal 解析并要求大于等于 0。
+func ParseNonNegativeDecimal(amount string) (decimal.Decimal, error) {
+	d, err := ParseCanonicalDecimal(amount)
+	if err != nil {
+		return decimal.Decimal{}, err
+	}
+	if d.IsNegative() {
+		return decimal.Decimal{}, errInvalidAmount.WithMessage("amount 不能为负数")
+	}
+	return d, nil
+}
+
+// ParseCanonical 按 Parse 的全部约束解析，且只接受规范形态的金额字符串
+// （并拒绝 "-0"）。入站 DTO 用它：同值只有一种字节形态，是幂等指纹与
+// 签名可比的前提。出站渲染不受此限——按资产标度定宽是 DTO 层的事。
+func ParseCanonical(amount string, currency string) (Money, error) {
+	d, err := ParseCanonicalDecimal(amount)
 	if err != nil {
 		return Money{}, err
 	}
-	if m.IsZero() && strings.HasPrefix(amount, "-") {
-		return Money{}, errInvalidAmount.
-			WithMessage("amount 不接受负零（\"0\"/\"0.00\" 已是零的规范形态）")
+	return New(d, currency)
+}
+
+// CheckScale 校验十进制数额的小数位不超过 scale（允许范围 [0, 18]）。
+// 尾随零（如 scale=2 收到 "1.500"）数值上仍在标度内会被放行，
+// 真正超出标度的有效小数（如 "1.005"）返回 CodeScaleExceeded。
+func CheckScale(d decimal.Decimal, scale int32) error {
+	if scale < 0 || scale > maxScale {
+		return errInvalidAmount.
+			WithMessage("scale 必须落在 [0, %d] 区间", maxScale).
+			WithDetail("scale", scale)
 	}
-	return m, nil
+	if exp := d.Exponent(); exp < 0 && -exp > scale && !d.Equal(d.Truncate(scale)) {
+		return errScaleExceeded.
+			WithDetail("amount", FormatAmount(d)).
+			WithDetail("scale", scale)
+	}
+	return nil
 }
 
 // validAmount 校验数额在金额域内。New 与 Parse 共用，保证任何已构造的
@@ -141,9 +203,9 @@ func Zero(currency string) Money {
 	return Money{currency: currency}
 }
 
-// validCurrency 接受 3-6 位大写 ASCII 字母：ISO 4217 是 3 位，多资产
-// 场景下还要容得下 USDT/USDC/WBTC 这类资产代码。只查格式。
-func validCurrency(c string) bool {
+// ValidCurrency 报告 c 是否为合法币种代码（3-6 位大写 ASCII 字母，
+// 覆盖 ISO 4217 与 USDT/USDC/WBTC 等常见资产代码）。只查格式，不查白名单。
+func ValidCurrency(c string) bool {
 	if len(c) < 3 || len(c) > 6 {
 		return false
 	}
@@ -154,6 +216,41 @@ func validCurrency(c string) bool {
 	}
 	return true
 }
+
+// ValidateCurrency 校验币种代码格式，不合法返回 CodeInvalidCurrency。
+func ValidateCurrency(c string) error {
+	if !ValidCurrency(c) {
+		return errInvalidCurrency.WithDetail("currency", c)
+	}
+	return nil
+}
+
+// ValidAssetCode 报告 c 是否为合法资产代码（^[A-Z][A-Z0-9]{1,11}$，2-12 位，
+// 大写字母开头，允许数字，适用于账本资产注册表与多资产域）。
+func ValidAssetCode(c string) bool {
+	if len(c) < 2 || len(c) > 12 {
+		return false
+	}
+	for i := 0; i < len(c); i++ {
+		ch := c[i]
+		upper := ch >= 'A' && ch <= 'Z'
+		digit := ch >= '0' && ch <= '9'
+		if (!upper && !digit) || (i == 0 && !upper) {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidateAssetCode 校验资产代码格式，不合法返回 CodeInvalidAssetCode。
+func ValidateAssetCode(c string) error {
+	if !ValidAssetCode(c) {
+		return errInvalidAssetCode.WithDetail("asset", c)
+	}
+	return nil
+}
+
+func validCurrency(c string) bool { return ValidCurrency(c) }
 
 // Amount 返回数额。decimal.Decimal 运算不改写操作数，可安全外传。
 func (m Money) Amount() decimal.Decimal { return m.amount }
@@ -215,14 +312,16 @@ func (m Money) sameCurrency(o Money) error {
 	return nil
 }
 
-// formatAmount 按数额自身的标度渲染，不丢尾零：
+// FormatAmount 按数额自身的标度渲染为字符串，不丢尾零：
 // decimal.String() 会把 "10.50" 缩成 "10.5"，这里用 StringFixed 保住标度。
-func formatAmount(d decimal.Decimal) string {
+func FormatAmount(d decimal.Decimal) string {
 	if exp := d.Exponent(); exp < 0 {
 		return d.StringFixed(-exp)
 	}
 	return d.String()
 }
+
+func formatAmount(d decimal.Decimal) string { return FormatAmount(d) }
 
 // moneyJSON 是线上形态：amount 必须是 JSON 字符串。
 // 字段用 string 而非数字类型，使数字形态的 amount 在解码期即被拒绝。

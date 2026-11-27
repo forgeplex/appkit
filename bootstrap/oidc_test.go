@@ -59,18 +59,12 @@ func signTestOIDCToken(t *testing.T, priv ed25519.PrivateKey, sub, orgID string)
 }
 
 func TestOIDCSecurityModeMatrix(t *testing.T) {
-	service, key := serviceSecurityFixture(t)
-	pub := key.Public().(ed25519.PublicKey)
+	service, _ := serviceSecurityFixture(t)
 	verifier, _ := testOIDCVerifier(t)
 
 	plain := Options{Service: "oidcmatrix"}
-	legacySingle := Options{Service: "oidcmatrix", AuthnPublicKey: pub, AuthnIssuer: "users"}
 	user := SecurityOptions{UserVerifier: verifier}
 	both := SecurityOptions{ServiceVerifier: service.ServiceVerifier, UserVerifier: verifier}
-	withIssuers := SecurityOptions{
-		UserVerifier: verifier,
-		UserIssuers:  map[string]authn.Issuer{"users": {Key: pub, Partition: "eu"}},
-	}
 
 	for _, tc := range []struct {
 		name string
@@ -84,8 +78,6 @@ func TestOIDCSecurityModeMatrix(t *testing.T) {
 		{"invalid zero verifier", appkit.SecurityUserFacing, plain, SecurityOptions{UserVerifier: &authn.OIDCVerifier{}}, "UserVerifier"},
 		{"disabled rejects UserVerifier", appkit.SecurityDisabled, plain, user, "冲突"},
 		{"internal_service rejects UserVerifier", appkit.SecurityInternalService, plain, both, "冲突"},
-		{"UserVerifier conflicts with UserIssuers", appkit.SecurityUserFacing, plain, withIssuers, "不能同时"},
-		{"UserVerifier conflicts with AuthnPublicKey", appkit.SecurityUserFacing, legacySingle, user, "不能同时"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateHTTPSecurityWithOptions(tc.o, "dev", tc.mode, "OIDCMATRIX", false, tc.s)

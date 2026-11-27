@@ -284,7 +284,7 @@ func TestProbeRejectsBusinessRoutesAndPprof(t *testing.T) {
 	options.Probe = &ProbeOptions{Addr: "127.0.0.1:0"}
 	options.Modules = func(ProfileDeps) ([]appkit.Module, error) {
 		return []appkit.Module{profileTestModule{name: "business", register: func(reg *appkit.Registry) error {
-			reg.Mount("/private", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+			reg.MountPublic("/private", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 			return nil
 		}}}, nil
 	}

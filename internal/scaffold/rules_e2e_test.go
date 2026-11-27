@@ -213,6 +213,91 @@ import "fmt"
 func ProbeLog() { fmt.Println("x") }
 `,
 	},
+	{
+		name:   "业务包里裸 time.NewTicker",
+		path:   "internal/" + e2eDomain + "/session/probe_ticker.go",
+		linter: "golangci",
+		token:  "forbidigo",
+		body: `package session
+
+import "time"
+
+// ProbeTicker 用裸 time.NewTicker 代替 job.Every。
+func ProbeTicker() *time.Ticker { return time.NewTicker(time.Second) }
+`,
+	},
+	{
+		name:   "transport 用 http.Error 绕过 httpserver.WriteError",
+		path:   "internal/http/probe_http_error.go",
+		linter: "golangci",
+		token:  "forbidigo",
+		body: `package http
+
+import "net/http"
+
+// ProbeHTTPError 直接调 http.Error 而非 httpserver.WriteError。
+func ProbeHTTPError(w http.ResponseWriter) { http.Error(w, "boom", http.StatusBadRequest) }
+`,
+	},
+	{
+		name:   "全局 slog.Info 绕过注入 logger",
+		path:   "internal/" + e2eDomain + "/session/probe_slog.go",
+		linter: "golangci",
+		token:  "sloglint",
+		body: `package session
+
+import "log/slog"
+
+// ProbeGlobalSlog 直接调全局 slog.Info。
+func ProbeGlobalSlog() { slog.Info("global") }
+`,
+	},
+	{
+		name:   "已有 ctx 链里断用 context.Background",
+		path:   "internal/" + e2eDomain + "/session/probe_contextcheck.go",
+		linter: "golangci",
+		token:  "contextcheck",
+		body: `package session
+
+import "context"
+
+func sinkCtx(ctx context.Context) error { return ctx.Err() }
+
+// ProbeBrokenCtx 收到 ctx 却往下游传 context.Background()。
+func ProbeBrokenCtx(_ context.Context) error { return sinkCtx(context.Background()) }
+`,
+	},
+	{
+		name:   "err != nil 分支返回 nil 吞错",
+		path:   "internal/" + e2eDomain + "/session/probe_nilerr.go",
+		linter: "golangci",
+		token:  "nilerr",
+		body: `package session
+
+import "errors"
+
+// ProbeSwallowErr 检查 err != nil 后返回 nil。
+func ProbeSwallowErr(err error) error {
+	if err != nil {
+		return nil
+	}
+	return errors.New("unreachable")
+}
+`,
+	},
+	{
+		name:   "用 == 比较错误绕过 errors.Is",
+		path:   "internal/" + e2eDomain + "/session/probe_errorlint.go",
+		linter: "golangci",
+		token:  "errorlint",
+		body: `package session
+
+import "io"
+
+// ProbeErrEq 直接 == 比较错误。
+func ProbeErrEq(err error) bool { return err == io.EOF }
+`,
+	},
 }
 
 // TestMaterializedRulesOnSubpackagedDomain 用真检查器验证物化的规则集在
@@ -391,4 +476,162 @@ func hasLineWith(out, a, b string) bool {
 		}
 	}
 	return false
+}
+
+// TestAppkitLintOnGeneratedDomain 用本地构建的 appkit-lint 真跑生成的域骨架
+// （含标准/分区域/租户三种形态与子包），验证：
+//  1. 干净骨架（含生成的 schematool）通过全部 appkit-lint 规则，零误报；
+//  2. 植入已知违规（rawmount / nogoroutine / authheader / errcmp / pgtxbypass / jsonany）
+//     后每一条都被精准报出。
+func TestAppkitLintOnGeneratedDomain(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short 模式跳过 appkit-lint 构建与端到端检查")
+	}
+	lintRoot, err := filepath.Abs(filepath.Join("..", "..", "lint"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(t.TempDir(), "appkit-lint")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
+	buildCmd := exec.Command("go", "build", "-o", bin, "./cmd/appkit-lint")
+	buildCmd.Dir = lintRoot
+	buildCmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=")
+	if out, err := buildCmd.CombinedOutput(); err != nil {
+		t.Fatalf("构建本地 appkit-lint 失败: %v\n%s", err, out)
+	}
+
+	runAppkitLint := func(dir, workFile string) (string, error) {
+		cmd := exec.Command(bin, "./...")
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GOWORK="+workFile, "GOFLAGS=")
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	dir := filepath.Join(t.TempDir(), e2eDomain)
+	if err := Domain(Options{Name: e2eDomain, Dir: dir, AppkitVersion: "(devel)"}, nil); err != nil {
+		t.Fatalf("Domain: %v", err)
+	}
+	dir, workFile := writeGoWork(t, dir)
+	writeFiles(t, dir, subpkgFiles)
+	mustCompile(t, dir, workFile)
+
+	t.Run("干净生成仓库必须零问题", func(t *testing.T) {
+		if out, err := runAppkitLint(dir, workFile); err != nil {
+			t.Fatalf("appkit-lint 在干净生成仓库上报了错误: %v\n%s", err, out)
+		}
+	})
+
+	t.Run("植入自研规则违规必须全部报出", func(t *testing.T) {
+		probes := []struct {
+			name  string
+			path  string
+			body  string
+			token string
+		}{
+			{
+				name:  "裸 go 语句",
+				path:  "internal/" + e2eDomain + "/session/probe_nogoroutine.go",
+				token: "裸 go 语句",
+				body: `package session
+
+func probeGo() { go func() {}() }
+`,
+			},
+			{
+				name:  "直读 Authorization 头",
+				path:  "internal/http/probe_authheader.go",
+				token: "Authorization",
+				body: `package http
+
+import "net/http"
+
+func probeAuthHeader(r *http.Request) string { return r.Header.Get("Authorization") }
+`,
+			},
+			{
+				name:  "err.Error() 字符串比对",
+				path:  "internal/" + e2eDomain + "/session/probe_errcmp.go",
+				token: "err.Error()",
+				body: `package session
+
+import "strings"
+
+func probeErrCmp(err error) bool { return strings.Contains(err.Error(), "boom") }
+`,
+			},
+			{
+				name:  "绕过 pgtx.From 直调 pool.Exec",
+				path:  "internal/postgres/probe_pgtxbypass.go",
+				token: "pgtx.From",
+				body: `package postgres
+
+import (
+	"context"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+func probePoolExec(ctx context.Context, pool *pgxpool.Pool) { _, _ = pool.Exec(ctx, "SELECT 1") }
+`,
+			},
+			{
+				name:  "json.Unmarshal 解码进 map[string]any",
+				path:  "internal/http/probe_jsonany.go",
+				token: "json.Unmarshal",
+				body: `package http
+
+import "encoding/json"
+
+func probeJSONAny(raw []byte) {
+	var m map[string]any
+	_ = json.Unmarshal(raw, &m)
+}
+`,
+			},
+			{
+				name:  "HTTP 层覆写 callctx.With",
+				path:  "internal/http/probe_callctxwrite.go",
+				token: "callctx.With",
+				body: `package http
+
+import (
+	"context"
+
+	"github.com/forgeplex/appkit/callctx"
+)
+
+func probeCallctxWrite(ctx context.Context) context.Context {
+	return callctx.With(ctx, callctx.Meta{TenantID: "forged"})
+}
+`,
+			},
+			{
+				name:  "函数参数传递 pgx.Tx",
+				path:  "internal/postgres/probe_txparam.go",
+				token: "pgx.Tx",
+				body: `package postgres
+
+import "github.com/jackc/pgx/v5"
+
+func probeTxParam(tx pgx.Tx) { _ = tx }
+`,
+			},
+		}
+		for _, p := range probes {
+			writeFiles(t, dir, map[string]string{p.path: p.body})
+		}
+		out, err := runAppkitLint(dir, workFile)
+		if err == nil {
+			t.Fatalf("植入违规后 appkit-lint 仍然全绿")
+		}
+		for _, p := range probes {
+			if !hasLineWith(out, filepath.Base(p.path), p.token) {
+				t.Errorf("探针 %q 未被 appkit-lint 报出（期望某一行同时含 %q 与 %q）：\n%s",
+					p.name, filepath.Base(p.path), p.token, out)
+			}
+		}
+	})
 }

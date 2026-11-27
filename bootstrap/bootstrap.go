@@ -12,7 +12,6 @@ package bootstrap
 import (
 	"cmp"
 	"context"
-	"crypto/ed25519"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -136,16 +135,6 @@ type Options struct {
 	// 此前域要给池加钩子只能整个自建池绕开 bootstrap——迁移/outbox/
 	// 幂等装配全部重写一遍，正是这条例外最不该存在的地方。
 	PoolOptions []pgtx.PoolOption
-	// AuthnPublicKey 是访问令牌的 Ed25519 验签公钥（组合根只持公钥，
-	// 私钥在鉴权提供方）。security.mode=user_facing 时必填，并在根链
-	// Base 之后挂 authn.Middleware：
-	// 验签结果（appkit.Actor）注入 ctx，reg.Require / appkit.Check 据此
-	// 判定。disabled 模式不得同时提供；内部服务身份由独立配置负责。
-	AuthnPublicKey ed25519.PublicKey
-	// AuthnIssuer 是期望的令牌 iss（提供方按分区签发，如 "rbac-demo"）。
-	// user_facing 模式必填，缺了启动报错——没有 iss 约束的验签
-	// 会接受任何持私钥者签的令牌。
-	AuthnIssuer string
 }
 
 // RunOptions 是运行期参数，对应 Main 解析出的命令行 flag。
@@ -197,18 +186,15 @@ func Run(ctx context.Context, o Options, r RunOptions) error {
 // 已导出的结构体增加字段而破坏无键字面量调用方。
 type SecurityOptions struct {
 	ServiceVerifier *authn.ServiceVerifier
-	// UserIssuers 用于单进程多用户签发方/分区，与 Options.AuthnPublicKey /
-	// AuthnIssuer 互斥。密钥与 Partition 均来自可信组合根，不从请求选配置。
-	UserIssuers map[string]authn.Issuer
 	// UserVerifier 用于校验来自 forgeplex/sso 等多 Realm OIDC 提供方的用户访问令牌，
-	// 与声明式 security.oidc、UserIssuers 及 AuthnPublicKey/AuthnIssuer 互斥。
+	// 与声明式 security.oidc 互斥。
 	UserVerifier *authn.OIDCVerifier
 }
 
 // RunWithSecurity 在连接数据库、模块装配或监听端口前验证安全配置。
 // internal_service 要求有效 ServiceVerifier；user_facing 要求有效用户验签配置
-// （UserVerifier / security.oidc / UserIssuers / AuthnPublicKey+AuthnIssuer）；
-// mixed 同时要求两者。没有凭证的请求只可访问显式公开路由及探针。
+// （UserVerifier / security.oidc）；mixed 同时要求两者。
+// 没有凭证的请求只可访问显式公开路由及探针。
 func RunWithSecurity(ctx context.Context, o Options, r RunOptions, security SecurityOptions) error {
 	if o.Service == "" {
 		return fmt.Errorf("bootstrap: Options.Service 不能为空")
@@ -291,14 +277,7 @@ func RunWithSecurity(ctx context.Context, o Options, r RunOptions, security Secu
 	if !r.MigrateOnly && (securityMode == appkit.SecurityUserFacing || securityMode == appkit.SecurityMixed) {
 		// 验签挂在 Base 之后（内一层）：RequestID/AccessLog 在外层，
 		// 401 响应也进访问日志。
-		switch {
-		case security.UserVerifier != nil:
-			opts = append(opts, appkit.Middleware(security.UserVerifier.Middleware))
-		case len(security.UserIssuers) != 0:
-			opts = append(opts, appkit.Middleware(authn.MultiIssuer(security.UserIssuers)))
-		default:
-			opts = append(opts, appkit.Middleware(authn.Middleware(o.AuthnPublicKey, o.AuthnIssuer)))
-		}
+		opts = append(opts, appkit.Middleware(security.UserVerifier.Middleware))
 	}
 	if securityMode == appkit.SecurityInternalService || securityMode == appkit.SecurityMixed {
 		// 用户验签先执行，服务验签器可检查 mixed 模式下两份已验证委托范围。
@@ -377,11 +356,8 @@ func validateHTTPSecurityWithOptions(o Options, env string, mode appkit.Security
 		if env != "dev" {
 			return fmt.Errorf("%s: security.mode=disabled 仅允许 env=dev，当前 env=%s", o.Service, env)
 		}
-		if len(o.AuthnPublicKey) > 0 || o.AuthnIssuer != "" {
-			return fmt.Errorf("%s: security.mode=disabled 与 AuthnPublicKey/AuthnIssuer 冲突；要验证用户令牌请使用 user_facing", o.Service)
-		}
-		if security.ServiceVerifier != nil || len(security.UserIssuers) != 0 || security.UserVerifier != nil {
-			return fmt.Errorf("%s: security.mode=disabled 与 ServiceVerifier/UserIssuers/UserVerifier 冲突", o.Service)
+		if security.ServiceVerifier != nil || security.UserVerifier != nil {
+			return fmt.Errorf("%s: security.mode=disabled 与 ServiceVerifier/UserVerifier 冲突", o.Service)
 		}
 		return nil
 	case appkit.SecurityUserFacing:
@@ -396,7 +372,7 @@ func validateHTTPSecurityWithOptions(o Options, env string, mode appkit.Security
 		if mode == appkit.SecurityMixed {
 			return validateUserSecurity(o, mode, security)
 		}
-		if len(o.AuthnPublicKey) > 0 || o.AuthnIssuer != "" || len(security.UserIssuers) != 0 || security.UserVerifier != nil {
+		if security.UserVerifier != nil {
 			return fmt.Errorf("%s: security.mode=internal_service 与用户验签配置冲突；双身份入口须选择 mixed", o.Service)
 		}
 		return nil
@@ -406,31 +382,8 @@ func validateHTTPSecurityWithOptions(o Options, env string, mode appkit.Security
 }
 
 func validateUserSecurity(o Options, mode appkit.SecurityMode, security SecurityOptions) error {
-	if security.UserVerifier != nil {
-		if len(security.UserIssuers) != 0 || len(o.AuthnPublicKey) != 0 || o.AuthnIssuer != "" {
-			return fmt.Errorf("%s: UserVerifier 与 UserIssuers/AuthnPublicKey/AuthnIssuer 不能同时配置", o.Service)
-		}
-		if err := security.UserVerifier.Validate(); err != nil {
-			return fmt.Errorf("%s: security.mode=%s 需要有效的 OIDC 用户验签配置（UserVerifier / security.oidc）: %w", o.Service, mode, err)
-		}
-		return nil
-	}
-	if len(security.UserIssuers) != 0 {
-		if len(o.AuthnPublicKey) != 0 || o.AuthnIssuer != "" {
-			return fmt.Errorf("%s: UserIssuers 与 AuthnPublicKey/AuthnIssuer 不能同时配置", o.Service)
-		}
-		for issuer, spec := range security.UserIssuers {
-			if strings.TrimSpace(issuer) == "" || len(spec.Key) != ed25519.PublicKeySize {
-				return fmt.Errorf("%s: UserIssuers 需要非空 issuer 与有效 Ed25519 公钥", o.Service)
-			}
-		}
-		return nil
-	}
-	if len(o.AuthnPublicKey) != ed25519.PublicKeySize {
-		return fmt.Errorf("%s: security.mode=%s 需要 %d 字节 Ed25519 AuthnPublicKey", o.Service, mode, ed25519.PublicKeySize)
-	}
-	if strings.TrimSpace(o.AuthnIssuer) == "" {
-		return fmt.Errorf("%s: security.mode=%s 需要 AuthnIssuer——没有 iss 约束的验签会接受其他系统令牌", o.Service, mode)
+	if err := security.UserVerifier.Validate(); err != nil {
+		return fmt.Errorf("%s: security.mode=%s 需要有效的 OIDC 用户验签配置（UserVerifier / security.oidc）: %w", o.Service, mode, err)
 	}
 	return nil
 }

@@ -36,27 +36,15 @@ func renderClient(doc *contractDoc) []byte {
 	}
 	b.WriteString(`
 	"github.com/forgeplex/appkit/apperr"
-	"github.com/forgeplex/appkit/callctx"
 	"github.com/forgeplex/appkit/contract"
-	"github.com/forgeplex/appkit/outbound"
 )
 
 `)
 
 	fmt.Fprintf(&b, "// Client 是 %s 契约的远程绑定：与进程内 wrapper（wrap.gen.go）实现\n", doc.System)
 	b.WriteString("// 同一个 Service 接口，方法体同样经 contract.Call——事务守卫、ctx 防火墙、\n// 超时与错误规范化在两种部署形态下完全一致（DESIGN §5.3）。\n")
-	b.WriteString("type Client struct {\n\tbase string\n\thc   *http.Client\n\tsecure bool\n}\n\n")
+	b.WriteString("type Client struct {\n\tbase string\n\thc   *http.Client\n}\n\n")
 
-	b.WriteString("// NewClient 返回契约 client。base 是服务根地址（如 \"http://ledger:8080\"），\n")
-	b.WriteString("// caller 填本服务名（callctx 白名单的归因值）。\n//\n")
-	b.WriteString("// 这是兼容旧行为的 legacy/dev 入口，不提供服务认证或 HTTPS 强制；\n// 生产服务调用使用 NewSecureClient。\n//\n")
-	b.WriteString("// 白名单传播焊死在装配处：hc 为 nil 走默认 Transport；非 nil 时在其\n")
-	b.WriteString("// Transport 外包一层 callctx.Transport（不改调用方的 client）。\n")
-	b.WriteString("// 「忘了装 Transport」这个静默失效形态在生成 client 里不存在。\n")
-	b.WriteString("func NewClient(base, caller string, hc *http.Client) *Client {\n")
-	b.WriteString("\tif hc == nil {\n\t\thc = &http.Client{}\n\t}\n")
-	b.WriteString("\tinner := *hc\n\tinner.Transport = callctx.Transport{Base: outbound.InstrumentTransport(hc.Transport), Caller: caller}\n")
-	b.WriteString("\treturn &Client{base: strings.TrimSuffix(base, \"/\"), hc: &inner}\n}\n\n")
 	b.WriteString(`// NewSecureClient 返回显式认证的 HTTPS 契约 client。Audience 与服务凭证
 // provider 必填；每次尝试取新凭证，拒绝过期凭证、不安全 transport 和重定向。
 // caller 由服务 JWT 的 subject 决定，不接受调用方伪造的 caller 或用户凭证。
@@ -66,7 +54,7 @@ func NewSecureClient(base string, opts contract.SecureClientOptions) (*Client, e
 	if err != nil {
 		return nil, err
 	}
-	return &Client{base: strings.TrimSuffix(base, "/"), hc: hc, secure: true}, nil
+	return &Client{base: strings.TrimSuffix(base, "/"), hc: hc}, nil
 }
 
 `)
@@ -123,7 +111,7 @@ func renderClientMethod(b *bytes.Buffer, doc *contractDoc, m methodDef) {
 			return %s{}, apperr.Internal(err)
 		}
 		hreq.Header.Set("Content-Type", "application/json")
-		return do[%s](c.hc, hreq, c.secure)
+		return do[%s](c.hc, hreq)
 	})`, respType, respType)
 
 	switch {
@@ -143,11 +131,11 @@ func renderDo(b *bytes.Buffer) {
 	b.WriteString(`// do 执行一次 HTTP 调用并按契约约定解码：200 解析 JSON 响应体，其余
 // 状态一律经 apperr.FromProblem 重建错误——错误身份 = 错误码，跨网络重建后
 // apperr.Is 判定与进程内一致。网络层故障折叠为 CodeUnavailable（可重试信号）。
-func do[T any](hc *http.Client, hreq *http.Request, secure bool) (T, error) {
+func do[T any](hc *http.Client, hreq *http.Request) (T, error) {
 	var zero T
 	resp, err := hc.Do(hreq)
 	if err != nil {
-		if secure && (apperr.Is(err, apperr.CodeUnauthenticated) || apperr.Is(err, apperr.CodePermissionDenied) || apperr.Is(err, apperr.CodeInvalidArgument)) {
+		if apperr.Is(err, apperr.CodeUnauthenticated) || apperr.Is(err, apperr.CodePermissionDenied) || apperr.Is(err, apperr.CodeInvalidArgument) {
 			return zero, apperr.From(err)
 		}
 		return zero, apperr.Unavailable(err)

@@ -2,6 +2,7 @@ package authn
 
 import (
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
@@ -385,20 +386,31 @@ func TestServicePolicyCannotMutateVerifiedPrincipal(t *testing.T) {
 
 func TestUserIssuerSnapshotAndCrossTokenRejection(t *testing.T) {
 	pub, key, _ := ed25519.GenerateKey(nil)
-	issuers := map[string]Issuer{"services": {Key: pub, Partition: "p"}}
+	staticKeys := map[string]crypto.PublicKey{"k1": pub}
+	uv, err := NewOIDCVerifier(OIDCVerifierOptions{
+		Realms: []OIDCRealm{{
+			Issuer:     "https://services.example.com/",
+			Audience:   "ledger",
+			Partition:  "p",
+			StaticKeys: staticKeys,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	called := false
-	h := MultiIssuer(issuers)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := uv.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		if callctx.From(r.Context()).Partition != "p" {
 			t.Error("issuer partition changed after construction")
 		}
 	}))
-	userClaims := jwt.MapClaims{"iss": "services", "sub": "user", "exp": time.Now().Add(time.Hour).Unix()}
-	user := sign(t, key, userClaims)
+	userClaims := jwt.MapClaims{"iss": "https://services.example.com/", "aud": "ledger", "sub": "user", "exp": time.Now().Add(time.Hour).Unix()}
+	user := signUserEdDSA(t, key, userClaims)
 	for i := range pub {
 		pub[i]++
 	}
-	issuers["services"] = Issuer{Partition: "attacker"}
+	staticKeys["k1"] = ed25519.PublicKey(make([]byte, ed25519.PublicKeySize))
 	for _, tc := range []struct {
 		name, raw string
 		status    int
@@ -406,7 +418,7 @@ func TestUserIssuerSnapshotAndCrossTokenRejection(t *testing.T) {
 		{"user-snapshot", user, 200},
 		{"service-token", signedService(t, key, serviceMapClaims(), nil), 401},
 		{"service-with-user-type", signedService(t, key, serviceMapClaims(), func(h map[string]any) { h["typ"] = "JWT" }), 401},
-		{"stepup-as-access", sign(t, key, jwt.MapClaims{"iss": "services", "sub": "user", "purpose": "step-up", "exp": time.Now().Add(time.Hour).Unix()}), 401},
+		{"stepup-as-access", signUserEdDSA(t, key, jwt.MapClaims{"iss": "https://services.example.com/", "aud": "ledger", "sub": "user", "purpose": "step-up", "exp": time.Now().Add(time.Hour).Unix()}), 401},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			called = false
@@ -428,7 +440,21 @@ func TestServiceMiddlewareMixedAndHeaderConflicts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	user := sign(t, key, jwt.MapClaims{"iss": "services", "sub": "user", "tid": "tenant", "exp": time.Now().Add(time.Hour).Unix()})
+	user := signUserEdDSA(t, key, jwt.MapClaims{
+		"iss": "https://services.example.com/", "aud": "ledger",
+		"sub": "user", "org_id": "tenant", "exp": time.Now().Add(time.Hour).Unix(),
+	})
+	uv, err := NewOIDCVerifier(OIDCVerifierOptions{
+		Realms: []OIDCRealm{{
+			Issuer:     "https://services.example.com/",
+			Audience:   "ledger",
+			Partition:  "p",
+			StaticKeys: map[string]crypto.PublicKey{"k1": pub},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, order := range []string{"user-first", "service-first"} {
 		t.Run(order, func(t *testing.T) {
 			called := false
@@ -441,7 +467,7 @@ func TestServiceMiddlewareMixedAndHeaderConflicts(t *testing.T) {
 				_, hasActor = appkit.ActorFrom(r.Context())
 				p, _ = appkit.ServicePrincipalFrom(r.Context())
 			})
-			u := MultiIssuer(map[string]Issuer{"services": {Key: pub, Partition: "p"}})
+			u := uv.Middleware
 			h := u(v.Middleware(next))
 			if order == "service-first" {
 				h = v.Middleware(u(next))

@@ -134,15 +134,6 @@ func newRegistry() *Registry {
 	}
 }
 
-// Mount 把一个未分类 http.Handler 挂到根路由，仅为 SecurityDisabled 的
-// 向后兼容保留；严格模式会在监听前拒绝它。新代码应按暴露面改用
-// MountPublic、MountAuthenticated、MountPermission 或 MountInternalService。
-// pattern 使用标准库 ServeMux 语法（Go 1.22+，可含方法与通配符）。
-// 同一 pattern 重复挂载在启动期报错。
-func (r *Registry) Mount(pattern string, h http.Handler) {
-	r.mount(pattern, h, routeUnclassified, "")
-}
-
 func (r *Registry) mount(pattern string, h http.Handler, security routeSecurity, permission string) {
 	if h == nil {
 		panic(fmt.Sprintf("路由 %q 的 handler 不能为 nil", pattern))

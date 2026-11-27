@@ -2,6 +2,7 @@ package authn
 
 import (
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	"encoding/json"
 	"io"
@@ -20,6 +21,18 @@ import (
 	"github.com/forgeplex/appkit/httpserver"
 )
 
+func signUserEdDSA(t *testing.T, key ed25519.PrivateKey, claims jwt.MapClaims) string {
+	t.Helper()
+	tok := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
+	tok.Header["kid"] = "k1"
+	tok.Header["typ"] = "at+jwt"
+	raw, err := tok.SignedString(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
 type strictIdentityObservation struct {
 	Meta       callctx.Meta
 	Actor      appkit.Actor
@@ -32,7 +45,7 @@ type strictIdentityObservation struct {
 // Exercise App.Run's actual listener and middleware ordering, not a hand-built
 // approximation of identityBoundary. BaseContext simulates untrusted identity
 // installed outside the App; forged HTTP headers independently test wire input.
-func TestStrictAppMultiIssuerIdentityIntegration(t *testing.T) {
+func TestStrictAppMultiRealmOIDCIdentityIntegration(t *testing.T) {
 	pubA, privA, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -41,23 +54,30 @@ func TestStrictAppMultiIssuerIdentityIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	const aud = "https://api.example.com"
 	token := func(key ed25519.PrivateKey, issuer, subject, tenant string, perms []string) string {
-		return sign(t, key, jwt.MapClaims{
-			"iss": issuer, "sub": subject, "tid": tenant, "perms": perms,
+		return signUserEdDSA(t, key, jwt.MapClaims{
+			"iss": issuer, "aud": aud, "sub": subject, "org_id": tenant, "permissions": perms,
 			"partition": "forged-signed-claim", // Partition is deployment mapping, not this claim.
 			"exp":       time.Now().Add(time.Hour).Unix(),
 		})
 	}
 	readPerms := []string{"fixture:read"}
-	alpha := token(privA, "issuer-a", "user-a", "shared-tenant", readPerms)
-	beta := token(privB, "issuer-b", "user-b", "shared-tenant", nil)
+	alpha := token(privA, "https://issuer-a.example.com/", "user-a", "shared-tenant", readPerms)
+	beta := token(privB, "https://issuer-b.example.com/", "user-b", "shared-tenant", nil)
+	verifier, err := NewOIDCVerifier(OIDCVerifierOptions{
+		Realms: []OIDCRealm{
+			{Issuer: "https://issuer-a.example.com/", Audience: aud, Partition: "partition-a", StaticKeys: map[string]crypto.PublicKey{"k1": pubA}},
+			{Issuer: "https://issuer-b.example.com/", Audience: aud, Partition: "partition-b", StaticKeys: map[string]crypto.PublicKey{"k1": pubB}},
+			{Issuer: "https://flat.example.com/", Audience: aud, StaticKeys: map[string]crypto.PublicKey{"k1": pubA}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, mode := range []appkit.SecurityMode{appkit.SecurityUserFacing, appkit.SecurityMixed} {
 		t.Run(string(mode), func(t *testing.T) {
-			url := startStrictIdentityApp(t, mode, MultiIssuer(map[string]Issuer{
-				"issuer-a": {Key: pubA, Partition: "partition-a"},
-				"issuer-b": {Key: pubB, Partition: "partition-b"},
-				"flat":     {Key: pubA},
-			}))
+			url := startStrictIdentityApp(t, mode, verifier.Middleware)
 			transport := &http.Transport{Proxy: nil}
 			t.Cleanup(transport.CloseIdleConnections)
 			client := &http.Client{Transport: transport, Timeout: 2 * time.Second}
@@ -68,16 +88,16 @@ func TestStrictAppMultiIssuerIdentityIntegration(t *testing.T) {
 			}{
 				{"issuer-a", "/private", alpha, "user-a", "shared-tenant", "partition-a", readPerms, 200},
 				{"issuer-b", "/private", beta, "user-b", "shared-tenant", "partition-b", nil, 200},
-				{"no-partition", "/private", token(privA, "flat", "user-flat", "", nil), "user-flat", "", "", nil, 200},
-				{"no-tenant", "/private", token(privA, "issuer-a", "user-a", "", nil), "user-a", "", "partition-a", nil, 200},
+				{"no-partition", "/private", token(privA, "https://flat.example.com/", "user-flat", "", nil), "user-flat", "", "", nil, 200},
+				{"no-tenant", "/private", token(privA, "https://issuer-a.example.com/", "user-a", "", nil), "user-a", "", "partition-a", nil, 200},
 				{"anonymous-public", "/public", "", "", "", "", nil, 200},
 				{"authenticated-public", "/public", alpha, "user-a", "shared-tenant", "partition-a", readPerms, 200},
 				{"anonymous-private", "/private", "", "", "", "", nil, 401},
 				{"anonymous-permission", "/permission", "", "", "", "", nil, 401},
 				{"permitted", "/permission", alpha, "user-a", "shared-tenant", "partition-a", readPerms, 200},
 				{"denied", "/permission", beta, "", "", "", nil, 403},
-				{"wrong-key-for-issuer", "/private", token(privA, "issuer-b", "forged", "forged", readPerms), "", "", "", nil, 401},
-				{"unknown-issuer", "/private", token(privA, "unknown", "forged", "forged", readPerms), "", "", "", nil, 401},
+				{"wrong-key-for-issuer", "/private", token(privA, "https://issuer-b.example.com/", "forged", "forged", readPerms), "", "", "", nil, 401},
+				{"unknown-issuer", "/private", token(privA, "https://unknown.example.com/", "forged", "forged", readPerms), "", "", "", nil, 401},
 				{"invalid-public-credential", "/public", "malformed", "", "", "", nil, 401},
 			}
 			if mode == appkit.SecurityMixed {

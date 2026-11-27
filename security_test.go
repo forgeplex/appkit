@@ -20,31 +20,31 @@ func TestRunRequiresExplicitSecurityMode(t *testing.T) {
 	}
 }
 
-func TestStrictModeRejectsUnclassifiedRoute(t *testing.T) {
+func TestStrictModeRejectsIncompatibleRoute(t *testing.T) {
 	m := ModuleFunc("files", func(reg *Registry) error {
-		reg.Mount("GET /files", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+		reg.MountInternalService("GET /files", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 		return nil
 	})
 	app := New([]Module{m}, Security(SecurityUserFacing), HTTPAddr("127.0.0.1:0"))
 	err := app.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), `模块 "files" 的路由 "GET /files"`) ||
-		!strings.Contains(err.Error(), "MountPublic") {
-		t.Fatalf("裸 Mount 应被点名并拒绝，实际 %v", err)
+		!strings.Contains(err.Error(), "InternalService") {
+		t.Fatalf("不兼容路由应被点名并拒绝，实际 %v", err)
 	}
 }
 
-func TestStrictModeRejectsRouteMountedDuringSetup(t *testing.T) {
+func TestStrictModeRejectsIncompatibleRouteMountedDuringSetup(t *testing.T) {
 	m := ModuleFunc("late", func(reg *Registry) error {
 		reg.Setup(func(context.Context) error {
-			reg.Mount("GET /late", http.NotFoundHandler())
+			reg.MountInternalService("GET /late", http.NotFoundHandler())
 			return nil
 		})
 		return nil
 	})
-	app := New([]Module{m}, Security(SecurityMixed), HTTPAddr("127.0.0.1:0"))
+	app := New([]Module{m}, Security(SecurityUserFacing), HTTPAddr("127.0.0.1:0"))
 	err := app.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), `模块 "late" 的路由 "GET /late"`) {
-		t.Fatalf("Setup 期挂的裸路由也应在监听前拒绝，实际 %v", err)
+		t.Fatalf("Setup 期挂的不兼容路由也应在监听前拒绝，实际 %v", err)
 	}
 }
 
@@ -80,10 +80,7 @@ func TestRouteSecurityModeMatrix(t *testing.T) {
 		{"mixed accepts user", SecurityMixed, func(r *Registry) { r.MountAuthenticated("GET /x", ok) }, false, ""},
 		{"mixed accepts permission", SecurityMixed, func(r *Registry) { r.MountPermission("GET /x", "x:read", ok) }, false, ""},
 		{"mixed accepts internal", SecurityMixed, func(r *Registry) { r.MountInternalService("GET /x", ok) }, false, ""},
-		{"user rejects legacy mount", SecurityUserFacing, func(r *Registry) { r.Mount("GET /x", ok) }, false, "未声明安全分类"},
-		{"internal rejects legacy mount", SecurityInternalService, func(r *Registry) { r.Mount("GET /x", ok) }, false, "未声明安全分类"},
-		{"mixed rejects legacy mount", SecurityMixed, func(r *Registry) { r.Mount("GET /x", ok) }, false, "未声明安全分类"},
-		{"disabled keeps legacy mount", SecurityDisabled, func(r *Registry) { r.Mount("GET /x", ok) }, true, ""},
+		{"disabled accepts pprof", SecurityDisabled, func(r *Registry) { r.MountPublic("GET /x", ok) }, true, ""},
 		{"user rejects pprof", SecurityUserFacing, func(*Registry) {}, true, "pprof"},
 	}
 	for _, tc := range tests {

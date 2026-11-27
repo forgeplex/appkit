@@ -2,6 +2,7 @@ package genfixture
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -9,18 +10,74 @@ import (
 	"testing"
 	"time"
 
+	"github.com/forgeplex/appkit"
 	"github.com/forgeplex/appkit/apperr"
+	"github.com/forgeplex/appkit/authn"
 	"github.com/forgeplex/appkit/callctx"
+	"github.com/forgeplex/appkit/contract"
 	"github.com/forgeplex/appkit/tx"
 )
 
-// remoteStub 是「真实部署形态」的对拍装配：生成的 server handler 里包着
-// 生成的 wrapper（边界内侧再经一次 contract.Call），client 走真 HTTP。
+func secureClientFor(t *testing.T, srv *httptest.Server, signer *authn.ServiceSigner) *Client {
+	t.Helper()
+	var creds contract.ServiceCredentialProvider
+	if signer != nil {
+		creds = contract.ServiceCredentialProviderFunc(func(ctx context.Context, scope contract.ServiceScope) (contract.ServiceCredential, error) {
+			raw, err := signer.Sign(ctx, scope.Audience, authn.ServiceDelegation{
+				TenantID:  scope.TenantID,
+				Partition: scope.Partition,
+			})
+			if err != nil {
+				return contract.ServiceCredential{}, err
+			}
+			return contract.ServiceCredential{Token: raw, ExpiresAt: time.Now().Add(time.Minute)}, nil
+		})
+	} else {
+		creds = contract.ServiceCredentialProviderFunc(func(context.Context, contract.ServiceScope) (contract.ServiceCredential, error) {
+			return contract.ServiceCredential{Token: "genfixture-test-token", ExpiresAt: time.Now().Add(time.Minute)}, nil
+		})
+	}
+	client, err := NewSecureClient(srv.URL, contract.SecureClientOptions{
+		Audience:    "genfixture",
+		HTTPClient:  srv.Client(),
+		Credentials: creds,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+// remoteStub 是「真实部署形态」的对拍装配：生成的 server handler 外包服务验签中间件、
+// 内侧包生成的 wrapper，client 走真 HTTPS + 服务 JWT。
 func remoteStub(t *testing.T, stub *stubService) (*Client, *httptest.Server) {
 	t.Helper()
-	srv := httptest.NewServer(NewHTTPHandler(WrapService(stub, 0)))
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := authn.NewServiceSigner(authn.ServiceSignerOptions{
+		Issuer: "genfixture-ca", Subject: "genfixture-test", KeyID: "k1", Key: priv, TTL: time.Minute,
+		AuthorizeDelegation: func(context.Context, appkit.ServicePrincipal, authn.ServiceDelegation) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifier, err := authn.NewServiceVerifier(authn.ServiceVerifierOptions{
+		Audience: "genfixture",
+		Issuers:  map[string]authn.ServiceIssuer{"genfixture-ca": {Keys: map[string]ed25519.PublicKey{"k1": pub}, Subjects: []string{"genfixture-test"}}},
+		AuthorizeDelegation: func(context.Context, appkit.ServicePrincipal, authn.ServiceDelegation) error {
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewTLSServer(verifier.Middleware(NewHTTPHandler(WrapService(stub, 0))))
 	t.Cleanup(srv.Close)
-	return NewClient(srv.URL, "genfixture-test", nil), srv
+	return secureClientFor(t, srv, signer), srv
 }
 
 // TestClientServerRoundTrip 生成的 client 与生成的 server 经真 HTTP 对拍：
@@ -77,11 +134,11 @@ func TestClientServerErrorCodes(t *testing.T) {
 // 请求根本不会发出去。
 func TestClientTxBoundary(t *testing.T) {
 	var hits atomic.Int64
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 	}))
 	t.Cleanup(srv.Close)
-	client := NewClient(srv.URL, "genfixture-test", nil)
+	client := secureClientFor(t, srv, nil)
 
 	err := client.Ping(tx.With(context.Background(), "fake-tx"))
 	if !apperr.Is(err, apperr.CodeTxBoundary) {
@@ -130,9 +187,9 @@ func flakyGateway(failTimes int64, inner http.Handler, hits *atomic.Int64) http.
 func TestClientRetriesIdempotent(t *testing.T) {
 	var hits atomic.Int64
 	stub := &stubService{}
-	srv := httptest.NewServer(flakyGateway(2, NewHTTPHandler(WrapService(stub, 0)), &hits))
+	srv := httptest.NewTLSServer(flakyGateway(2, NewHTTPHandler(WrapService(stub, 0)), &hits))
 	t.Cleanup(srv.Close)
-	client := NewClient(srv.URL, "genfixture-test", nil)
+	client := secureClientFor(t, srv, nil)
 
 	reply, err := client.Greet(context.Background(), GreetRequest{Name: "x"})
 	if err != nil || reply.Message != "hi x" {
@@ -147,9 +204,9 @@ func TestClientRetriesIdempotent(t *testing.T) {
 // 失败后交给调用方决策。
 func TestClientNoRetryNonIdempotent(t *testing.T) {
 	var hits atomic.Int64
-	srv := httptest.NewServer(flakyGateway(1<<30, http.NotFoundHandler(), &hits))
+	srv := httptest.NewTLSServer(flakyGateway(1<<30, http.NotFoundHandler(), &hits))
 	t.Cleanup(srv.Close)
-	client := NewClient(srv.URL, "genfixture-test", nil)
+	client := secureClientFor(t, srv, nil)
 
 	err := client.Reset(context.Background(), ResetRequest{Scope: "all"})
 	if !apperr.Is(err, apperr.CodeUnavailable) {
@@ -164,9 +221,9 @@ func TestClientNoRetryNonIdempotent(t *testing.T) {
 // CodeUnavailable，总尝试次数 = retryMaxAttempts。
 func TestClientRetryExhausted(t *testing.T) {
 	var hits atomic.Int64
-	srv := httptest.NewServer(flakyGateway(1<<30, http.NotFoundHandler(), &hits))
+	srv := httptest.NewTLSServer(flakyGateway(1<<30, http.NotFoundHandler(), &hits))
 	t.Cleanup(srv.Close)
-	client := NewClient(srv.URL, "genfixture-test", nil)
+	client := secureClientFor(t, srv, nil)
 
 	start := time.Now()
 	err := client.Ping(context.Background())
@@ -186,9 +243,9 @@ func TestClientRetryExhausted(t *testing.T) {
 // 不空转剩余退避。
 func TestClientRetryAbortsOnCancel(t *testing.T) {
 	var hits atomic.Int64
-	srv := httptest.NewServer(flakyGateway(1<<30, http.NotFoundHandler(), &hits))
+	srv := httptest.NewTLSServer(flakyGateway(1<<30, http.NotFoundHandler(), &hits))
 	t.Cleanup(srv.Close)
-	client := NewClient(srv.URL, "genfixture-test", nil)
+	client := secureClientFor(t, srv, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

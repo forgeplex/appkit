@@ -32,9 +32,10 @@ require (
 
 import "github.com/jackc/pgx/v5"
 `,
+			"internal/rogue/x.go":         "package rogue\n",
 			"db/queries/q.sql":            "SELECT * FROM auth.users;\n",
 			"db/migrations/0001_init.sql": "CREATE SCHEMA ledger;\n",
-			"db/migrations/0002_a.sql":    "-- a\n",
+			"db/migrations/0002_a.sql":    "ALTER TABLE ledger.x ADD COLUMN c text NOT NULL;\n",
 			"db/migrations/0002_b.sql":    "-- b\n",
 		})
 		got, err := archcheck.Run(dir)
@@ -43,9 +44,12 @@ import "github.com/jackc/pgx/v5"
 		}
 		assertViolations(t, got, []wantV{
 			{File: "go.mod", Line: 7, Msg: "github.com/forgeplex/auth"},
+			{File: "internal/rogue", Msg: "禁止在 internal/ 下建平级目录 internal/rogue"},
 			{File: "internal/ledger/service.go", Line: 3, Msg: "pgx"},
 			{File: "db/queries/q.sql", Line: 1, Msg: "跨 schema 引用 auth"},
+			{File: "db/queries/q.sql", Line: 1, Msg: "禁止 SELECT *"},
 			{File: "db/migrations/0002_b.sql", Msg: "重复"},
+			{File: "db/migrations/0002_a.sql", Line: 1, Msg: "ADD COLUMN NOT NULL 缺少 DEFAULT"},
 		})
 	})
 
@@ -70,7 +74,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 `,
-			"db/queries/report.sql":       "SELECT * FROM ledger.outbox JOIN auth.users u ON true;\n",
 			"db/migrations/0001_init.sql": "-- init\n",
 			"db/migrations/0001_dup.sql":  "-- dup\n",
 		})
